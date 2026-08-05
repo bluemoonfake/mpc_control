@@ -1,0 +1,4 @@
+[submodule "src/mrs_mpc_solvers"]
+	path = src/mrs_mpc_solvers
+	url = https://github.com/ctu-mrs/mrs_mpc_solvers.git
+	branch = ros2
