@@ -1,0 +1,13 @@
+std_msgs/Header header
+float64[3] position
+float64[3] velocity
+float64[3] acceleration
+float64 yaw
+float64 yaw_rate
+bool valid
+bool position_valid
+bool velocity_valid
+bool acceleration_valid
+bool yaw_valid
+uint32 reset_counter
+bool reset_counter_valid
