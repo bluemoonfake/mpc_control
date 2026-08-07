@@ -76,6 +76,20 @@ Eigen::MatrixXd makeConstantReference(
   return reference;
 }
 
+Eigen::MatrixXd makeIndexedReference()
+{
+  Eigen::MatrixXd reference = Eigen::MatrixXd::Zero(
+      kHorizon * kStateDimension, 1);
+
+  for (int step = 0; step < kHorizon; ++step) {
+    reference(step * kStateDimension + 0, 0) = 1.0 + 0.1 * step;
+    reference(step * kStateDimension + 1, 0) = 2.0 + 0.2 * step;
+    reference(step * kStateDimension + 2, 0) = 3.0 + 0.3 * step;
+  }
+
+  return reference;
+}
+
 SolveResult solveAxis(
     const Eigen::Vector3d& initial_state,
     Eigen::MatrixXd reference,
@@ -83,16 +97,19 @@ SolveResult solveAxis(
     const double max_control = kMaxControl,
     const double max_control_rate = kMaxControlRate,
     const double model_p1 = kModelP1,
-    const double model_p2 = kModelP2)
+    const double model_p2 = kModelP2,
+    const int max_iterations = kMaxIterations,
+    const double dt_first = kDtFirst,
+    const double dt_later = kDt)
 {
   mrs_mpc_solvers::mpc_controller::Solver solver(
       "solver_contract",
       false,
-      kMaxIterations,
+      max_iterations,
       kStageWeights,
       kTerminalWeights,
-      kDtFirst,
-      kDt,
+      dt_first,
+      dt_later,
       model_p1,
       model_p2);
 
@@ -105,8 +122,8 @@ SolveResult solveAxis(
       kDisabledStateAccelerationLimit,
       max_control,
       max_control_rate,
-      kDtFirst,
-      kDt);
+      dt_first,
+      dt_later);
   solver.setInitialState(state);
   solver.loadReference(reference);
 
@@ -212,6 +229,87 @@ TEST(MrsSolverContract, FirstPredictedStateMatchesConfiguredDynamics)
   EXPECT_NEAR(result.predicted_states(1, 0), expected_velocity, kTolerance);
   EXPECT_NEAR(
       result.predicted_states(2, 0), expected_acceleration, kTolerance);
+}
+
+TEST(MrsSolverContract, PredictionLayoutContains26StateTriples)
+{
+  const auto result = solveAxis(
+      Eigen::Vector3d::Zero(), makeIndexedReference());
+
+  expectNominalSolve(result);
+  ASSERT_EQ(result.predicted_states.rows(), kHorizon * kStateDimension);
+  ASSERT_EQ(result.predicted_states.cols(), 1);
+  EXPECT_TRUE(result.predicted_states.allFinite());
+}
+
+TEST(MrsSolverContract, LaterPredictionUsesDt2)
+{
+  // Freeze the control at u=0 so the position of x[2] exposes the second
+  // prediction interval directly. The first prediction must still use dt1.
+  constexpr int grid_test_max_iterations = 200;
+  const Eigen::Vector3d state(0.0, 1.0, 0.1);
+  const auto short_later_step = solveAxis(
+      state,
+      makeConstantReference(0.0),
+      0.0,
+      kMaxControl,
+      0.0,
+      kModelP1,
+      kModelP2,
+      grid_test_max_iterations,
+      kDtFirst,
+      0.20);
+  const auto long_later_step = solveAxis(
+      state,
+      makeConstantReference(0.0),
+      0.0,
+      kMaxControl,
+      0.0,
+      kModelP1,
+      kModelP2,
+      grid_test_max_iterations,
+      kDtFirst,
+      0.40);
+
+  EXPECT_GT(short_later_step.iterations, 0);
+  EXPECT_LT(short_later_step.iterations, grid_test_max_iterations);
+  EXPECT_GT(long_later_step.iterations, 0);
+  EXPECT_LT(long_later_step.iterations, grid_test_max_iterations);
+  EXPECT_TRUE(short_later_step.predicted_states.allFinite());
+  EXPECT_TRUE(long_later_step.predicted_states.allFinite());
+
+  const double first_position = state.x() + kDtFirst * state.y();
+  const double first_velocity = state.y() + kDtFirst * state.z();
+  EXPECT_NEAR(short_later_step.predicted_states(0, 0), first_position, kTolerance);
+  EXPECT_NEAR(long_later_step.predicted_states(0, 0), first_position, kTolerance);
+  EXPECT_NEAR(short_later_step.predicted_states(1, 0), first_velocity, kTolerance);
+  EXPECT_NEAR(long_later_step.predicted_states(1, 0), first_velocity, kTolerance);
+
+  EXPECT_NEAR(
+      short_later_step.predicted_states(3, 0),
+      first_position + 0.20 * first_velocity,
+      kTolerance);
+  EXPECT_NEAR(
+      long_later_step.predicted_states(3, 0),
+      first_position + 0.40 * first_velocity,
+      kTolerance);
+}
+
+TEST(MrsSolverContract, IterationBudgetBoundaryReturnsOnlyAnIterationCount)
+{
+  const auto result = solveAxis(
+      Eigen::Vector3d::Zero(),
+      makeConstantReference(10.0),
+      0.0,
+      kMaxControl,
+      kMaxControlRate,
+      kModelP1,
+      kModelP2,
+      1);
+
+  // The public API has no convergence flag. Reaching max_iters is therefore
+  // an explicit boundary condition for the future backend to reject.
+  EXPECT_EQ(result.iterations, 1);
 }
 
 TEST(MrsSolverContract, VerticalFirstAccelerationMatchesFilteredModel)

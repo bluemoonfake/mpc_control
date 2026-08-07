@@ -1,0 +1,21 @@
+repositories:
+  mrs_mpc_solvers:
+    type: git
+    url: https://github.com/ctu-mrs/mrs_mpc_solvers.git
+    version: f173ea285cce7bbbfc1dbc382e31c761f44b0963
+
+  px4_autopilot:
+    type: git
+    url: https://github.com/PX4/PX4-Autopilot.git
+    version: d6f12ad1c4f70ad3230afd7d86e971421e02fef4
+
+  px4_msgs:
+    type: git
+    url: https://github.com/PX4/px4_msgs.git
+    version: 86d8239e962f6939e05c3737784f60c02fa884db
+
+# Every repository is pinned to a full commit. Do not replace `version` with
+# `main`, a branch name or a moving tag in a release/test manifest.
+# PX4 and px4_msgs are pinned to the dereferenced commits of their official
+# v1.17.0 tags. Do not replace these commits with a custom fork without a new
+# architecture/dependency decision.

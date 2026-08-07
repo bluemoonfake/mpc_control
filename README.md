@@ -11,6 +11,61 @@ integration.
 - Eigen3
 - GoogleTest
 - the pinned `src/mrs_mpc_solvers` checkout
+- the pinned PX4 official `v1.17.0` submodule at `third_party/PX4-Autopilot`
+- ROS 2 Jazzy under `/opt/ros/jazzy`
+- `colcon` for building the pinned `third_party/px4_msgs` overlay
+
+Initialize the root repository submodules after cloning:
+
+```bash
+git submodule update --init src/mrs_mpc_solvers third_party/PX4-Autopilot
+```
+
+The PX4 submodule is pinned by the superproject to the official `v1.17.0`
+commit. The separate `manifests/dependencies.repos` file remains available for
+clean external workspaces and CI.
+
+For the PX4 `gz_x500` SITL build, initialize PX4's recorded source
+dependencies, excluding the legacy FlightGear and Gazebo Classic simulators:
+
+```bash
+px4_dir=third_party/PX4-Autopilot
+mapfile -t px4_paths < <(
+  git -C "$px4_dir" config --file .gitmodules --get-regexp '\.path$' \
+    | awk '$2 != "Tools/simulation/flightgear/flightgear_bridge" && \
+           $2 != "Tools/simulation/gazebo-classic/sitl_gazebo-classic" {print $2}'
+)
+git -C "$px4_dir" submodule sync -- "${px4_paths[@]}"
+git -C "$px4_dir" submodule update --init --force --checkout "${px4_paths[@]}"
+```
+
+Build from the project root so the Gazebo runtime wrapper is sourced with the
+correct path:
+
+```bash
+source tools/px4_gazebo_harmonic_env.sh
+(cd third_party/PX4-Autopilot && make px4_sitl gz_x500)
+```
+
+The pinned M0 container baseline is under `containers/m0/`. Build it with:
+
+```bash
+docker build --pull=false \
+  --file containers/m0/Dockerfile \
+  --tag mpc-control:m0-20260805 .
+```
+
+Build and source the official PX4 v1.17.0 message overlay on the host:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+colcon --log-base log/ros_px4_msgs build \
+  --base-paths third_party/px4_msgs \
+  --build-base build/ros_px4_msgs \
+  --install-base install/ros_px4_msgs \
+  --merge-install
+source install/ros_px4_msgs/setup.bash
+```
 
 ## Build and run the solver contract tests
 
