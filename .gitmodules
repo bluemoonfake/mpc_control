@@ -1,7 +1,0 @@
-[submodule "src/mrs_mpc_solvers"]
-	path = src/mrs_mpc_solvers
-	url = https://github.com/ctu-mrs/mrs_mpc_solvers.git
-	branch = ros2
-[submodule "third_party/PX4-Autopilot"]
-	path = third_party/PX4-Autopilot
-	url = https://github.com/PX4/PX4-Autopilot.git
