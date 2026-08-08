@@ -1,10 +1,17 @@
+#include "mpc_controller/frame_contract.hpp"
 #include "mpc_controller/msg/vehicle_state.hpp"
 
+#include <px4_msgs/msg/vehicle_angular_velocity.hpp>
+#include <px4_msgs/msg/vehicle_attitude.hpp>
 #include <px4_msgs/msg/vehicle_local_position.hpp>
 #include <rclcpp/rclcpp.hpp>
 
-#include <cmath>
+#include <algorithm>
+#include <chrono>
 #include <functional>
+#include <limits>
+#include <mutex>
+#include <optional>
 
 class VehicleStateBridgeNode final : public rclcpp::Node
 {
@@ -12,49 +19,304 @@ public:
   VehicleStateBridgeNode()
   : Node("vehicle_state_bridge_node")
   {
-    state_publisher_ = create_publisher<State>("vehicle_state", 10);
-    subscription_ = create_subscription<Px4State>(
-        "fmu/out/vehicle_local_position_v1",
-        rclcpp::QoS(rclcpp::KeepLast(10)).best_effort(),
-        std::bind(&VehicleStateBridgeNode::callback, this, std::placeholders::_1));
+    declare_parameter("position_topic", position_topic_);
+    declare_parameter("attitude_topic", attitude_topic_);
+    declare_parameter("angular_velocity_topic", angular_velocity_topic_);
+    declare_parameter("output_topic", output_topic_);
+    declare_parameter("frame_id", frame_id_);
+    declare_parameter("state_timeout_seconds", state_timeout_seconds_);
+    declare_parameter("max_sample_skew_seconds", max_sample_skew_seconds_);
+    declare_parameter("publish_rate_hz", publish_rate_hz_);
+    get_parameter("position_topic", position_topic_);
+    get_parameter("attitude_topic", attitude_topic_);
+    get_parameter("angular_velocity_topic", angular_velocity_topic_);
+    get_parameter("output_topic", output_topic_);
+    get_parameter("frame_id", frame_id_);
+    get_parameter("state_timeout_seconds", state_timeout_seconds_);
+    get_parameter("max_sample_skew_seconds", max_sample_skew_seconds_);
+    get_parameter("publish_rate_hz", publish_rate_hz_);
+
+    const auto qos = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort();
+    position_subscription_ = create_subscription<Px4Position>(
+      position_topic_, qos, std::bind(&VehicleStateBridgeNode::positionCallback, this, std::placeholders::_1));
+    attitude_subscription_ = create_subscription<Px4Attitude>(
+      attitude_topic_, qos, std::bind(&VehicleStateBridgeNode::attitudeCallback, this, std::placeholders::_1));
+    angular_velocity_subscription_ = create_subscription<Px4AngularVelocity>(
+      angular_velocity_topic_, qos,
+      std::bind(&VehicleStateBridgeNode::angularVelocityCallback, this, std::placeholders::_1));
+    state_publisher_ = create_publisher<State>(output_topic_, 10);
+    timer_ = create_wall_timer(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double>(1.0 / std::max(publish_rate_hz_, 1.0))),
+      std::bind(&VehicleStateBridgeNode::publish, this));
   }
 
 private:
   using State = mpc_controller::msg::VehicleState;
-  using Px4State = px4_msgs::msg::VehicleLocalPosition;
+  using Px4Position = px4_msgs::msg::VehicleLocalPosition;
+  using Px4Attitude = px4_msgs::msg::VehicleAttitude;
+  using Px4AngularVelocity = px4_msgs::msg::VehicleAngularVelocity;
+  using Clock = std::chrono::steady_clock;
 
-  void callback(const Px4State::SharedPtr message)
+  struct Cache
   {
-    if (!message || !std::isfinite(message->x) || !std::isfinite(message->y)
-        || !std::isfinite(message->z) || !std::isfinite(message->vx)
-        || !std::isfinite(message->vy) || !std::isfinite(message->vz)
-        || !std::isfinite(message->ax) || !std::isfinite(message->ay)
-        || !std::isfinite(message->az) || !std::isfinite(message->heading)) {
-      return;
+    Clock::time_point received_at{};
+    uint64_t last_timestamp_sample = 0;
+    bool received = false;
+    uint64_t accepted_count = 0;
+    uint64_t gap_count = 0;
+    double gap_sum_seconds = 0.0;
+    double gap_max_seconds = 0.0;
+  };
+
+  static void recordReception(Cache &cache, Clock::time_point now)
+  {
+    if (cache.received) {
+      const double gap = std::chrono::duration<double>(now - cache.received_at).count();
+      if (std::isfinite(gap) && gap >= 0.0) {
+        ++cache.gap_count;
+        cache.gap_sum_seconds += gap;
+        cache.gap_max_seconds = std::max(cache.gap_max_seconds, gap);
+      }
     }
-    State state;
-    state.header.stamp = get_clock()->now();
-    state.header.frame_id = "map";
-    state.position = {message->y, message->x, -message->z};
-    state.velocity = {message->vy, message->vx, -message->vz};
-    state.acceleration = {message->ay, message->ax, -message->az};
-    state.yaw = 1.5707963267948966 - message->heading;
-    state.yaw_rate = 0.0;
-    state.position_valid = message->xy_valid && message->z_valid;
-    state.velocity_valid = message->v_xy_valid && message->v_z_valid;
-    state.acceleration_valid = true;
-    state.yaw_valid = message->heading_good_for_control;
-    state.valid = state.position_valid && state.velocity_valid && state.yaw_valid;
-    state.reset_counter = message->xy_reset_counter;
-    state.reset_counter_valid = true;
-    state_publisher_->publish(state);
+    cache.received_at = now;
+    cache.received = true;
+    ++cache.accepted_count;
   }
 
-  rclcpp::Subscription<Px4State>::SharedPtr subscription_;
+  void positionCallback(const Px4Position::SharedPtr message)
+  {
+    if (!message) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!acceptTimestamp(position_cache_, message->timestamp_sample)) {
+      return;
+    }
+    position_ = *message;
+    recordReception(position_cache_, Clock::now());
+  }
+
+  void attitudeCallback(const Px4Attitude::SharedPtr message)
+  {
+    if (!message) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!acceptTimestamp(attitude_cache_, message->timestamp_sample)) {
+      return;
+    }
+    attitude_ = *message;
+    recordReception(attitude_cache_, Clock::now());
+  }
+
+  void angularVelocityCallback(const Px4AngularVelocity::SharedPtr message)
+  {
+    if (!message) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!acceptTimestamp(angular_velocity_cache_, message->timestamp_sample)) {
+      return;
+    }
+    angular_velocity_ = *message;
+    recordReception(angular_velocity_cache_, Clock::now());
+  }
+
+  bool fresh(const Cache &cache, Clock::time_point now) const noexcept
+  {
+    if (!cache.received) {
+      return false;
+    }
+    const double age = std::chrono::duration<double>(now - cache.received_at).count();
+    return mpc_controller::frame::sampleAgeValid(age, state_timeout_seconds_);
+  }
+
+  bool acceptTimestamp(Cache &cache, uint64_t timestamp_sample)
+  {
+    if (!mpc_controller::frame::timestampMonotonic(cache.last_timestamp_sample, timestamp_sample)) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "VehicleState input rejected: PX4 timestamp is zero or moved backwards");
+      return false;
+    }
+    cache.last_timestamp_sample = timestamp_sample;
+    return true;
+  }
+
+  void publish()
+  {
+    Px4Position position;
+    Px4Attitude attitude;
+    Px4AngularVelocity angular_velocity;
+    const auto now = Clock::now();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      reportTiming(now);
+      if (!fresh(position_cache_, now) || !fresh(attitude_cache_, now)
+        || !fresh(angular_velocity_cache_, now)) {
+        ++stale_rejection_count_;
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 5000,
+          "VehicleState not published: waiting for fresh position, attitude and angular velocity");
+        return;
+      }
+      position = position_;
+      attitude = attitude_;
+      angular_velocity = angular_velocity_;
+    }
+
+    mpc_controller::frame::Px4LocalPositionSample local_sample;
+    local_sample.timestamp_sample = position.timestamp_sample;
+    local_sample.xy_valid = position.xy_valid;
+    local_sample.z_valid = position.z_valid;
+    local_sample.v_xy_valid = position.v_xy_valid;
+    local_sample.v_z_valid = position.v_z_valid;
+    local_sample.heading_good_for_control = position.heading_good_for_control;
+    local_sample.xy_reset_counter = position.xy_reset_counter;
+    local_sample.z_reset_counter = position.z_reset_counter;
+    local_sample.heading_reset_counter = position.heading_reset_counter;
+    local_sample.position_ned = {position.x, position.y, position.z};
+    local_sample.velocity_ned = {position.vx, position.vy, position.vz};
+    local_sample.acceleration_ned = {position.ax, position.ay, position.az};
+
+    mpc_controller::frame::Px4AttitudeSample attitude_sample;
+    attitude_sample.timestamp_sample = attitude.timestamp_sample;
+    attitude_sample.quat_reset_counter = attitude.quat_reset_counter;
+    attitude_sample.body_frd_to_world_ned = {
+      attitude.q[0], attitude.q[1], attitude.q[2], attitude.q[3]};
+
+    mpc_controller::frame::Px4AngularVelocitySample angular_sample;
+    angular_sample.timestamp_sample = angular_velocity.timestamp_sample;
+    angular_sample.body_rate_frd = {
+      angular_velocity.xyz[0], angular_velocity.xyz[1], angular_velocity.xyz[2]};
+
+    mpc_controller::frame::VehicleStateData converted;
+    const uint64_t minimum_sample = std::min({
+      position.timestamp_sample, attitude.timestamp_sample, angular_velocity.timestamp_sample});
+    const uint64_t maximum_sample = std::max({
+      position.timestamp_sample, attitude.timestamp_sample, angular_velocity.timestamp_sample});
+    if (maximum_sample < minimum_sample
+      || static_cast<double>(maximum_sample - minimum_sample) * 1.0e-6 > max_sample_skew_seconds_) {
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++skew_rejection_count_;
+      }
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "VehicleState not published: PX4 samples are not time-aligned");
+      return;
+    }
+    if (!mpc_controller::frame::convert(local_sample, attitude_sample, angular_sample, converted)) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "VehicleState not published: PX4 estimator data invalid or non-finite");
+      return;
+    }
+
+    State state;
+    state.header.stamp = get_clock()->now();
+    state.header.frame_id = frame_id_;
+    state.position = converted.position_enu;
+    state.velocity = converted.velocity_enu;
+    state.acceleration = converted.acceleration_enu;
+    state.attitude = converted.body_flu_to_world_enu;
+    state.body_rate = converted.body_rate_flu;
+    state.yaw = converted.yaw_enu;
+    state.yaw_rate = converted.yaw_rate_enu;
+    // `valid` means the measured state is usable for observation/shadow
+    // processing. Active attitude/thrust control additionally requires
+    // PX4's heading readiness, exposed separately below.
+    state.valid = converted.position_valid && converted.velocity_valid
+      && converted.acceleration_valid && converted.attitude_valid
+      && converted.body_rate_valid;
+    state.position_valid = converted.position_valid;
+    state.velocity_valid = converted.velocity_valid;
+    state.acceleration_valid = converted.acceleration_valid;
+    state.attitude_valid = converted.attitude_valid;
+    state.body_rate_valid = converted.body_rate_valid;
+    state.heading_valid = converted.heading_valid;
+    state.yaw_valid = converted.heading_valid;
+    state.control_ready = converted.control_ready;
+    state.reset_counter = converted.reset_counter;
+    state.reset_counter_valid = true;
+    state_publisher_->publish(state);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++state_publish_count_;
+    }
+  }
+
+  void reportTiming(Clock::time_point now)
+  {
+    if (std::chrono::duration<double>(now - timing_report_at_).count() < 5.0) {
+      return;
+    }
+    timing_report_at_ = now;
+    const auto age_ms = [now](const Cache &cache) {
+        return cache.received
+          ? std::chrono::duration<double>(now - cache.received_at).count() * 1.0e3
+          : std::numeric_limits<double>::infinity();
+      };
+    const auto mean_gap_ms = [](const Cache &cache) {
+        return cache.gap_count > 0
+          ? cache.gap_sum_seconds / static_cast<double>(cache.gap_count) * 1.0e3
+          : 0.0;
+      };
+    const uint64_t minimum_sample = std::min({
+      position_.timestamp_sample, attitude_.timestamp_sample,
+      angular_velocity_.timestamp_sample});
+    const uint64_t maximum_sample = std::max({
+      position_.timestamp_sample, attitude_.timestamp_sample,
+      angular_velocity_.timestamp_sample});
+    const double skew_ms = maximum_sample >= minimum_sample
+      ? static_cast<double>(maximum_sample - minimum_sample) * 1.0e-3 : 0.0;
+    RCLCPP_INFO(
+      get_logger(),
+      "VehicleState timing: published=%lu stale_reject=%lu skew_reject=%lu "
+      "age_ms[pos att ang]=[%.1f %.1f %.1f] gap_mean_ms[pos att ang]=[%.2f %.2f %.2f] "
+      "gap_max_ms[pos att ang]=[%.2f %.2f %.2f] sample_skew_ms=%.3f",
+      static_cast<unsigned long>(state_publish_count_),
+      static_cast<unsigned long>(stale_rejection_count_),
+      static_cast<unsigned long>(skew_rejection_count_),
+      age_ms(position_cache_), age_ms(attitude_cache_), age_ms(angular_velocity_cache_),
+      mean_gap_ms(position_cache_), mean_gap_ms(attitude_cache_),
+      mean_gap_ms(angular_velocity_cache_),
+      position_cache_.gap_max_seconds * 1.0e3,
+      attitude_cache_.gap_max_seconds * 1.0e3,
+      angular_velocity_cache_.gap_max_seconds * 1.0e3, skew_ms);
+  }
+
+  std::mutex mutex_;
+  Px4Position position_{};
+  Px4Attitude attitude_{};
+  Px4AngularVelocity angular_velocity_{};
+  Cache position_cache_;
+  Cache attitude_cache_;
+  Cache angular_velocity_cache_;
+  Clock::time_point timing_report_at_ = Clock::now();
+  uint64_t state_publish_count_ = 0;
+  uint64_t stale_rejection_count_ = 0;
+  uint64_t skew_rejection_count_ = 0;
+  // PX4 v1.17 publishes this versioned uORB message on the DDS topic
+  // vehicle_local_position_v1. Keep the topic configurable for other
+  // px4_msgs revisions, but make the selected v1.17 default explicit.
+  std::string position_topic_ = "/fmu/out/vehicle_local_position_v1";
+  std::string attitude_topic_ = "/fmu/out/vehicle_attitude";
+  std::string angular_velocity_topic_ = "/fmu/out/vehicle_angular_velocity";
+  std::string output_topic_ = "vehicle_state";
+  std::string frame_id_ = "map";
+  double state_timeout_seconds_ = 0.25;
+  double max_sample_skew_seconds_ = 0.10;
+  double publish_rate_hz_ = 50.0;
+  rclcpp::Subscription<Px4Position>::SharedPtr position_subscription_;
+  rclcpp::Subscription<Px4Attitude>::SharedPtr attitude_subscription_;
+  rclcpp::Subscription<Px4AngularVelocity>::SharedPtr angular_velocity_subscription_;
   rclcpp::Publisher<State>::SharedPtr state_publisher_;
+  rclcpp::TimerBase::SharedPtr timer_;
 };
 
-int main(int argc, char** argv)
+int main(int argc, char **argv)
 {
   rclcpp::init(argc, argv);
   rclcpp::spin(std::make_shared<VehicleStateBridgeNode>());
