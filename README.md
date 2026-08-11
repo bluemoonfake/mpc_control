@@ -13,25 +13,68 @@ force and attitude, and converts collective force to PX4 normalized thrust. A
 fresh valid `HoverThrustEstimate` is latched when Offboard becomes active; the
 configured hover thrust is only a fallback.
 
-## Build
+## Build only
 
 ```bash
 make build
 source install/local_setup.bash
 ```
 
-Only the four runtime nodes and their message interfaces are built. Historical
-direct-wrench bridges, milestone launch files, timing probes, and standalone
-test executables are not part of the deployable package.
+Use this only when a standalone package build is needed. The normal simulation
+workflow below runs the build automatically. Only the four runtime nodes and
+their message interfaces are built.
 
-## Run
+## Simulation and Offboard workflow
+
+Start the complete simulator stack from the repository root:
 
 ```bash
-ros2 launch mpc_controller mpc_offboard.launch.py
+make sim
 ```
 
-The launch file does not arm the vehicle and does not request Offboard mode.
-The operator remains responsible for arming and changing mode in PX4.
+`make sim` checks the environment, builds the package with one parallel worker,
+then starts PX4 SITL, Gazebo, the uXRCE-DDS agent, and exactly one MPC ROS 2
+pipeline. Wait for Gazebo and PX4 to finish starting, then check the processes:
+
+```bash
+make status
+```
+
+Use `make logs` if one of the processes did not start. Do not run an additional
+`ros2 launch mpc_controller mpc_offboard.launch.py` after `make sim`; a second
+pipeline would publish duplicate references and setpoints.
+
+In a second terminal, source the generated ROS workspace and verify that state
+data is available:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source install/local_setup.bash
+ros2 topic echo /vehicle_state --once
+```
+
+The operator then performs the flight-mode sequence in PX4/QGroundControl:
+
+1. Arm and take off in Position mode.
+2. Establish a stable hover at the desired starting position.
+3. Change to Offboard mode. The current position and yaw are captured at the
+   Offboard rising edge.
+4. Confirm that the adapter is active before sending a trajectory command:
+
+```bash
+ros2 topic echo /px4_attitude_setpoint_preview --once
+```
+
+The expected fields are `px4_offboard_active: true`, `state: 2`, and all three
+freshness fields set to `true`. Only then call `start_line`, `start_circle`, or
+publish a relative step. The launch file never arms the vehicle and never
+requests Offboard mode itself.
+
+After the flight, change back to Position mode before stopping the simulator:
+
+```bash
+make stop
+```
 
 Runtime parameters are split between:
 
@@ -41,7 +84,7 @@ Runtime parameters are split between:
 The main command path is:
 
 - `/reference_trajectory` -> `/mpc_translational_output`
-- `/m3_control_output` -> `/fmu/in/vehicle_attitude_setpoint`
+- `/m3_control_output` -> `/fmu/in/vehicle_attitude_setpoint_v1`
 - `/fmu/out/hover_thrust_estimate` supplies hover-thrust calibration
 
 Use `/reference_step` for relative point commands while testing.
@@ -64,8 +107,9 @@ configured circle exactly once:
 ros2 service call /reference_generator_node/start_circle std_srvs/srv/Trigger "{}"
 ```
 
-The default one-revolution circle has radius 3 m and period 20 s, with 3 s quintic
-acceleration and deceleration ramps. It begins at the captured
-position without a setpoint jump, initially moves in ENU +Y, and holds the
-captured Z and yaw. After one revolution it stops and holds the start point.
-Leaving Offboard returns the generator to current-state hold tracking.
+The radius, period, direction, and ramp are read from `config/controller.yaml`.
+The circle begins at the captured position without a setpoint jump, initially
+moves in ENU +Y for `circle_direction: 1`, and holds the captured Z and yaw.
+After one revolution it stops and holds the start point. Leaving Offboard
+returns the generator to current-state hold tracking and cancels the active
+line or circle.
