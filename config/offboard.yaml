@@ -3,22 +3,29 @@ reference_generator_node:
     # Follow measured position/yaw before Offboard, then freeze at the rising edge.
     auto_capture_current_hold: true
 
-px4_attitude_setpoint_node:
+px4_torque_thrust_setpoint_node:
   ros__parameters:
-    # Freshness and timesync are the only state-machine gates in this profile.
-    publish_rate_hz: 50.0
+    # Direct torque bypasses PX4 attitude/rate control; keep the inner loop fast.
+    publish_rate_hz: 250.0
     heartbeat_rate_hz: 10.0
+    # Freshness limit for direct PX4 attitude and body-rate samples.
     state_timeout_seconds: 0.25
     command_timeout_seconds: 0.25
     timesync_timeout_seconds: 1.5
-    hover_thrust_estimate_timeout_seconds: 1.0
-    motor_count: 4
-    motor_thrust_coefficient_n_per_rad_s2: 8.54858e-6
-    motor_max_speed_rad_s: 1000.0
+    hover_thrust_estimate_timeout_seconds: 5.0
+    # Follow PX4 HTE slowly in ACTIVE to remove feedforward bias without a
+    # discontinuous collective-thrust change.
+    hover_thrust_tracking_time_constant_seconds: 2.0
+    hover_thrust_max_rate_per_second: 0.02
     vehicle_mass: 2.0
     gravity: 9.80665
-    # Fallback only. A fresh PX4 estimate is latched when Offboard becomes active.
-    hover_thrust_normalized: 0.765
+    # Fallback only. THR_MDL_FAC=0.68 moves x500 hover thrust near PX4's 0.60
+    # airframe default; a fresh HTE initializes and then slowly updates it.
+    hover_thrust_normalized: 0.60
+    # Baseline normalized SO(3) PD. Inertia/feedforward are intentionally off.
+    attitude_gain: [0.8, 0.8, 0.4]
+    rate_gain: [0.15, 0.15, 0.10]
+    normalized_torque_limit: [0.30, 0.30, 0.20]
 
 mpc_controller_node:
   ros__parameters:
@@ -26,5 +33,3 @@ mpc_controller_node:
     strict_validation: false
     enable_thrust_feasibility: false
     use_force_norm_for_collective_thrust: true
-    force_feedback_kp_n_per_m: [0.0, 0.0, 0.0]
-    force_feedback_kv_n_per_m_s: [0.0, 0.0, 0.0]

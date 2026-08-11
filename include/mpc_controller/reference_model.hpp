@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <string>
@@ -31,6 +32,41 @@ struct Parameters
   int circle_direction = 1;
   double hold_yaw_rad = 0.0;
 };
+
+struct CircleTiming
+{
+  double cruise_speed_m_s = 0.0;
+  double ramp_seconds = 0.0;
+  double period_seconds = 0.0;
+  bool valid = false;
+};
+
+inline CircleTiming deriveCircleTiming(
+  double radius_m, double reference_speed_limit_m_s,
+  double acceleration_limit_m_s2) noexcept
+{
+  CircleTiming output;
+  if (!std::isfinite(radius_m) || radius_m <= 0.0
+    || !std::isfinite(reference_speed_limit_m_s) || reference_speed_limit_m_s <= 0.0
+    || !std::isfinite(acceleration_limit_m_s2) || acceleration_limit_m_s2 <= 0.0) {
+    return output;
+  }
+
+  constexpr double pi = 3.14159265358979323846;
+  // smoothstep5'(tau) peaks at 1.875. Limit cruise speed by both the
+  // configured reference cap and the centripetal-acceleration cap, then pick
+  // the ramp duration so its peak tangential acceleration uses the same cap.
+  output.cruise_speed_m_s = std::min(
+    reference_speed_limit_m_s, std::sqrt(acceleration_limit_m_s2 * radius_m));
+  output.ramp_seconds = 1.875 * output.cruise_speed_m_s / acceleration_limit_m_s2;
+  output.period_seconds = output.ramp_seconds
+    + 2.0 * pi * radius_m / output.cruise_speed_m_s;
+  output.valid = std::isfinite(output.cruise_speed_m_s)
+    && std::isfinite(output.ramp_seconds) && std::isfinite(output.period_seconds)
+    && output.cruise_speed_m_s > 0.0 && output.ramp_seconds > 0.0
+    && 2.0 * output.ramp_seconds < output.period_seconds;
+  return output;
+}
 
 inline bool finite(const std::array<double, 3> &value) noexcept
 {

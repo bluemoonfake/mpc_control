@@ -3,15 +3,33 @@
 This ROS 2 package implements the active attitude-setpoint Offboard pipeline:
 
 ```text
-reference_generator_node -> mpc_controller_node -> px4_attitude_setpoint_node -> PX4
-               vehicle_state_bridge_node -------^                    
+reference_generator_node -> mpc_controller_node -> px4_torque_thrust_setpoint_node -> PX4
+               vehicle_state_bridge_node -------^
 ```
 
-The controller runs at 50 Hz. It captures the current position and yaw before
-Offboard, solves the independent-axis translational MPC, constructs the desired
-force and attitude, and converts collective force to PX4 normalized thrust. A
-fresh valid `HoverThrustEstimate` is latched when Offboard becomes active; the
-configured hover thrust is only a fallback.
+The translational MPC runs at 50 Hz and the direct torque loop at 250 Hz. The
+pipeline captures the current position and yaw before Offboard, solves the
+independent-axis translational MPC, constructs the desired
+force and attitude, closes a normalized SO(3) attitude/rate feedback loop, and
+publishes torque plus collective thrust directly to PX4's control allocator. A
+fresh valid `HoverThrustEstimate` initializes the Offboard thrust mapping and
+is then followed through a rate-limited low-pass filter; the configured hover
+thrust is only a fallback. Brief invalid estimator samples do not overwrite the
+most recent valid estimate; that sample remains usable only for the configured
+HTE timeout. The Gazebo x500 airframe uses PX4's native
+`THR_MDL_FAC` compensation so the ROS force-to-thrust mapping remains linear.
+Its fallback hover thrust is therefore `0.60`, close to the compensated HTE,
+rather than the uncompensated value used by the earlier actuator profile.
+
+The torque loop reads PX4 attitude and angular velocity directly with sensor
+QoS. The aggregated `/vehicle_state` remains the measured input of the slower
+translational MPC and is not the inner-loop feedback path.
+
+The Z prediction model uses the identified first-order time constant from
+`model_time_constant_xyz`. With `tau_z=0.13 s`, each horizon interval computes
+`alpha(dt)=exp(-dt/tau_z)`; XY retains the direct acceleration-command model.
+The optimizer input `u` is sent to the thrust path, while `a[k+1]` remains the
+predicted delayed plant response published for diagnostics.
 
 ## Build only
 
@@ -62,7 +80,7 @@ The operator then performs the flight-mode sequence in PX4/QGroundControl:
 4. Confirm that the adapter is active before sending a trajectory command:
 
 ```bash
-ros2 topic echo /px4_attitude_setpoint_preview --once
+ros2 topic echo /px4_torque_thrust_setpoint_preview --once
 ```
 
 The expected fields are `px4_offboard_active: true`, `state: 2`, and all three
@@ -84,7 +102,8 @@ Runtime parameters are split between:
 The main command path is:
 
 - `/reference_trajectory` -> `/mpc_translational_output`
-- `/m3_control_output` -> `/fmu/in/vehicle_attitude_setpoint_v1`
+- `/m3_control_output` -> `/fmu/in/vehicle_torque_setpoint`
+- `/m3_control_output` -> `/fmu/in/vehicle_thrust_setpoint`
 - `/fmu/out/hover_thrust_estimate` supplies hover-thrust calibration
 
 Use `/reference_step` for relative point commands while testing.
@@ -107,7 +126,10 @@ configured circle exactly once:
 ros2 service call /reference_generator_node/start_circle std_srvs/srv/Trigger "{}"
 ```
 
-The radius, period, direction, and ramp are read from `config/controller.yaml`.
+Set only `circle_radius` for the geometry. The generator bounds cruise speed by
+`circle_reference_speed_limit_m_s` and centripetal acceleration, then derives a
+quintic ramp and period from `circle_acceleration_limit_m_s2`. The configured
+4 m/s reference cap leaves tracking margin below 5 m/s measured speed.
 The circle begins at the captured position without a setpoint jump, initially
 moves in ENU +Y for `circle_direction: 1`, and holds the captured Z and yaw.
 After one revolution it stops and holds the start point. Leaving Offboard

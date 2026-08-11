@@ -36,6 +36,7 @@ public:
     declare_parameter("dt_later", config_.dt_later);
     declare_parameter("max_iterations", config_.max_iterations);
     declare_parameter("model_alpha_xyz", std::vector<double>{0.0, 0.0, 0.0});
+    declare_parameter("model_time_constant_xyz", std::vector<double>{0.0, 0.0, 0.0});
     declare_parameter("admm_rho", config_.admm_rho);
     declare_parameter("solver_absolute_tolerance", config_.solver_absolute_tolerance);
     declare_parameter("solver_relative_tolerance", config_.solver_relative_tolerance);
@@ -79,6 +80,7 @@ public:
       && getArrayParameter("q_z", config_.q_z)
       && getArrayParameter("s_z", config_.s_z)
       && getArrayParameter("model_alpha_xyz", config_.model_alpha_xyz)
+      && getArrayParameter("model_time_constant_xyz", config_.model_time_constant_xyz)
       && getArrayParameter("force_feedback_kp_n_per_m", force_feedback_kp_n_per_m_)
       && getArrayParameter("force_feedback_kv_n_per_m_s", force_feedback_kv_n_per_m_s_);
     get_parameter("admm_rho", config_.admm_rho);
@@ -254,13 +256,31 @@ private:
     const auto now = get_clock()->now();
     const double reference_age = (now - reference_received_at_).seconds();
     const double state_age = (now - state_received_at_).seconds();
-    if (!std::isfinite(reference_age) || reference_age < 0.0
+    const bool stale_input = !std::isfinite(reference_age) || reference_age < 0.0
       || reference_age > reference_timeout_seconds_
-      || !std::isfinite(state_age) || state_age < 0.0 || state_age > state_timeout_seconds_) {
+      || !std::isfinite(state_age) || state_age < 0.0 || state_age > state_timeout_seconds_;
+    if (stale_input) {
+      if (!m2_stale_active_) {
+        // A stale interval breaks the continuity assumed by the warm start and
+        // by the first-input rate constraint.  Restart from neutral acceleration
+        // when fresh measurements return instead of reusing the pre-gap state.
+        controller_->reset();
+        m2_stale_active_ = true;
+      }
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "M2 update rejected: reference or measured state is stale");
+        "M2 update rejected: stale input: reference_age=%.3f s (limit %.3f s), "
+        "state_age=%.3f s (limit %.3f s)",
+        reference_age, reference_timeout_seconds_, state_age, state_timeout_seconds_);
       return;
+    }
+    if (m2_stale_active_) {
+      RCLCPP_INFO(
+        get_logger(),
+        "M2 input recovered; solver warm start and input-rate memory were reset: "
+        "reference_age=%.3f s, state_age=%.3f s",
+        reference_age, state_age);
+      m2_stale_active_ = false;
     }
     if (strict_validation_ && (!state_->valid || !state_->position_valid || !state_->velocity_valid
       || !state_->acceleration_valid || state_->header.frame_id.empty())) {
@@ -350,8 +370,7 @@ private:
     solve_time_max_seconds_ = std::max(solve_time_max_seconds_, result.solve_time_seconds);
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 2000,
-      "MPC update seq=%lu measured_x0=[p %.3f %.3f %.3f v %.3f %.3f %.3f a %.3f %.3f %.3f] "
-      "u=[%.3f %.3f %.3f] ref_age=%.1f ms state_age=%.1f ms "
+      "MPC update seq=%lu measured_x0=[p %.3f %.3f %.3f v %.3f %.3f %.3f a %.3f %.3f %.3f] ""u=[%.3f %.3f %.3f] ref_age=%.1f ms state_age=%.1f ms "
       "solve=%.3f ms mean=%.3f ms max=%.3f ms",
       static_cast<unsigned long>(output.sequence),
       measured.position[0], measured.position[1], measured.position[2],
@@ -375,12 +394,12 @@ private:
     }
 
     mpc_controller::mrs_control::Input m3_input;
-    // u is the optimizer input of the acceleration-response model.  The
-    // physical acceleration command is the first predicted acceleration
-    // state, which equals u only for alpha=0, beta=1.
+    // u is the actuator acceleration command. The predicted acceleration
+    // state a[k+1] models the delayed plant response and is diagnostic only.
+    // Sending a[k+1] back to the actuator would feed the measured transient
+    // through the command path and apply the lag twice.
     Eigen::Vector3d force_acceleration_command(
-      result.first_predicted_acceleration[0], result.first_predicted_acceleration[1],
-      result.first_predicted_acceleration[2]);
+      result.control[0], result.control[1], result.control[2]);
     for (int axis = 0; axis < 3; ++axis) {
       const double feedback_force_n = force_feedback_kp_n_per_m_[axis]
         * (yaw_reference.position[axis] - measured.position[axis])
@@ -480,6 +499,7 @@ private:
   std::mutex mutex_;
   bool config_valid_ = true;
   bool m3_config_valid_ = true;
+  bool m2_stale_active_ = false;
   bool strict_validation_ = true;
   double update_rate_hz_ = 50.0;
   double reference_timeout_seconds_ = 1.5;

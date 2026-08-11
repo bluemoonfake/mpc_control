@@ -33,8 +33,8 @@ public:
     declare_parameter("line_duration_seconds", parameters_.line_duration_seconds);
     declare_parameter("circle_center", std::vector<double>{0.0, 0.0, 1.0});
     declare_parameter("circle_radius", parameters_.circle_radius);
-    declare_parameter("circle_period_seconds", parameters_.circle_period_seconds);
-    declare_parameter("circle_ramp_seconds", parameters_.circle_ramp_seconds);
+    declare_parameter("circle_reference_speed_limit_m_s", circle_reference_speed_limit_m_s_);
+    declare_parameter("circle_acceleration_limit_m_s2", circle_acceleration_limit_m_s2_);
     declare_parameter("circle_phase_rad", parameters_.circle_phase_rad);
     declare_parameter("circle_direction", parameters_.circle_direction);
     declare_parameter("hold_yaw_rad", parameters_.hold_yaw_rad);
@@ -66,8 +66,8 @@ public:
     get_parameter("line_duration_seconds", parameters_.line_duration_seconds);
     getVectorParameter("circle_center", parameters_.circle_center);
     get_parameter("circle_radius", parameters_.circle_radius);
-    get_parameter("circle_period_seconds", parameters_.circle_period_seconds);
-    get_parameter("circle_ramp_seconds", parameters_.circle_ramp_seconds);
+    get_parameter("circle_reference_speed_limit_m_s", circle_reference_speed_limit_m_s_);
+    get_parameter("circle_acceleration_limit_m_s2", circle_acceleration_limit_m_s2_);
     get_parameter("circle_phase_rad", parameters_.circle_phase_rad);
     get_parameter("circle_direction", parameters_.circle_direction);
     get_parameter("hold_yaw_rad", parameters_.hold_yaw_rad);
@@ -87,7 +87,17 @@ public:
     get_parameter("sample_period_seconds", sample_period_seconds_);
     get_parameter("publish_rate_hz", publish_rate_hz_);
 
-    valid_config_ = valid_config_ && mpc_controller::reference::valid(parameters_)
+    const auto circle_timing = mpc_controller::reference::deriveCircleTiming(
+      parameters_.circle_radius, circle_reference_speed_limit_m_s_,
+      circle_acceleration_limit_m_s2_);
+    if (circle_timing.valid) {
+      parameters_.circle_period_seconds = circle_timing.period_seconds;
+      parameters_.circle_ramp_seconds = circle_timing.ramp_seconds;
+      circle_cruise_speed_m_s_ = circle_timing.cruise_speed_m_s;
+    }
+
+    valid_config_ = valid_config_ && circle_timing.valid
+      && mpc_controller::reference::valid(parameters_)
       && std::all_of(
         line_relative_delta_.begin(), line_relative_delta_.end(),
         [](double value) {return std::isfinite(value);})
@@ -104,6 +114,13 @@ public:
     if (!valid_config_) {
       RCLCPP_ERROR(get_logger(), "Invalid reference generator parameters; publishing disabled");
     } else {
+      RCLCPP_INFO(
+        get_logger(),
+        "Circle timing derived: radius=%.3f m cruise=%.3f m/s ramp=%.3f s period=%.3f s "
+        "acceleration_limit=%.3f m/s^2",
+        parameters_.circle_radius, circle_cruise_speed_m_s_,
+        parameters_.circle_ramp_seconds, parameters_.circle_period_seconds,
+        circle_acceleration_limit_m_s2_);
       publisher_ = create_publisher<Reference>("reference_trajectory", 10);
       step_subscription_ = create_subscription<ReferenceStep>(
         "reference_step", 10,
@@ -485,6 +502,9 @@ private:
   double sample_period_seconds_ = 0.1;
   double publish_rate_hz_ = 1.0;
   double state_timeout_seconds_ = 0.25;
+  double circle_reference_speed_limit_m_s_ = 4.0;
+  double circle_acceleration_limit_m_s2_ = 1.5;
+  double circle_cruise_speed_m_s_ = 0.0;
   bool hold_current_state_on_enable_ = false;
   bool auto_capture_current_hold_ = false;
   bool offboard_active_ = false;

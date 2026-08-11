@@ -1,9 +1,14 @@
 std_msgs/Header header
 uint64 px4_timestamp
-# Same field semantics as VehicleAttitudeSetpoint, but this is diagnostic only.
+# Desired attitude in PX4 FRD/NED convention, diagnostic only.
 float32[4] q_d_wxyz
+# Commands sent to PX4's control allocator.
+float32[3] torque_body_frd
 float32[3] thrust_body_frd
-float32 yaw_sp_move_rate_ned_rad_s
+# SO(3) feedback terms in body FLU.
+float64[3] attitude_error
+float64[3] body_rate_error_rad_s
+bool torque_saturated
 bool valid
 bool prestream_enabled
 bool px4_offboard_active
@@ -11,6 +16,10 @@ uint8 state
 # SITL-first gates. Numeric validity below is diagnostic-only in this phase.
 float64 state_age_seconds
 bool state_fresh
+float64 attitude_age_seconds
+float64 body_rate_age_seconds
+bool attitude_fresh
+bool body_rate_fresh
 bool m3_fresh
 bool timesync_fresh
 bool yaw_hold_valid
@@ -18,9 +27,8 @@ float64 yaw_hold_enu_rad
 bool vehicle_state_valid
 bool m3_message_valid
 bool m3_math_valid
-float64 motor_model_max_collective_thrust_n
 # PX4 hover-thrust estimator evidence and the calibration actually used for
-# force [N] -> VehicleAttitudeSetpoint normalized thrust conversion.
+# force [N] -> VehicleThrustSetpoint normalized thrust conversion.
 float32 hover_thrust_estimate
 float32 hover_thrust_estimate_variance
 float64 hover_thrust_estimate_age_seconds

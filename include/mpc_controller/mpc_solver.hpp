@@ -25,6 +25,9 @@ struct Configuration
   double dt_first = 0.01;
   double dt_later = 0.20;
   double model_alpha = 0.0;
+  // Optional first-order actuator time constant. Zero preserves the explicit
+  // model_alpha contract; a positive value computes alpha = exp(-dt / tau).
+  double model_time_constant = 0.0;
   std::array<double, 3> stage_weights{};
   std::array<double, 3> terminal_weights{};
   double max_speed = 0.0;
@@ -59,6 +62,8 @@ inline bool validConfiguration(const Configuration &configuration) noexcept
     && finite_positive(configuration.dt_later)
     && std::isfinite(configuration.model_alpha)
     && configuration.model_alpha >= 0.0 && configuration.model_alpha < 1.0
+    && std::isfinite(configuration.model_time_constant)
+    && configuration.model_time_constant >= 0.0
     && valid_weights(configuration.stage_weights)
     && valid_weights(configuration.terminal_weights)
     && finite_positive(configuration.max_speed)
@@ -87,6 +92,12 @@ inline State inputMatrix(double dt, double alpha) noexcept
 {
   const double beta = 1.0 - alpha;
   return State(0.5 * beta * dt * dt, beta * dt, beta);
+}
+
+inline double effectiveModelAlpha(
+  double dt, double configured_alpha, double time_constant) noexcept
+{
+  return time_constant > 0.0 ? std::exp(-dt / time_constant) : configured_alpha;
 }
 
 class Solver final
@@ -225,8 +236,10 @@ private:
 
     for (std::size_t step = 0; step < kHorizonLength; ++step) {
       const double dt = step == 0 ? configuration_.dt_first : configuration_.dt_later;
-      const Eigen::Matrix3d a = transitionMatrix(dt, configuration_.model_alpha);
-      const State b = inputMatrix(dt, configuration_.model_alpha);
+      const double alpha = effectiveModelAlpha(
+        dt, configuration_.model_alpha, configuration_.model_time_constant);
+      const Eigen::Matrix3d a = transitionMatrix(dt, alpha);
+      const State b = inputMatrix(dt, alpha);
       state_transition = a * state_transition;
       control_transition = a * control_transition;
       control_transition.col(static_cast<Eigen::Index>(step)) += b;

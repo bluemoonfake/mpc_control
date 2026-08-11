@@ -60,6 +60,7 @@ struct Config
   double dt_later = kDtLater;
   int max_iterations = 400;
   std::array<double, 3> model_alpha_xyz{0.0, 0.0, 0.0};
+  std::array<double, 3> model_time_constant_xyz{0.0, 0.0, 0.0};
   double admm_rho = 0.02;
   double solver_absolute_tolerance = 1.0e-5;
   double solver_relative_tolerance = 1.0e-5;
@@ -92,8 +93,8 @@ struct UpdateResult
 {
   bool valid = false;
   FailureReason failure_reason = FailureReason::none;
-  std::array<double, 3> control{};  // optimizer input u0 for X/Y/Z
-  std::array<double, 3> first_predicted_acceleration{};  // a[k+1]
+  std::array<double, 3> control{};  // actuator acceleration command u0 for X/Y/Z
+  std::array<double, 3> first_predicted_acceleration{};  // modeled plant state a[k+1]
   std::array<int, 3> iterations{};
   std::array<double, 3> initial_state_x{};
   std::array<double, 3> initial_state_y{};
@@ -129,6 +130,11 @@ inline bool validConfig(const Config &config) noexcept
     && std::all_of(config.model_alpha_xyz.begin(), config.model_alpha_xyz.end(), [](double value) {
       return std::isfinite(value) && value >= 0.0 && value < 1.0;
     })
+    && std::all_of(
+      config.model_time_constant_xyz.begin(), config.model_time_constant_xyz.end(),
+      [](double value) {
+        return std::isfinite(value) && value >= 0.0;
+      })
     && std::isfinite(config.admm_rho) && config.admm_rho > 0.0
     && std::isfinite(config.solver_absolute_tolerance)
     && config.solver_absolute_tolerance > 0.0
@@ -335,6 +341,7 @@ private:
     output.dt_first = config.dt_first;
     output.dt_later = config.dt_later;
     output.model_alpha = config.model_alpha_xyz[axis];
+    output.model_time_constant = config.model_time_constant_xyz[axis];
     output.stage_weights = stage_weights;
     output.terminal_weights = terminal_weights;
     output.max_speed = max_speed;

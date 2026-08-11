@@ -18,7 +18,7 @@ set(msg_files
   "msg/VehicleState.msg"
   "msg/MpcTranslationalOutput.msg"
   "msg/M3ControlOutput.msg"
-  "msg/AttitudeSetpointPreview.msg"
+  "msg/TorqueThrustSetpointPreview.msg"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -41,7 +41,7 @@ endfunction()
 add_mpc_node(reference_generator_node src/reference_generator_node.cpp)
 add_mpc_node(mpc_controller_node src/mpc_controller_node.cpp)
 add_mpc_node(vehicle_state_bridge_node src/vehicle_state_bridge_node.cpp)
-add_mpc_node(px4_attitude_setpoint_node src/px4_attitude_setpoint_node.cpp)
+add_mpc_node(px4_torque_thrust_setpoint_node src/px4_torque_thrust_setpoint_node.cpp)
 
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 

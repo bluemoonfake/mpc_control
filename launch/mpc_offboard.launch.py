@@ -48,8 +48,8 @@ def generate_launch_description():
         ),
         Node(
             package="mpc_controller",
-            executable="px4_attitude_setpoint_node",
-            name="px4_attitude_setpoint_node",
+            executable="px4_torque_thrust_setpoint_node",
+            name="px4_torque_thrust_setpoint_node",
             parameters=[offboard_config],
             output="screen",
         ),

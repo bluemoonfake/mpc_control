@@ -11,7 +11,8 @@ uint64 timer_callback_end_steady_timestamp_ns
 float64[3] desired_acceleration_m_s2
 # Desired inertial force in ENU, Newtons.
 float64[3] desired_force_world_n
-# Raw independent-axis M2 command and force before coupled feasibility shaping.
+# Raw independent-axis actuator acceleration command and force before coupled
+# feasibility shaping. This is optimizer input u, not modeled state a[k+1].
 float64[3] raw_desired_acceleration_m_s2
 float64[3] feasible_desired_acceleration_m_s2
 float64[3] raw_desired_force_world_n
