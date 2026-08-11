@@ -1,4 +1,4 @@
-# Compact simulator orchestration for the M5 normalized-wrench path.
+# Compact simulator orchestration for the PX4 attitude-setpoint path.
 #
 # The Makefile does not arm PX4 and does not change PX4 failsafe parameters.
 # PX4 and px4_msgs remain external dependencies of this source-only branch.
@@ -20,9 +20,12 @@ DDS_TRANSPORT ?= udp4
 DDS_PORT ?= 8888
 
 ROS_PACKAGE ?= mpc_controller
-ROS_LAUNCH ?= m5_sitl.launch.py
+ROS_LAUNCH ?= mpc_offboard.launch.py
 ROS_LAUNCH_ARGS ?=
 ROS_BUILD_ARGS ?= --symlink-install
+# The package contains several Eigen-heavy translation units. Building all of
+# them with the host-default job count can exhaust RAM and kill cc1plus.
+ROS_BUILD_PARALLEL_WORKERS ?= 1
 
 SIM_RUNTIME_DIR ?= /tmp/mpc_controller_sim
 PX4_LOG := $(SIM_RUNTIME_DIR)/px4.log
@@ -75,7 +78,7 @@ if test -n "$$stale_cache"; then \
 	echo "Recreating only the generated PX4 build directory: $(PX4_BUILD_DIR)"; \
 	rm -rf "$(PX4_BUILD_DIR)"; \
 fi; \
-cd "$(PX4_DIR)" && exec make "$(PX4_TARGET)" "$(PX4_SIM)"
+cd "$(PX4_DIR)" && exec make "$(PX4_TARGET)" "$(PX4_SIM)" < <(exec tail -f /dev/null)
 endef
 
 help:
@@ -86,12 +89,13 @@ help:
 	@echo "make status  - show simulator process status"
 	@echo "make logs    - follow PX4, DDS and ROS logs"
 	@echo ""
-	@echo "Overrides: PX4_DIR=... PX4_MSGS_SETUP=... DDS_PORT=... GZ_GUI_QT_PLATFORM=wayland|xcb ROS_LAUNCH_ARGS=..."
+	@echo "Overrides: PX4_DIR=... PX4_MSGS_SETUP=... DDS_PORT=... GZ_GUI_QT_PLATFORM=wayland|xcb ROS_LAUNCH=... ROS_LAUNCH_ARGS=..."
 
 check-build:
 	@test -f "$(ROS_SETUP)" || { echo "Missing ROS setup: $(ROS_SETUP)"; exit 1; }
 	@source "$(ROS_SETUP)"; \
 	if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; \
+	if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; \
 	command -v ros2 >/dev/null || { echo "ros2 is not available in PATH"; exit 1; }; \
 	command -v colcon >/dev/null || { echo "colcon is not available in PATH"; exit 1; }; \
 	ros2 pkg prefix px4_msgs >/dev/null || { echo "px4_msgs is not available; set PX4_MSGS_SETUP"; exit 1; }
@@ -123,7 +127,10 @@ check: check-build
 build: check-build
 	@source "$(ROS_SETUP)"; \
 	if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; \
-	colcon build --base-paths . --packages-select $(ROS_PACKAGE) $(ROS_BUILD_ARGS)
+	if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; \
+	CMAKE_BUILD_PARALLEL_LEVEL=$(ROS_BUILD_PARALLEL_WORKERS) \
+	colcon build --base-paths . --packages-select $(ROS_PACKAGE) \
+		--parallel-workers $(ROS_BUILD_PARALLEL_WORKERS) $(ROS_BUILD_ARGS)
 
 px4: check
 	@mkdir -p "$(SIM_RUNTIME_DIR)"

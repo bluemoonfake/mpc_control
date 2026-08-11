@@ -229,7 +229,10 @@ public:
     solver_y_("mpc_y", config.solver_verbose, config.max_iterations,
       toVector(config.q_xy), toVector(config.s_xy), config.dt_first, config.dt_later, 0.0, 1.0),
     solver_z_("mpc_z", config.solver_verbose, config.max_iterations,
-      toVector(config.q_z), toVector(config.s_z), config.dt_first, config.dt_later, 0.5, 0.5),
+      // M3 consumes u_z directly as a desired physical acceleration. Keep the
+      // prediction model at the same command boundary so a raw measured a_z
+      // transient cannot be inverted into a large actuator command.
+      toVector(config.q_z), toVector(config.s_z), config.dt_first, config.dt_later, 0.0, 1.0),
     initial_x_(3, 1), initial_y_(3, 1), initial_z_(3, 1),
     reference_x_(kHorizonLength * kStateSize, 1),
     reference_y_(kHorizonLength * kStateSize, 1),

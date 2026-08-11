@@ -1,0 +1,58 @@
+std_msgs/Header header
+
+# Reject reason values are stable for offline log analysis.
+uint8 REJECT_NONE=0
+uint8 REJECT_POSITION_STALE=1
+uint8 REJECT_ATTITUDE_STALE=2
+uint8 REJECT_ANGULAR_VELOCITY_STALE=3
+uint8 REJECT_SAMPLE_SKEW=4
+uint8 REJECT_NON_FINITE=5
+uint8 REJECT_TIMESTAMP=6
+
+uint64 sequence
+bool vehicle_state_published
+bool publication_rejected
+uint8 reject_reason
+float64 sample_skew_ms
+
+bool stale_position
+bool stale_attitude
+bool stale_angular_velocity
+
+uint64 position_sample_timestamp
+uint64 attitude_sample_timestamp
+uint64 angular_velocity_sample_timestamp
+
+# Monotonic timestamps from the bridge process steady clock.
+uint64 position_receipt_steady_timestamp_ns
+uint64 attitude_receipt_steady_timestamp_ns
+uint64 angular_velocity_receipt_steady_timestamp_ns
+
+float64 position_age_ms
+float64 attitude_age_ms
+float64 angular_velocity_age_ms
+float64 position_interarrival_ms
+float64 attitude_interarrival_ms
+float64 angular_velocity_interarrival_ms
+
+uint64 position_accepted_count
+uint64 attitude_accepted_count
+uint64 angular_velocity_accepted_count
+uint64 stale_reject_count
+uint64 skew_reject_count
+uint64 last_vehicle_state_publication_steady_timestamp_ns
+
+bool first_reject_latched
+uint64 first_reject_steady_timestamp_ns
+uint8 first_reject_reason
+float64 first_reject_position_age_ms
+float64 first_reject_attitude_age_ms
+float64 first_reject_angular_velocity_age_ms
+float64 first_reject_sample_skew_ms
+uint64 first_reject_position_sample_timestamp
+uint64 first_reject_attitude_sample_timestamp
+uint64 first_reject_angular_velocity_sample_timestamp
+uint64 first_reject_position_receipt_steady_timestamp_ns
+uint64 first_reject_attitude_receipt_steady_timestamp_ns
+uint64 first_reject_angular_velocity_receipt_steady_timestamp_ns
+uint64 first_reject_previous_vehicle_state_publication_steady_timestamp_ns

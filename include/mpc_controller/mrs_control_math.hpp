@@ -1,11 +1,14 @@
 #pragma once
 
+#include "mpc_controller/coupled_thrust_feasibility.hpp"
+
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <optional>
 
 namespace mpc_controller::mrs_control
@@ -16,38 +19,25 @@ using Matrix3 = Eigen::Matrix3d;
 
 struct Parameters
 {
-  // Verified from the PX4 gz_x500 SDF.
   double mass_kg = 2.0;
-  Vector3 inertia_kg_m2{0.02166666666666667, 0.02166666666666667, 0.04000000000000001};
   double gravity_m_s2 = 9.80665;
-
-  // Values match the pinned MRS public MPC controller configuration.
-  Vector3 attitude_gain_rad_s{5.0, 5.0, 1.0};
-  Vector3 rate_gain_s_inv{4.0, 4.0, 4.0};
-
-  // PX4's VehicleTorqueSetpoint is a normalized allocator coordinate. These
-  // gains are deliberately separate from the inertia-weighted MRS parity
-  // gains above. Defaults follow PX4 v1.17 gz_x500 rate P gains with
-  // MC_*RATE_K=1: roll/pitch 0.15, yaw 0.20.
-  Vector3 normalized_rate_gain_s_inv{0.15, 0.15, 0.20};
-  Vector3 normalized_torque_limit{1.0, 1.0, 1.0};
-
-  // The pinned MRS MPC config uses a 90 degree tilt failsafe. These rate
-  // bounds are explicit shadow-mode bounds; active PX4 limits are an M4 task.
-  Vector3 max_body_rate_rad_s{4.0, 4.0, 4.0};
   double max_tilt_rad = 1.5707963267948966;
+
+  // External PX4 normalized collective contract. The plant maximum is kept
+  // for diagnostics only and must not be used as the control limit.
+  double hover_thrust_normalized = 0.765;
+  double max_normalized_collective_thrust = 1.0;
+  double plant_max_collective_thrust_n = 34.19432;
+  bool enable_thrust_feasibility = true;
+  bool use_force_norm_for_collective_thrust = false;
 };
 
 struct Input
 {
   Vector3 desired_acceleration_m_s2{};  // M2 control_input, not predicted a[k+1]
-  Vector3 measured_body_rate_rad_s{};   // FLU body frame
   Eigen::Quaterniond measured_body_to_world{Eigen::Quaterniond::Identity()};
   double desired_yaw_rad = 0.0;
-  double desired_yaw_rate_rad_s = 0.0;
-  bool desired_yaw_rate_valid = false;
   bool attitude_valid = false;
-  bool body_rate_valid = false;
   bool heading_valid = false;
   bool control_ready = false;
 };
@@ -56,13 +46,36 @@ enum class FailureReason
 {
   none,
   invalid_parameters,
+  non_finite_input,
   invalid_input,
   degenerate_force,
   tilt_limit,
-  heading_singularity,
-  invalid_output,
-  non_finite_output
+  degenerate_heading_basis,
+  invalid_rotation,
+  rate_command_invalid,
+  non_finite_output,
+  feasibility_invalid,
+  invalid_collective_projection
 };
+
+inline const char *failureReasonName(FailureReason reason) noexcept
+{
+  switch (reason) {
+    case FailureReason::none: return "NONE";
+    case FailureReason::invalid_parameters: return "INVALID_PARAMETERS";
+    case FailureReason::non_finite_input: return "NON_FINITE_INPUT";
+    case FailureReason::invalid_input: return "INVALID_INPUT";
+    case FailureReason::degenerate_force: return "DEGENERATE_FORCE";
+    case FailureReason::tilt_limit: return "TILT_LIMIT";
+    case FailureReason::degenerate_heading_basis: return "DEGENERATE_HEADING_BASIS";
+    case FailureReason::invalid_rotation: return "INVALID_ROTATION";
+    case FailureReason::rate_command_invalid: return "RATE_COMMAND_INVALID";
+    case FailureReason::non_finite_output: return "NON_FINITE_OUTPUT";
+    case FailureReason::feasibility_invalid: return "FEASIBILITY_INVALID";
+    case FailureReason::invalid_collective_projection: return "INVALID_COLLECTIVE_PROJECTION";
+  }
+  return "UNKNOWN";
+}
 
 struct Output
 {
@@ -71,19 +84,19 @@ struct Output
   FailureReason failure_reason = FailureReason::none;
   Vector3 desired_acceleration_m_s2{};
   Vector3 desired_force_world_n{};
+  Vector3 raw_desired_acceleration_m_s2{};
+  Vector3 feasible_desired_acceleration_m_s2{};
+  Vector3 raw_desired_force_world_n{};
+  Vector3 feasible_desired_force_world_n{};
+  double raw_force_norm_n = 0.0;
+  double feasible_force_norm_n = 0.0;
+  double force_limit_n = 0.0;
+  double feasibility_correction_norm_m_s2 = 0.0;
+  bool feasibility_constraint_active = false;
   Matrix3 desired_rotation_world_from_body = Matrix3::Identity();
   Eigen::Quaterniond desired_body_to_world{Eigen::Quaterniond::Identity()};
   double desired_thrust_force_n = 0.0;
   double tilt_angle_rad = 0.0;
-  Vector3 orientation_error{};
-  Vector3 desired_body_rate_rad_s{};
-  Vector3 body_rate_error_rad_s{};
-  // MRS attitude-rate control-group action. This is dimensionless at the
-  // MRS hardware boundary and remains diagnostic only.
-  Vector3 control_group_action{};
-  // Explicit PX4 normalized torque command in body FLU coordinates.
-  Vector3 normalized_torque_command_flu{};
-  bool normalized_torque_saturated = false;
 };
 
 inline bool finite(const Vector3 &value) noexcept
@@ -99,22 +112,12 @@ inline bool finite(const Matrix3 &value) noexcept
 inline bool validParameters(const Parameters &parameters) noexcept
 {
   return std::isfinite(parameters.mass_kg) && parameters.mass_kg > 0.0
-    && finite(parameters.inertia_kg_m2)
-    && (parameters.inertia_kg_m2.array() > 0.0).all()
     && std::isfinite(parameters.gravity_m_s2) && parameters.gravity_m_s2 > 0.0
-    && finite(parameters.attitude_gain_rad_s)
-    && (parameters.attitude_gain_rad_s.array() >= 0.0).all()
-    && finite(parameters.rate_gain_s_inv)
-    && (parameters.rate_gain_s_inv.array() >= 0.0).all()
-    && finite(parameters.normalized_rate_gain_s_inv)
-    && (parameters.normalized_rate_gain_s_inv.array() >= 0.0).all()
-    && finite(parameters.normalized_torque_limit)
-    && (parameters.normalized_torque_limit.array() > 0.0).all()
-    && (parameters.normalized_torque_limit.array() <= 1.0).all()
-    && finite(parameters.max_body_rate_rad_s)
-    && (parameters.max_body_rate_rad_s.array() > 0.0).all()
     && std::isfinite(parameters.max_tilt_rad) && parameters.max_tilt_rad > 0.0
-    && parameters.max_tilt_rad <= 0.5 * M_PI;
+    && parameters.max_tilt_rad <= 0.5 * M_PI
+    && thrust_feasibility::validParameters(thrust_feasibility::Parameters{
+      parameters.mass_kg, parameters.gravity_m_s2, parameters.hover_thrust_normalized,
+      parameters.max_normalized_collective_thrust, parameters.plant_max_collective_thrust_n});
 }
 
 inline std::optional<Vector3> desiredForce(
@@ -180,47 +183,21 @@ inline std::optional<Matrix3> so3Transform(
   return rotation;
 }
 
-// Exact MRS common::orientationError() formulation.
-inline Vector3 orientationError(const Matrix3 &current, const Matrix3 &desired) noexcept
-{
-  const Matrix3 error = 0.5 * (desired.transpose() * current - current.transpose() * desired);
-  return Vector3(
-    (error(1, 2) - error(2, 1)) / 2.0,
-    (error(2, 0) - error(0, 2)) / 2.0,
-    (error(0, 1) - error(1, 0)) / 2.0);
-}
-
-inline Vector3 saturate(const Vector3 &value, const Vector3 &limits) noexcept
-{
-  Vector3 output = value;
-  for (int i = 0; i < 3; ++i) {
-    output[i] = std::clamp(output[i], -limits[i], limits[i]);
-  }
-  return output;
-}
-
-inline Vector3 normalizedRateTorque(
-  const Vector3 &desired_body_rate, const Vector3 &measured_body_rate,
-  const Vector3 &gain_s_inv, const Vector3 &limits,
-  bool &saturated) noexcept
-{
-  const Vector3 unsaturated = (desired_body_rate - measured_body_rate)
-    .cwiseProduct(gain_s_inv);
-  const Vector3 limited = saturate(unsaturated, limits);
-  saturated = (limited - unsaturated).norm() > 1.0e-12;
-  return limited;
-}
-
 inline Output compute(const Parameters &parameters, const Input &input) noexcept
 {
   Output output;
+  output.raw_desired_acceleration_m_s2 = input.desired_acceleration_m_s2;
   output.desired_acceleration_m_s2 = input.desired_acceleration_m_s2;
-  if (!validParameters(parameters) || !finite(input.desired_acceleration_m_s2)
-    || !finite(input.measured_body_rate_rad_s) || !std::isfinite(input.desired_yaw_rad)
-    || (input.desired_yaw_rate_valid && !std::isfinite(input.desired_yaw_rate_rad_s))
-    || !input.attitude_valid || !input.body_rate_valid) {
-    output.failure_reason = !validParameters(parameters)
-      ? FailureReason::invalid_parameters : FailureReason::invalid_input;
+  if (!validParameters(parameters)) {
+    output.failure_reason = FailureReason::invalid_parameters;
+    return output;
+  }
+  if (!finite(input.desired_acceleration_m_s2) || !std::isfinite(input.desired_yaw_rad)) {
+    output.failure_reason = FailureReason::non_finite_input;
+    return output;
+  }
+  if (!input.attitude_valid) {
+    output.failure_reason = FailureReason::invalid_input;
     return output;
   }
 
@@ -231,8 +208,48 @@ inline Output compute(const Parameters &parameters, const Input &input) noexcept
   }
   const Eigen::Quaterniond current_quaternion = input.measured_body_to_world.normalized();
   const Matrix3 current_rotation = current_quaternion.toRotationMatrix();
+  if (!finite(current_rotation) || !std::isfinite(current_rotation.determinant()) ||
+    current_rotation.determinant() <= 0.0) {
+    output.failure_reason = FailureReason::invalid_rotation;
+    return output;
+  }
 
-  const auto force = desiredForce(parameters, input.desired_acceleration_m_s2);
+  if (parameters.enable_thrust_feasibility) {
+    const auto feasibility = thrust_feasibility::project(
+      thrust_feasibility::Parameters{
+        parameters.mass_kg, parameters.gravity_m_s2, parameters.hover_thrust_normalized,
+        parameters.max_normalized_collective_thrust, parameters.plant_max_collective_thrust_n},
+      input.desired_acceleration_m_s2);
+    if (!feasibility) {
+      output.failure_reason = FailureReason::feasibility_invalid;
+      return output;
+    }
+    output.raw_desired_force_world_n = feasibility->raw_force_world_n;
+    output.feasible_desired_acceleration_m_s2 = feasibility->feasible_acceleration_m_s2;
+    output.feasible_desired_force_world_n = feasibility->feasible_force_world_n;
+    output.raw_force_norm_n = feasibility->raw_force_norm_n;
+    output.feasible_force_norm_n = feasibility->feasible_force_norm_n;
+    output.force_limit_n = feasibility->force_limit_n;
+    output.feasibility_correction_norm_m_s2 = feasibility->acceleration_correction_norm_m_s2;
+    output.feasibility_constraint_active = feasibility->constraint_active;
+    output.desired_acceleration_m_s2 = feasibility->feasible_acceleration_m_s2;
+  } else {
+    const auto raw_force = desiredForce(parameters, input.desired_acceleration_m_s2);
+    if (!raw_force) {
+      output.failure_reason = FailureReason::degenerate_force;
+      return output;
+    }
+    output.raw_desired_force_world_n = *raw_force;
+    output.feasible_desired_acceleration_m_s2 = input.desired_acceleration_m_s2;
+    output.feasible_desired_force_world_n = *raw_force;
+    output.raw_force_norm_n = raw_force->norm();
+    output.feasible_force_norm_n = output.raw_force_norm_n;
+    output.force_limit_n = std::numeric_limits<double>::infinity();
+    output.feasibility_correction_norm_m_s2 = 0.0;
+    output.feasibility_constraint_active = false;
+  }
+
+  const auto force = desiredForce(parameters, output.desired_acceleration_m_s2);
   if (!force) {
     output.failure_reason = FailureReason::degenerate_force;
     return output;
@@ -246,43 +263,25 @@ inline Output compute(const Parameters &parameters, const Input &input) noexcept
   }
   const auto desired_rotation = so3Transform(*body_z, input.desired_yaw_rad);
   if (!desired_rotation) {
-    output.failure_reason = FailureReason::heading_singularity;
+    output.failure_reason = FailureReason::degenerate_heading_basis;
     return output;
   }
   output.desired_rotation_world_from_body = *desired_rotation;
   output.desired_body_to_world = Eigen::Quaterniond(*desired_rotation).normalized();
 
-  // MRS uses f dot current R.col(2) before converting force to throttle.
-  output.desired_thrust_force_n = force->dot(current_rotation.col(2));
-  if (!std::isfinite(output.desired_thrust_force_n) || output.desired_thrust_force_n < 0.0) {
-    output.failure_reason = FailureReason::invalid_output;
+  // The attitude-setpoint profile commands ||F_d|| while q_d aligns the
+  // desired body-Z axis with F_d. Projection mode remains available as a
+  // configuration choice.
+  output.desired_thrust_force_n = parameters.use_force_norm_for_collective_thrust
+    ? force->norm() : force->dot(current_rotation.col(2));
+  if (!std::isfinite(output.desired_thrust_force_n) || output.desired_thrust_force_n < 0.0
+    || output.desired_thrust_force_n > force->norm() + 1.0e-9) {
+    output.failure_reason = FailureReason::invalid_collective_projection;
     return output;
   }
 
-  output.orientation_error = orientationError(current_rotation, *desired_rotation);
-  Vector3 feedforward_body = Vector3::Zero();
-  if (input.desired_yaw_rate_valid) {
-    const Vector3 yaw_rate_world(0.0, 0.0, input.desired_yaw_rate_rad_s);
-    feedforward_body = desired_rotation->transpose() * yaw_rate_world;
-  }
-  output.desired_body_rate_rad_s = saturate(
-    output.orientation_error.cwiseProduct(parameters.attitude_gain_rad_s) + feedforward_body,
-    parameters.max_body_rate_rad_s);
-  output.body_rate_error_rad_s = output.desired_body_rate_rad_s - input.measured_body_rate_rad_s;
-
-  // MRS parity diagnostic: retain the inertia-weighted rate-error quantity
-  // used by the MRS control-group path. It is not the active PX4 command and
-  // is intentionally not assigned a physical N*m contract here.
-  const Vector3 inertia_weighted_rate_gain =
-    parameters.inertia_kg_m2.cwiseProduct(parameters.rate_gain_s_inv);
-  output.control_group_action = output.body_rate_error_rad_s.cwiseProduct(inertia_weighted_rate_gain);
-  output.normalized_torque_command_flu = normalizedRateTorque(
-    output.desired_body_rate_rad_s, input.measured_body_rate_rad_s,
-    parameters.normalized_rate_gain_s_inv, parameters.normalized_torque_limit,
-    output.normalized_torque_saturated);
-  if (!finite(output.desired_force_world_n) || !finite(output.desired_rotation_world_from_body)
-    || !finite(output.desired_body_rate_rad_s) || !finite(output.body_rate_error_rad_s)
-    || !finite(output.control_group_action) || !finite(output.normalized_torque_command_flu)) {
+  if (!finite(output.desired_force_world_n)
+    || !finite(output.desired_rotation_world_from_body)) {
     output.failure_reason = FailureReason::non_finite_output;
     return output;
   }

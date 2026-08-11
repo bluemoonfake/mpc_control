@@ -1,0 +1,40 @@
+std_msgs/Header header
+
+uint8 PRODUCER=1
+uint8 CONSUMER=2
+uint8 role
+uint64 diagnostic_sequence
+
+# The producer uses HandoverStatus.timer_sequence as its publication sequence.
+uint64 source_publish_sequence
+uint64 source_publish_steady_timestamp_ns
+uint64 source_publish_ros_timestamp_ns
+uint64 source_callback_start_steady_timestamp_ns
+uint64 source_callback_end_steady_timestamp_ns
+
+uint64 consumer_receipt_sequence
+uint64 consumer_callback_start_steady_timestamp_ns
+uint64 consumer_callback_end_steady_timestamp_ns
+uint64 consumer_callback_interarrival_ns
+uint64 source_interpublish_ns
+uint64 source_to_callback_delay_ns
+
+uint64 sequence_gap_count
+uint64 maximum_sequence_gap
+uint64 callback_gap_count
+uint64 last_callback_gap_start_steady_timestamp_ns
+uint64 callback_before_gap_source_sequence
+uint64 callback_after_gap_first_source_sequence
+uint64 callback_gap_sequence_gap_count
+uint64 callback_burst_count
+uint64[20] callback_burst_source_sequence
+uint64[20] callback_burst_interarrival_ns
+
+float64 callback_duration_us
+float64 callback_mutex_wait_us
+float64 callback_work_duration_us
+float64 source_to_callback_delay_ms
+float64 consumer_callback_interarrival_ms
+float64 producer_interpublish_ms
+float64 status_receipt_age_ms
+bool callback_gap_active

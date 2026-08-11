@@ -1,0 +1,37 @@
+reference_generator_node:
+  ros__parameters:
+    # Follow measured position/yaw before Offboard, then freeze at the rising edge.
+    auto_capture_current_hold: true
+
+px4_attitude_setpoint_node:
+  ros__parameters:
+    # Freshness and timesync are the only state-machine gates in this profile.
+    publish_rate_hz: 50.0
+    heartbeat_rate_hz: 10.0
+    state_timeout_seconds: 0.25
+    command_timeout_seconds: 0.25
+    timesync_timeout_seconds: 1.5
+    hover_thrust_estimate_timeout_seconds: 1.0
+    motor_count: 4
+    motor_thrust_coefficient_n_per_rad_s2: 8.54858e-6
+    motor_max_speed_rad_s: 1000.0
+    vehicle_mass: 2.0
+    gravity: 9.80665
+    # Fallback only. A fresh PX4 estimate is latched when Offboard becomes active.
+    hover_thrust_normalized: 0.765
+
+mpc_controller_node:
+  ros__parameters:
+    # Validation and force-envelope projection remain disabled during tuning.
+    strict_validation: false
+    enable_thrust_feasibility: false
+    use_force_norm_for_collective_thrust: true
+    max_control_z: 2.0
+    max_control_rate_z: 5.0
+    vehicle_mass: 2.0
+    gravity: 9.80665
+    hover_thrust_normalized: 0.765
+    plant_max_collective_thrust_n: 34.19432
+    max_tilt: 1.5707963267948966
+    force_feedback_kp_n_per_m: [0.0, 0.0, 0.0]
+    force_feedback_kv_n_per_m_s: [0.0, 0.0, 0.0]
