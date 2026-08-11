@@ -17,9 +17,11 @@ float64[3] sampled_reference_position
 float64[3] sampled_reference_velocity
 float64[3] sampled_reference_acceleration
 
-# Optimizer input u0 for X/Y/Z. For Z this is not equal to a[k+1].
+# Optimizer input u0 for X/Y/Z. In general this is not a physical
+# acceleration; a[k+1] = alpha*a[k] + (1-alpha)*u[k].
 float64[3] control_input
-# First predicted state acceleration a[k+1] for X/Y/Z.
+# First predicted physical acceleration state a[k+1] for X/Y/Z. M3 consumes
+# this field at the force-command boundary.
 float64[3] first_predicted_acceleration
 # Flattened prediction: [step][axis][p,v,a], 26 * 3 * 3 values.
 float64[] predicted_states

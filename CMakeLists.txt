@@ -17,12 +17,8 @@ set(msg_files
   "msg/ReferenceStep.msg"
   "msg/VehicleState.msg"
   "msg/MpcTranslationalOutput.msg"
-  "msg/MpcControlLoopDiagnostics.msg"
   "msg/M3ControlOutput.msg"
   "msg/AttitudeSetpointPreview.msg"
-  "msg/HandoverStatus.msg"
-  "msg/HandoverStatusDeliveryDiagnostics.msg"
-  "msg/VehicleStateBridgeDiagnostics.msg"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -42,28 +38,10 @@ function(add_mpc_node target source)
   install(TARGETS ${target} DESTINATION lib/${PROJECT_NAME})
 endfunction()
 
-set(MPC_SOLVER_SOURCES
-  "third_party/mrs_mpc_solvers/src/mpc_controller/mpc_controller_solver.cpp"
-  "third_party/mrs_mpc_solvers/src/mpc_controller/solver/ldl.cpp"
-  "third_party/mrs_mpc_solvers/src/mpc_controller/solver/matrix_support.cpp"
-  "third_party/mrs_mpc_solvers/src/mpc_controller/solver/solver.cpp"
-  "third_party/mrs_mpc_solvers/src/mpc_controller/solver/util.cpp"
-)
-
-add_library(mpc_translational_solver STATIC ${MPC_SOLVER_SOURCES})
-target_compile_features(mpc_translational_solver PRIVATE cxx_std_20)
-target_include_directories(mpc_translational_solver PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/mrs_mpc_solvers/include>)
-target_link_libraries(mpc_translational_solver PUBLIC Eigen3::Eigen)
-
 add_mpc_node(reference_generator_node src/reference_generator_node.cpp)
 add_mpc_node(mpc_controller_node src/mpc_controller_node.cpp)
-target_link_libraries(mpc_controller_node mpc_translational_solver)
 add_mpc_node(vehicle_state_bridge_node src/vehicle_state_bridge_node.cpp)
 add_mpc_node(px4_attitude_setpoint_node src/px4_attitude_setpoint_node.cpp)
-
-# Development tests and timing probes are intentionally not part of the
-# deployable controller package.
 
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 

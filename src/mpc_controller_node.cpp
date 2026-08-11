@@ -1,10 +1,9 @@
 #include "mpc_controller/msg/mpc_translational_output.hpp"
-#include "mpc_controller/msg/mpc_control_loop_diagnostics.hpp"
 #include "mpc_controller/msg/m3_control_output.hpp"
 #include "mpc_controller/msg/reference_trajectory.hpp"
 #include "mpc_controller/msg/vehicle_state.hpp"
 #include "mpc_controller/mrs_control_math.hpp"
-#include "mpc_controller/measured_acceleration_admission.hpp"
+#include "detail/measured_acceleration_admission.hpp"
 #include "mpc_controller/timing_diagnostics.hpp"
 #include "mpc_controller/translational_mpc.hpp"
 
@@ -22,25 +21,6 @@
 #include <utility>
 #include <vector>
 
-template<typename Function>
-class ScopeExit final
-{
-public:
-  explicit ScopeExit(Function function) : function_(std::move(function)) {}
-  ~ScopeExit() {function_();}
-  ScopeExit(const ScopeExit &) = delete;
-  ScopeExit &operator=(const ScopeExit &) = delete;
-
-private:
-  Function function_;
-};
-
-template<typename Function>
-ScopeExit<Function> makeScopeExit(Function function)
-{
-  return ScopeExit<Function>(std::move(function));
-}
-
 class MpcControllerNode final : public rclcpp::Node
 {
 public:
@@ -55,7 +35,10 @@ public:
     declare_parameter("dt_first", config_.dt_first);
     declare_parameter("dt_later", config_.dt_later);
     declare_parameter("max_iterations", config_.max_iterations);
-    declare_parameter("solver_verbose", config_.solver_verbose);
+    declare_parameter("model_alpha_xyz", std::vector<double>{0.0, 0.0, 0.0});
+    declare_parameter("admm_rho", config_.admm_rho);
+    declare_parameter("solver_absolute_tolerance", config_.solver_absolute_tolerance);
+    declare_parameter("solver_relative_tolerance", config_.solver_relative_tolerance);
     declare_parameter("q_xy", std::vector<double>{500.0, 100.0, 100.0});
     declare_parameter("s_xy", std::vector<double>{1000.0, 300.0, 300.0});
     declare_parameter("q_z", std::vector<double>{100.0, 30.0, 10.0});
@@ -78,8 +61,6 @@ public:
     declare_parameter("hover_thrust_normalized", m3_config_.hover_thrust_normalized);
     declare_parameter(
       "max_normalized_collective_thrust", m3_config_.max_normalized_collective_thrust);
-    declare_parameter(
-      "plant_max_collective_thrust_n", m3_config_.plant_max_collective_thrust_n);
     declare_parameter("enable_thrust_feasibility", m3_config_.enable_thrust_feasibility);
     declare_parameter(
       "use_force_norm_for_collective_thrust",
@@ -93,13 +74,16 @@ public:
     get_parameter("dt_first", config_.dt_first);
     get_parameter("dt_later", config_.dt_later);
     get_parameter("max_iterations", config_.max_iterations);
-    get_parameter("solver_verbose", config_.solver_verbose);
     const bool vector_parameters_valid = getArrayParameter("q_xy", config_.q_xy)
       && getArrayParameter("s_xy", config_.s_xy)
       && getArrayParameter("q_z", config_.q_z)
       && getArrayParameter("s_z", config_.s_z)
+      && getArrayParameter("model_alpha_xyz", config_.model_alpha_xyz)
       && getArrayParameter("force_feedback_kp_n_per_m", force_feedback_kp_n_per_m_)
       && getArrayParameter("force_feedback_kv_n_per_m_s", force_feedback_kv_n_per_m_s_);
+    get_parameter("admm_rho", config_.admm_rho);
+    get_parameter("solver_absolute_tolerance", config_.solver_absolute_tolerance);
+    get_parameter("solver_relative_tolerance", config_.solver_relative_tolerance);
     get_parameter("max_speed_xy", config_.max_speed_xy);
     get_parameter("max_control_xy", config_.max_control_xy);
     get_parameter("max_control_rate_xy", config_.max_control_rate_xy);
@@ -116,7 +100,6 @@ public:
     get_parameter("hover_thrust_normalized", m3_config_.hover_thrust_normalized);
     get_parameter(
       "max_normalized_collective_thrust", m3_config_.max_normalized_collective_thrust);
-    get_parameter("plant_max_collective_thrust_n", m3_config_.plant_max_collective_thrust_n);
     get_parameter("enable_thrust_feasibility", m3_config_.enable_thrust_feasibility);
     get_parameter(
       "use_force_norm_for_collective_thrust",
@@ -143,8 +126,6 @@ public:
       [this](State::SharedPtr message) {stateCallback(std::move(message));});
     output_publisher_ = create_publisher<Output>("mpc_translational_output", 10);
     m3_output_publisher_ = create_publisher<M3Output>("m3_control_output", 10);
-    loop_diagnostics_publisher_ = create_publisher<LoopDiagnostics>(
-      "mpc_control_loop_diagnostics", 10);
 
     if (!config_valid_) {
       RCLCPP_ERROR(get_logger(), "Invalid M2 MPC configuration; controller updates disabled");
@@ -166,7 +147,6 @@ private:
   using State = mpc_controller::msg::VehicleState;
   using Output = mpc_controller::msg::MpcTranslationalOutput;
   using M3Output = mpc_controller::msg::M3ControlOutput;
-  using LoopDiagnostics = mpc_controller::msg::MpcControlLoopDiagnostics;
   using ReferenceData = mpc_controller::translational::ReferenceTrajectoryData;
   using ReferencePoint = mpc_controller::translational::ReferencePoint;
   using MeasuredState = mpc_controller::translational::MeasuredState;
@@ -239,8 +219,6 @@ private:
     reference_stamp_ = stamp;
     reference_trajectory_id_ = message->trajectory_id;
     reference_received_at_ = get_clock()->now();
-    reference_received_steady_timestamp_ns_ = mpc_controller::timing::steadyNowNs();
-    ++reference_callback_sequence_;
   }
 
   void stateCallback(State::SharedPtr message)
@@ -262,60 +240,14 @@ private:
     state_ = std::move(*message);
     state_stamp_ = stamp;
     state_received_at_ = get_clock()->now();
-    state_received_steady_timestamp_ns_ = mpc_controller::timing::steadyNowNs();
-    ++state_callback_sequence_;
   }
 
   void update()
   {
-    const auto timer_sample = mpc_timer_tracker_.begin(mpc_controller::timing::steadyNowNs());
-    auto stage = LoopDiagnostics::STAGE_NOT_READY;
-    bool m2_published = false;
-    bool m3_published = false;
-    std::uint64_t m2_published_steady_timestamp_ns = 0U;
-    std::uint64_t m3_published_steady_timestamp_ns = 0U;
+    mpc_controller::timing::TimerGuard timer_guard(
+      mpc_timer_tracker_, mpc_controller::timing::steadyNowNs());
+    const auto timer_sample = timer_guard.sample();
     std::lock_guard<std::mutex> lock(mutex_);
-    auto finish_diagnostics = makeScopeExit([this, &timer_sample, &stage, &m2_published,
-        &m3_published, &m2_published_steady_timestamp_ns,
-        &m3_published_steady_timestamp_ns]() {
-        const auto callback_end = mpc_controller::timing::steadyNowNs();
-        mpc_timer_tracker_.finish(timer_sample.sequence, callback_end);
-        const auto completed = mpc_timer_tracker_.last();
-        LoopDiagnostics diagnostics;
-        diagnostics.header.stamp = now();
-        diagnostics.header.frame_id = output_frame_id_;
-        diagnostics.timer_sequence = completed.sequence;
-        diagnostics.configured_period_ns = completed.configured_period_ns;
-        diagnostics.timer_expected_fire_steady_timestamp_ns =
-          completed.expected_fire_steady_timestamp_ns;
-        diagnostics.timer_actual_start_steady_timestamp_ns =
-          completed.actual_start_steady_timestamp_ns;
-        diagnostics.timer_callback_end_steady_timestamp_ns =
-          completed.callback_end_steady_timestamp_ns;
-        diagnostics.scheduling_lateness_ms = completed.scheduling_lateness_ms;
-        diagnostics.callback_duration_ms = completed.callback_duration_ms;
-        diagnostics.reference_callback_sequence = reference_callback_sequence_;
-        diagnostics.state_callback_sequence = state_callback_sequence_;
-        diagnostics.reference_received_steady_timestamp_ns =
-          reference_received_steady_timestamp_ns_;
-        diagnostics.state_received_steady_timestamp_ns = state_received_steady_timestamp_ns_;
-        diagnostics.reference_receipt_age_seconds = reference_received_steady_timestamp_ns_ > 0U &&
-          callback_end >= reference_received_steady_timestamp_ns_
-          ? static_cast<double>(callback_end - reference_received_steady_timestamp_ns_) * 1.0e-9
-          : std::numeric_limits<double>::quiet_NaN();
-        diagnostics.state_receipt_age_seconds = state_received_steady_timestamp_ns_ > 0U &&
-          callback_end >= state_received_steady_timestamp_ns_
-          ? static_cast<double>(callback_end - state_received_steady_timestamp_ns_) * 1.0e-9
-          : std::numeric_limits<double>::quiet_NaN();
-        diagnostics.m2_sequence = sequence_;
-        diagnostics.m3_sequence = sequence_;
-        diagnostics.m2_published_steady_timestamp_ns = m2_published_steady_timestamp_ns;
-        diagnostics.m3_published_steady_timestamp_ns = m3_published_steady_timestamp_ns;
-        diagnostics.m2_published = m2_published;
-        diagnostics.m3_published = m3_published;
-        diagnostics.stage = stage;
-        loop_diagnostics_publisher_->publish(diagnostics);
-      });
     if (!config_valid_ || !controller_ || !reference_ || !state_) {
       return;
     }
@@ -328,7 +260,6 @@ private:
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
         "M2 update rejected: reference or measured state is stale");
-      stage = LoopDiagnostics::STAGE_INPUT_STALE;
       return;
     }
     if (strict_validation_ && (!state_->valid || !state_->position_valid || !state_->velocity_valid
@@ -336,7 +267,6 @@ private:
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
         "M2 update rejected: measured translational state is invalid");
-      stage = LoopDiagnostics::STAGE_INPUT_INVALID;
       return;
     }
     MeasuredState measured;
@@ -349,7 +279,6 @@ private:
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
         "M2 update rejected: measured state contains NaN or Inf");
-      stage = LoopDiagnostics::STAGE_INPUT_INVALID;
       return;
     }
     if (strict_validation_) {
@@ -362,7 +291,6 @@ private:
           measured.acceleration[2],
           mpc_controller::measured_acceleration::reasonName(acceleration_admission.reason),
           measured_acceleration_limits_.max_abs_z_m_s2);
-        stage = LoopDiagnostics::STAGE_ACCELERATION_REJECTED;
         return;
       }
       // Identity conditioning by contract. Do not clamp, differentiate, or
@@ -377,7 +305,6 @@ private:
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
         "M2 update rejected: reference cannot be sampled on the solver grid");
-      stage = LoopDiagnostics::STAGE_REFERENCE_REJECTED;
       return;
     }
 
@@ -386,7 +313,6 @@ private:
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
         "M2 solver update failed: %s", failureReasonString(result.failure_reason));
-      stage = LoopDiagnostics::STAGE_SOLVER_REJECTED;
       return;
     }
 
@@ -419,8 +345,6 @@ private:
     output.solver_success = true;
     output.valid = true;
     output_publisher_->publish(output);
-    m2_published = true;
-    m2_published_steady_timestamp_ns = mpc_controller::timing::steadyNowNs();
     ++solve_count_;
     solve_time_total_seconds_ += result.solve_time_seconds;
     solve_time_max_seconds_ = std::max(solve_time_max_seconds_, result.solve_time_seconds);
@@ -440,7 +364,6 @@ private:
       solve_time_max_seconds_ * 1000.0);
 
     if (!m3_config_valid_) {
-      stage = LoopDiagnostics::STAGE_M3_REJECTED;
       return;
     }
     ReferencePoint yaw_reference;
@@ -448,13 +371,16 @@ private:
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
         "M3 output rejected: reference yaw cannot be sampled");
-      stage = LoopDiagnostics::STAGE_M3_REJECTED;
       return;
     }
 
     mpc_controller::mrs_control::Input m3_input;
+    // u is the optimizer input of the acceleration-response model.  The
+    // physical acceleration command is the first predicted acceleration
+    // state, which equals u only for alpha=0, beta=1.
     Eigen::Vector3d force_acceleration_command(
-      result.control[0], result.control[1], result.control[2]);
+      result.first_predicted_acceleration[0], result.first_predicted_acceleration[1],
+      result.first_predicted_acceleration[2]);
     for (int axis = 0; axis < 3; ++axis) {
       const double feedback_force_n = force_feedback_kp_n_per_m_[axis]
         * (yaw_reference.position[axis] - measured.position[axis])
@@ -476,7 +402,6 @@ private:
         get_logger(), *get_clock(), 2000,
         "Force/attitude output rejected: %s",
         mpc_controller::mrs_control::failureReasonName(m3_result.failure_reason));
-      stage = LoopDiagnostics::STAGE_M3_REJECTED;
       return;
     }
 
@@ -523,9 +448,6 @@ private:
     m3_output.valid = m3_result.valid;
     m3_output.failure_reason = static_cast<uint8_t>(m3_result.failure_reason);
     m3_output_publisher_->publish(m3_output);
-    m3_published = true;
-    m3_published_steady_timestamp_ns = mpc_controller::timing::steadyNowNs();
-    stage = LoopDiagnostics::STAGE_M3_PUBLISHED;
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 2000,
       "Force/attitude output seq=%lu a_des=[%.3f %.3f %.3f] force=[%.3f %.3f %.3f] "
@@ -576,10 +498,6 @@ private:
   rclcpp::Time reference_received_at_{0, 0, RCL_ROS_TIME};
   rclcpp::Time state_received_at_{0, 0, RCL_ROS_TIME};
   uint64_t reference_trajectory_id_ = 0;
-  uint64_t reference_callback_sequence_ = 0;
-  uint64_t state_callback_sequence_ = 0;
-  uint64_t reference_received_steady_timestamp_ns_ = 0;
-  uint64_t state_received_steady_timestamp_ns_ = 0;
   uint64_t sequence_ = 0;
   uint64_t solve_count_ = 0;
   double solve_time_total_seconds_ = 0.0;
@@ -588,7 +506,6 @@ private:
   rclcpp::Subscription<State>::SharedPtr state_subscription_;
   rclcpp::Publisher<Output>::SharedPtr output_publisher_;
   rclcpp::Publisher<M3Output>::SharedPtr m3_output_publisher_;
-  rclcpp::Publisher<LoopDiagnostics>::SharedPtr loop_diagnostics_publisher_;
   rclcpp::TimerBase::SharedPtr timer_;
   mpc_controller::timing::TimerTracker mpc_timer_tracker_{};
 };

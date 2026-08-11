@@ -1,13 +1,11 @@
-#include "mpc_controller/frame_contract.hpp"
-#include "mpc_controller/msg/vehicle_state_bridge_diagnostics.hpp"
+#include "detail/frame_contract.hpp"
 #include "mpc_controller/msg/vehicle_state.hpp"
-#include "mpc_controller/vehicle_state_bridge_diagnostics.hpp"
+#include "detail/vehicle_state_bridge_diagnostics.hpp"
 
 #include <px4_msgs/msg/vehicle_angular_velocity.hpp>
 #include <px4_msgs/msg/vehicle_attitude.hpp>
 #include <px4_msgs/msg/vehicle_local_position.hpp>
 #include <rclcpp/rclcpp.hpp>
-#include <std_srvs/srv/trigger.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -48,12 +46,6 @@ public:
       angular_velocity_topic_, qos,
       std::bind(&VehicleStateBridgeNode::angularVelocityCallback, this, std::placeholders::_1));
     state_publisher_ = create_publisher<State>(output_topic_, 10);
-    diagnostics_publisher_ = create_publisher<Diagnostics>("vehicle_state_bridge_diagnostics", 10);
-    reset_diagnostics_service_ = create_service<std_srvs::srv::Trigger>(
-      "~/reset_diagnostics",
-      std::bind(
-        &VehicleStateBridgeNode::resetDiagnostics, this, std::placeholders::_1,
-        std::placeholders::_2));
     timer_ = create_wall_timer(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::duration<double>(1.0 / std::max(publish_rate_hz_, 1.0))),
@@ -62,7 +54,6 @@ public:
 
 private:
   using State = mpc_controller::msg::VehicleState;
-  using Diagnostics = mpc_controller::msg::VehicleStateBridgeDiagnostics;
   using Px4Position = px4_msgs::msg::VehicleLocalPosition;
   using Px4Attitude = px4_msgs::msg::VehicleAttitude;
   using Px4AngularVelocity = px4_msgs::msg::VehicleAngularVelocity;
@@ -79,19 +70,6 @@ private:
     double gap_max_seconds = 0.0;
     double last_interarrival_seconds = std::numeric_limits<double>::infinity();
     uint64_t receipt_steady_timestamp_ns = 0;
-  };
-
-  struct FirstReject
-  {
-    bool latched = false;
-    uint64_t steady_timestamp_ns = 0;
-    mpc_controller::vehicle_state_diagnostics::RejectReason reason =
-      mpc_controller::vehicle_state_diagnostics::RejectReason::none;
-    mpc_controller::vehicle_state_diagnostics::SourceTiming position;
-    mpc_controller::vehicle_state_diagnostics::SourceTiming attitude;
-    mpc_controller::vehicle_state_diagnostics::SourceTiming angular_velocity;
-    double sample_skew_ms = std::numeric_limits<double>::infinity();
-    uint64_t previous_vehicle_state_publication_steady_timestamp_ns = 0;
   };
 
   static uint64_t steadyTimestampNs(const Clock::time_point time) noexcept
@@ -193,104 +171,6 @@ private:
     return static_cast<double>(maximum - minimum) * 1.0e-3;
   }
 
-  void latchFirstReject(
-    const mpc_controller::vehicle_state_diagnostics::RejectReason reason,
-    const mpc_controller::vehicle_state_diagnostics::SourceTiming &position,
-    const mpc_controller::vehicle_state_diagnostics::SourceTiming &attitude,
-    const mpc_controller::vehicle_state_diagnostics::SourceTiming &angular_velocity,
-    const double sample_skew_ms, const uint64_t evaluation_ns)
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (first_reject_.latched) {
-      return;
-    }
-    first_reject_.latched = true;
-    first_reject_.steady_timestamp_ns = evaluation_ns;
-    first_reject_.reason = reason;
-    first_reject_.position = position;
-    first_reject_.attitude = attitude;
-    first_reject_.angular_velocity = angular_velocity;
-    first_reject_.sample_skew_ms = sample_skew_ms;
-    first_reject_.previous_vehicle_state_publication_steady_timestamp_ns =
-      last_vehicle_state_publication_steady_timestamp_ns_;
-    RCLCPP_ERROR(
-      get_logger(),
-      "VehicleState first reject: reason=%s pos_age=%.3f ms att_age=%.3f ms "
-      "ang_age=%.3f ms skew=%.3f ms",
-      mpc_controller::vehicle_state_diagnostics::rejectReasonName(reason),
-      position.age_seconds * 1.0e3, attitude.age_seconds * 1.0e3,
-      angular_velocity.age_seconds * 1.0e3, sample_skew_ms);
-  }
-
-  void publishDiagnostics(
-    const Clock::time_point now,
-    const mpc_controller::vehicle_state_diagnostics::SourceTiming &position,
-    const mpc_controller::vehicle_state_diagnostics::SourceTiming &attitude,
-    const mpc_controller::vehicle_state_diagnostics::SourceTiming &angular_velocity,
-    const double sample_skew_ms,
-    const mpc_controller::vehicle_state_diagnostics::RejectReason reason,
-    const bool state_published)
-  {
-    Diagnostics message;
-    message.header.stamp = get_clock()->now();
-    message.header.frame_id = frame_id_;
-    message.sequence = ++diagnostics_sequence_;
-    message.vehicle_state_published = state_published;
-    message.publication_rejected = !state_published;
-    message.reject_reason = static_cast<uint8_t>(reason);
-    message.sample_skew_ms = sample_skew_ms;
-    message.stale_position = !mpc_controller::vehicle_state_diagnostics::fresh(
-      position, state_timeout_seconds_);
-    message.stale_attitude = !mpc_controller::vehicle_state_diagnostics::fresh(
-      attitude, state_timeout_seconds_);
-    message.stale_angular_velocity = !mpc_controller::vehicle_state_diagnostics::fresh(
-      angular_velocity, state_timeout_seconds_);
-    message.position_sample_timestamp = position.sample_timestamp;
-    message.attitude_sample_timestamp = attitude.sample_timestamp;
-    message.angular_velocity_sample_timestamp = angular_velocity.sample_timestamp;
-    message.position_receipt_steady_timestamp_ns = position.receipt_steady_timestamp_ns;
-    message.attitude_receipt_steady_timestamp_ns = attitude.receipt_steady_timestamp_ns;
-    message.angular_velocity_receipt_steady_timestamp_ns = angular_velocity.receipt_steady_timestamp_ns;
-    message.position_age_ms = position.age_seconds * 1.0e3;
-    message.attitude_age_ms = attitude.age_seconds * 1.0e3;
-    message.angular_velocity_age_ms = angular_velocity.age_seconds * 1.0e3;
-    message.position_interarrival_ms = position.interarrival_seconds * 1.0e3;
-    message.attitude_interarrival_ms = attitude.interarrival_seconds * 1.0e3;
-    message.angular_velocity_interarrival_ms = angular_velocity.interarrival_seconds * 1.0e3;
-    FirstReject first_reject;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      message.position_accepted_count = position_cache_.accepted_count;
-      message.attitude_accepted_count = attitude_cache_.accepted_count;
-      message.angular_velocity_accepted_count = angular_velocity_cache_.accepted_count;
-      message.stale_reject_count = stale_rejection_count_;
-      message.skew_reject_count = skew_rejection_count_;
-      message.last_vehicle_state_publication_steady_timestamp_ns =
-        last_vehicle_state_publication_steady_timestamp_ns_;
-      first_reject = first_reject_;
-    }
-    message.first_reject_latched = first_reject.latched;
-    message.first_reject_steady_timestamp_ns = first_reject.steady_timestamp_ns;
-    message.first_reject_reason = static_cast<uint8_t>(first_reject.reason);
-    message.first_reject_position_age_ms = first_reject.position.age_seconds * 1.0e3;
-    message.first_reject_attitude_age_ms = first_reject.attitude.age_seconds * 1.0e3;
-    message.first_reject_angular_velocity_age_ms = first_reject.angular_velocity.age_seconds * 1.0e3;
-    message.first_reject_sample_skew_ms = first_reject.sample_skew_ms;
-    message.first_reject_position_sample_timestamp = first_reject.position.sample_timestamp;
-    message.first_reject_attitude_sample_timestamp = first_reject.attitude.sample_timestamp;
-    message.first_reject_angular_velocity_sample_timestamp = first_reject.angular_velocity.sample_timestamp;
-    message.first_reject_position_receipt_steady_timestamp_ns =
-      first_reject.position.receipt_steady_timestamp_ns;
-    message.first_reject_attitude_receipt_steady_timestamp_ns =
-      first_reject.attitude.receipt_steady_timestamp_ns;
-    message.first_reject_angular_velocity_receipt_steady_timestamp_ns =
-      first_reject.angular_velocity.receipt_steady_timestamp_ns;
-    message.first_reject_previous_vehicle_state_publication_steady_timestamp_ns =
-      first_reject.previous_vehicle_state_publication_steady_timestamp_ns;
-    diagnostics_publisher_->publish(message);
-    (void)now;
-  }
-
   bool acceptTimestamp(Cache &cache, uint64_t timestamp_sample)
   {
     if (!mpc_controller::frame::timestampMonotonic(cache.last_timestamp_sample, timestamp_sample)) {
@@ -340,9 +220,6 @@ private:
         std::lock_guard<std::mutex> lock(mutex_);
         ++stale_rejection_count_;
       }
-      latchFirstReject(
-        freshness_decision.reason, position_timing, attitude_timing, angular_velocity_timing,
-        current_sample_skew_ms, evaluation_ns);
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 5000,
         "VehicleState not published: reason=%s pos_age=%.3f ms att_age=%.3f ms "
@@ -350,9 +227,6 @@ private:
         mpc_controller::vehicle_state_diagnostics::rejectReasonName(freshness_decision.reason),
         position_timing.age_seconds * 1.0e3, attitude_timing.age_seconds * 1.0e3,
         angular_velocity_timing.age_seconds * 1.0e3, current_sample_skew_ms);
-      publishDiagnostics(
-        now, position_timing, attitude_timing, angular_velocity_timing,
-        current_sample_skew_ms, freshness_decision.reason, false);
       return;
     }
 
@@ -383,17 +257,9 @@ private:
 
     mpc_controller::frame::VehicleStateData converted;
     if (!mpc_controller::frame::convert(local_sample, attitude_sample, angular_sample, converted)) {
-      latchFirstReject(
-        mpc_controller::vehicle_state_diagnostics::RejectReason::non_finite,
-        position_timing, attitude_timing, angular_velocity_timing,
-        current_sample_skew_ms, evaluation_ns);
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 5000,
         "VehicleState not published: PX4 estimator data invalid or non-finite");
-      publishDiagnostics(
-        now, position_timing, attitude_timing, angular_velocity_timing,
-        current_sample_skew_ms,
-        mpc_controller::vehicle_state_diagnostics::RejectReason::non_finite, false);
       return;
     }
 
@@ -427,22 +293,7 @@ private:
     {
       std::lock_guard<std::mutex> lock(mutex_);
       ++state_publish_count_;
-      last_vehicle_state_publication_steady_timestamp_ns_ = evaluation_ns;
     }
-    publishDiagnostics(
-      now, position_timing, attitude_timing, angular_velocity_timing,
-      current_sample_skew_ms,
-      mpc_controller::vehicle_state_diagnostics::RejectReason::none, true);
-  }
-
-  void resetDiagnostics(
-    const std_srvs::srv::Trigger::Request::SharedPtr,
-    std_srvs::srv::Trigger::Response::SharedPtr response)
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    first_reject_ = FirstReject{};
-    response->success = true;
-    response->message = "VehicleState bridge first-reject diagnostic latch reset";
   }
 
   void reportTiming(Clock::time_point now)
@@ -496,9 +347,6 @@ private:
   uint64_t state_publish_count_ = 0;
   uint64_t stale_rejection_count_ = 0;
   uint64_t skew_rejection_count_ = 0;
-  uint64_t diagnostics_sequence_ = 0;
-  uint64_t last_vehicle_state_publication_steady_timestamp_ns_ = 0;
-  FirstReject first_reject_{};
   // PX4 v1.17 publishes this versioned uORB message on the DDS topic
   // vehicle_local_position_v1. Keep the topic configurable for other
   // px4_msgs revisions, but make the selected v1.17 default explicit.
@@ -514,8 +362,6 @@ private:
   rclcpp::Subscription<Px4Attitude>::SharedPtr attitude_subscription_;
   rclcpp::Subscription<Px4AngularVelocity>::SharedPtr angular_velocity_subscription_;
   rclcpp::Publisher<State>::SharedPtr state_publisher_;
-  rclcpp::Publisher<Diagnostics>::SharedPtr diagnostics_publisher_;
-  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_diagnostics_service_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 

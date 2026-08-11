@@ -35,6 +35,7 @@ GZ_GUI_LOG := $(SIM_RUNTIME_DIR)/gazebo_gui.log
 PX4_PID := $(SIM_RUNTIME_DIR)/px4.pid
 DDS_PID := $(SIM_RUNTIME_DIR)/dds.pid
 ROS_PID := $(SIM_RUNTIME_DIR)/ros.pid
+ROS_LOCK := $(SIM_RUNTIME_DIR)/ros.lock
 GZ_GUI_PID := $(SIM_RUNTIME_DIR)/gazebo_gui.pid
 
 # The VS Code Snap exports GTK paths pointing at its bundled glibc.  Gazebo's
@@ -146,11 +147,24 @@ dds: check
 
 ros: check build
 	@mkdir -p "$(SIM_RUNTIME_DIR)"
-	@source "$(ROS_SETUP)"; \
-	if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; \
-	if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; \
-	setsid bash -c 'source "$(ROS_SETUP)"; if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; exec ros2 launch "$(ROS_PACKAGE)" "$(ROS_LAUNCH)" $(ROS_LAUNCH_ARGS)' \
-		>"$(ROS_LOG)" 2>&1 & echo $$! >"$(ROS_PID)"
+	@if test -f "$(ROS_PID)"; then \
+		pid=$$(cat "$(ROS_PID)"); \
+		if kill -0 "$$pid" 2>/dev/null; then \
+			echo "ROS 2 launch already running (pid $$pid)."; exit 1; \
+		fi; \
+		rm -f "$(ROS_PID)"; \
+	fi
+	@setsid bash -c 'exec 9>"$(ROS_LOCK)"; if ! flock -n 9; then echo "Another MPC ROS 2 pipeline already holds $(ROS_LOCK)"; exit 75; fi; echo $$$$ >"$(ROS_PID)"; source "$(ROS_SETUP)"; if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; exec ros2 launch "$(ROS_PACKAGE)" "$(ROS_LAUNCH)" $(ROS_LAUNCH_ARGS)' \
+		>"$(ROS_LOG)" 2>&1 &
+	@sleep 0.2; \
+	if ! test -f "$(ROS_PID)"; then \
+		echo "ROS 2 launch did not start; inspect $(ROS_LOG)."; exit 1; \
+	fi; \
+	pid=$$(cat "$(ROS_PID)"); \
+	if ! kill -0 "$$pid" 2>/dev/null; then \
+		echo "ROS 2 launch exited during startup; inspect $(ROS_LOG)."; \
+		rm -f "$(ROS_PID)"; exit 1; \
+	fi
 	@echo "ROS 2 launch started; log: $(ROS_LOG)"
 
 gui: check
@@ -180,11 +194,8 @@ sim: check build
 		>"$(DDS_LOG)" 2>&1 & echo $$! >"$(DDS_PID)"
 	@sleep 2
 	@$(MAKE) --no-print-directory gui
-	@source "$(ROS_SETUP)"; \
-	if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; \
-	if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; \
-	setsid bash -c 'source "$(ROS_SETUP)"; if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; exec ros2 launch "$(ROS_PACKAGE)" "$(ROS_LAUNCH)" $(ROS_LAUNCH_ARGS)' \
-		>"$(ROS_LOG)" 2>&1 & echo $$! >"$(ROS_PID)"
+	@setsid bash -c 'exec 9>"$(ROS_LOCK)"; if ! flock -n 9; then echo "Another MPC ROS 2 pipeline already holds $(ROS_LOCK)"; exit 75; fi; echo $$$$ >"$(ROS_PID)"; source "$(ROS_SETUP)"; if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; exec ros2 launch "$(ROS_PACKAGE)" "$(ROS_LAUNCH)" $(ROS_LAUNCH_ARGS)' \
+		>"$(ROS_LOG)" 2>&1 &
 	@echo "Simulation started with Gazebo GUI. No arm/offboard command was sent."
 	@echo "Run 'make status' and inspect logs under $(SIM_RUNTIME_DIR)."
 

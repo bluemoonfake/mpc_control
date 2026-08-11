@@ -2,11 +2,8 @@
 #include "mpc_controller/msg/reference_step.hpp"
 #include "mpc_controller/msg/trajectory_point.hpp"
 #include "mpc_controller/msg/vehicle_state.hpp"
-#include "mpc_controller/msg/handover_status.hpp"
-#include "mpc_controller/msg/handover_status_delivery_diagnostics.hpp"
-#include "mpc_controller/hold_capture.hpp"
+#include "detail/hold_capture.hpp"
 #include "mpc_controller/reference_model.hpp"
-#include "mpc_controller/timing_diagnostics.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 #include <px4_msgs/msg/vehicle_control_mode.hpp>
@@ -32,17 +29,18 @@ public:
     declare_parameter("hold_position", std::vector<double>{0.0, 0.0, 1.0});
     declare_parameter("line_start", std::vector<double>{0.0, 0.0, 1.0});
     declare_parameter("line_end", std::vector<double>{1.0, 0.0, 1.0});
+    declare_parameter("line_relative_delta", std::vector<double>{2.0, 0.0, 0.0});
     declare_parameter("line_duration_seconds", parameters_.line_duration_seconds);
     declare_parameter("circle_center", std::vector<double>{0.0, 0.0, 1.0});
     declare_parameter("circle_radius", parameters_.circle_radius);
     declare_parameter("circle_period_seconds", parameters_.circle_period_seconds);
+    declare_parameter("circle_ramp_seconds", parameters_.circle_ramp_seconds);
     declare_parameter("circle_phase_rad", parameters_.circle_phase_rad);
     declare_parameter("circle_direction", parameters_.circle_direction);
     declare_parameter("hold_yaw_rad", parameters_.hold_yaw_rad);
     declare_parameter("hold_current_state_on_enable", false);
     declare_parameter("auto_capture_current_hold", false);
     declare_parameter("state_timeout_seconds", state_timeout_seconds_);
-    declare_parameter("status_publish_rate_hz", status_publish_rate_hz_);
     declare_parameter("stable_hover_max_velocity_xy_m_s", thresholds_.max_velocity_xy_m_s);
     declare_parameter("stable_hover_max_velocity_z_m_s", thresholds_.max_velocity_z_m_s);
     declare_parameter(
@@ -54,21 +52,6 @@ public:
     declare_parameter("stable_hover_max_roll_rad", thresholds_.max_roll_rad);
     declare_parameter("stable_hover_max_pitch_rad", thresholds_.max_pitch_rad);
     declare_parameter("stable_hover_dwell_seconds", thresholds_.dwell_seconds);
-    declare_parameter(
-      "stable_hover_exit_max_velocity_xy_m_s", thresholds_.exit_max_velocity_xy_m_s);
-    declare_parameter(
-      "stable_hover_exit_max_velocity_z_m_s", thresholds_.exit_max_velocity_z_m_s);
-    declare_parameter(
-      "stable_hover_exit_max_acceleration_xy_m_s2", thresholds_.exit_max_acceleration_xy_m_s2);
-    declare_parameter(
-      "stable_hover_exit_max_acceleration_z_m_s2", thresholds_.exit_max_acceleration_z_m_s2);
-    declare_parameter(
-      "stable_hover_exit_max_body_rate_xy_rad_s", thresholds_.exit_max_body_rate_xy_rad_s);
-    declare_parameter(
-      "stable_hover_exit_max_body_rate_z_rad_s", thresholds_.exit_max_body_rate_z_rad_s);
-    declare_parameter("stable_hover_exit_max_roll_rad", thresholds_.exit_max_roll_rad);
-    declare_parameter("stable_hover_exit_max_pitch_rad", thresholds_.exit_max_pitch_rad);
-    declare_parameter("stable_hover_exit_dwell_seconds", thresholds_.exit_dwell_seconds);
     declare_parameter("horizon_seconds", horizon_seconds_);
     declare_parameter("sample_period_seconds", sample_period_seconds_);
     declare_parameter("publish_rate_hz", publish_rate_hz_);
@@ -79,17 +62,18 @@ public:
     getVectorParameter("hold_position", parameters_.hold_position);
     getVectorParameter("line_start", parameters_.line_start);
     getVectorParameter("line_end", parameters_.line_end);
+    getVectorParameter("line_relative_delta", line_relative_delta_);
     get_parameter("line_duration_seconds", parameters_.line_duration_seconds);
     getVectorParameter("circle_center", parameters_.circle_center);
     get_parameter("circle_radius", parameters_.circle_radius);
     get_parameter("circle_period_seconds", parameters_.circle_period_seconds);
+    get_parameter("circle_ramp_seconds", parameters_.circle_ramp_seconds);
     get_parameter("circle_phase_rad", parameters_.circle_phase_rad);
     get_parameter("circle_direction", parameters_.circle_direction);
     get_parameter("hold_yaw_rad", parameters_.hold_yaw_rad);
     get_parameter("hold_current_state_on_enable", hold_current_state_on_enable_);
     get_parameter("auto_capture_current_hold", auto_capture_current_hold_);
     get_parameter("state_timeout_seconds", state_timeout_seconds_);
-    get_parameter("status_publish_rate_hz", status_publish_rate_hz_);
     get_parameter("stable_hover_max_velocity_xy_m_s", thresholds_.max_velocity_xy_m_s);
     get_parameter("stable_hover_max_velocity_z_m_s", thresholds_.max_velocity_z_m_s);
     get_parameter("stable_hover_max_acceleration_xy_m_s2", thresholds_.max_acceleration_xy_m_s2);
@@ -99,35 +83,24 @@ public:
     get_parameter("stable_hover_max_roll_rad", thresholds_.max_roll_rad);
     get_parameter("stable_hover_max_pitch_rad", thresholds_.max_pitch_rad);
     get_parameter("stable_hover_dwell_seconds", thresholds_.dwell_seconds);
-    get_parameter(
-      "stable_hover_exit_max_velocity_xy_m_s", thresholds_.exit_max_velocity_xy_m_s);
-    get_parameter("stable_hover_exit_max_velocity_z_m_s", thresholds_.exit_max_velocity_z_m_s);
-    get_parameter(
-      "stable_hover_exit_max_acceleration_xy_m_s2", thresholds_.exit_max_acceleration_xy_m_s2);
-    get_parameter(
-      "stable_hover_exit_max_acceleration_z_m_s2", thresholds_.exit_max_acceleration_z_m_s2);
-    get_parameter(
-      "stable_hover_exit_max_body_rate_xy_rad_s", thresholds_.exit_max_body_rate_xy_rad_s);
-    get_parameter(
-      "stable_hover_exit_max_body_rate_z_rad_s", thresholds_.exit_max_body_rate_z_rad_s);
-    get_parameter("stable_hover_exit_max_roll_rad", thresholds_.exit_max_roll_rad);
-    get_parameter("stable_hover_exit_max_pitch_rad", thresholds_.exit_max_pitch_rad);
-    get_parameter("stable_hover_exit_dwell_seconds", thresholds_.exit_dwell_seconds);
     get_parameter("horizon_seconds", horizon_seconds_);
     get_parameter("sample_period_seconds", sample_period_seconds_);
     get_parameter("publish_rate_hz", publish_rate_hz_);
 
     valid_config_ = valid_config_ && mpc_controller::reference::valid(parameters_)
+      && std::all_of(
+        line_relative_delta_.begin(), line_relative_delta_.end(),
+        [](double value) {return std::isfinite(value);})
+      && std::any_of(
+        line_relative_delta_.begin(), line_relative_delta_.end(),
+        [](double value) {return std::abs(value) > 0.0;})
       && std::isfinite(horizon_seconds_) && horizon_seconds_ >= 0.0
       && std::isfinite(sample_period_seconds_) && sample_period_seconds_ > 0.0
       && std::isfinite(publish_rate_hz_) && publish_rate_hz_ > 0.0
       && std::isfinite(state_timeout_seconds_) && state_timeout_seconds_ > 0.0
-      && std::isfinite(status_publish_rate_hz_) && status_publish_rate_hz_ > 0.0
       && mpc_controller::hold::validThresholds(thresholds_)
       && !frame_id_.empty();
     hold_capture_ = mpc_controller::hold::CaptureOnce(thresholds_);
-    handover_stability_ = mpc_controller::hold::HysteresisGate(thresholds_);
-    status_timer_tracker_.setPeriodSeconds(1.0 / std::max(status_publish_rate_hz_, 1.0));
     if (!valid_config_) {
       RCLCPP_ERROR(get_logger(), "Invalid reference generator parameters; publishing disabled");
     } else {
@@ -135,13 +108,20 @@ public:
       step_subscription_ = create_subscription<ReferenceStep>(
         "reference_step", 10,
         std::bind(&ReferenceGeneratorNode::referenceStepCallback, this, std::placeholders::_1));
-      status_publisher_ = create_publisher<HandoverStatus>("hold_capture_status", 10);
-      status_delivery_diagnostics_publisher_ = create_publisher<DeliveryDiagnostics>(
-        "handover_status_source_diagnostics", 10);
       capture_service_ = create_service<Trigger>(
         "~/capture_hold",
         std::bind(
           &ReferenceGeneratorNode::captureHold, this, std::placeholders::_1,
+          std::placeholders::_2));
+      start_line_service_ = create_service<Trigger>(
+        "~/start_line",
+        std::bind(
+          &ReferenceGeneratorNode::startLine, this, std::placeholders::_1,
+          std::placeholders::_2));
+      start_circle_service_ = create_service<Trigger>(
+        "~/start_circle",
+        std::bind(
+          &ReferenceGeneratorNode::startCircle, this, std::placeholders::_1,
           std::placeholders::_2));
       if (hold_current_state_on_enable_) {
         state_subscription_ = create_subscription<State>(
@@ -174,10 +154,6 @@ public:
         std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::duration<double>(1.0 / publish_rate_hz_)),
         std::bind(&ReferenceGeneratorNode::publish, this));
-      status_timer_ = create_wall_timer(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::duration<double>(1.0 / status_publish_rate_hz_)),
-        std::bind(&ReferenceGeneratorNode::publishStatus, this));
     }
   }
 
@@ -186,8 +162,6 @@ private:
   using ReferenceStep = mpc_controller::msg::ReferenceStep;
   using Point = mpc_controller::msg::TrajectoryPoint;
   using State = mpc_controller::msg::VehicleState;
-  using HandoverStatus = mpc_controller::msg::HandoverStatus;
-  using DeliveryDiagnostics = mpc_controller::msg::HandoverStatusDeliveryDiagnostics;
   using Trigger = std_srvs::srv::Trigger;
   using SteadyClock = std::chrono::steady_clock;
 
@@ -233,6 +207,8 @@ private:
       && std::isfinite(input.position[2]) && std::isfinite(input.yaw)) {
       const bool first_capture = !hold_reference_captured_;
       parameters_.type = "hold";
+      line_started_at_.reset();
+      circle_started_at_.reset();
       parameters_.hold_position = input.position;
       parameters_.hold_yaw_rad = input.yaw;
       hold_reference_captured_ = true;
@@ -296,7 +272,6 @@ private:
     latest_input_ = input;
     const double now = steadySeconds(SteadyClock::now());
     hold_capture_.update(now, input);
-    handover_stability_.update(now, input);
   }
 
   void captureHold(
@@ -318,6 +293,8 @@ private:
     }
     const auto &snapshot = hold_capture_.snapshot();
     parameters_.type = "hold";
+    line_started_at_.reset();
+    circle_started_at_.reset();
     parameters_.hold_position = snapshot.position;
     parameters_.hold_yaw_rad = snapshot.yaw;
     hold_reference_captured_ = true;
@@ -339,6 +316,78 @@ private:
       snapshot.stability.acceleration_xy_m_s2, snapshot.stability.acceleration_z_m_s2,
       snapshot.stability.body_rate_xy_rad_s, snapshot.stability.body_rate_z_rad_s,
       snapshot.stability.roll_rad, snapshot.stability.pitch_rad);
+  }
+
+  void startLine(
+    const std::shared_ptr<Trigger::Request>, const std::shared_ptr<Trigger::Response> response)
+  {
+    if (!valid_config_ || !offboard_active_) {
+      response->success = false;
+      response->message = "line rejected: PX4 Offboard is not active";
+      return;
+    }
+    if (!hold_reference_captured_ || parameters_.type != "hold") {
+      response->success = false;
+      response->message = "line rejected: a captured hold reference is not active";
+      return;
+    }
+
+    parameters_.line_start = parameters_.hold_position;
+    for (std::size_t axis = 0; axis < parameters_.line_end.size(); ++axis) {
+      parameters_.line_end[axis] = parameters_.line_start[axis] + line_relative_delta_[axis];
+    }
+    parameters_.type = "line";
+    circle_started_at_.reset();
+    line_started_at_ = SteadyClock::now();
+    publish();
+
+    response->success = true;
+    response->message = "relative line started";
+    RCLCPP_INFO(
+      get_logger(),
+      "Relative ENU line started: start=[%.3f %.3f %.3f] end=[%.3f %.3f %.3f] "
+      "duration=%.3f s yaw_hold=%.4f",
+      parameters_.line_start[0], parameters_.line_start[1], parameters_.line_start[2],
+      parameters_.line_end[0], parameters_.line_end[1], parameters_.line_end[2],
+      parameters_.line_duration_seconds, parameters_.hold_yaw_rad);
+  }
+
+  void startCircle(
+    const std::shared_ptr<Trigger::Request>, const std::shared_ptr<Trigger::Response> response)
+  {
+    if (!valid_config_ || !offboard_active_) {
+      response->success = false;
+      response->message = "circle rejected: PX4 Offboard is not active";
+      return;
+    }
+    if (!hold_reference_captured_ || parameters_.type != "hold") {
+      response->success = false;
+      response->message = "circle rejected: a captured hold reference is not active";
+      return;
+    }
+
+    // phase=0 starts at center+[radius, 0, 0]. Offset the center so the
+    // circle begins exactly at the captured hold, without a position jump.
+    parameters_.circle_center = parameters_.hold_position;
+    parameters_.circle_center[0] -= parameters_.circle_radius;
+    parameters_.circle_phase_rad = 0.0;
+    parameters_.type = "circle";
+    line_started_at_.reset();
+    circle_started_at_ = SteadyClock::now();
+    publish();
+
+    response->success = true;
+    response->message = "circle started";
+    RCLCPP_INFO(
+      get_logger(),
+      "ENU circle started: start=[%.3f %.3f %.3f] center=[%.3f %.3f %.3f] "
+      "radius=%.3f m period=%.3f s ramp=%.3f s direction=%d yaw_hold=%.4f",
+      parameters_.hold_position[0], parameters_.hold_position[1],
+      parameters_.hold_position[2], parameters_.circle_center[0],
+      parameters_.circle_center[1], parameters_.circle_center[2],
+      parameters_.circle_radius, parameters_.circle_period_seconds,
+      parameters_.circle_ramp_seconds,
+      parameters_.circle_direction, parameters_.hold_yaw_rad);
   }
 
   void getVectorParameter(const std::string &name, std::array<double, 3> &output)
@@ -381,12 +430,32 @@ private:
     message.hold_after_end = true;
     const uint64_t count = horizon_ns / sample_ns + 1;
     message.points.reserve(static_cast<std::size_t>(count));
+    double trajectory_elapsed_seconds = 0.0;
+    if (parameters_.type == "line" && line_started_at_) {
+      trajectory_elapsed_seconds = std::max(
+        0.0, std::chrono::duration<double>(SteadyClock::now() - *line_started_at_).count());
+    } else if (parameters_.type == "circle" && circle_started_at_) {
+      trajectory_elapsed_seconds = std::max(
+        0.0, std::chrono::duration<double>(SteadyClock::now() - *circle_started_at_).count());
+    }
     for (uint64_t index = 0; index < count; ++index) {
-      const double time = static_cast<double>(index * sample_ns) * 1.0e-9;
+      const double time = trajectory_elapsed_seconds +
+        static_cast<double>(index * sample_ns) * 1.0e-9;
+      const bool circle_complete = parameters_.type == "circle" &&
+        time >= parameters_.circle_period_seconds;
+      const double model_time = circle_complete ? parameters_.circle_period_seconds : time;
       mpc_controller::reference::Sample sample;
-      if (!mpc_controller::reference::sample(parameters_, time, sample)) {
+      if (!mpc_controller::reference::sample(parameters_, model_time, sample)) {
         RCLCPP_ERROR(get_logger(), "Reference sample failed at t=%.6f", time);
         return;
+      }
+      if (parameters_.type == "line" || parameters_.type == "circle") {
+        sample.yaw = parameters_.hold_yaw_rad;
+        sample.yaw_rate = 0.0;
+      }
+      if (circle_complete) {
+        sample.velocity = {0.0, 0.0, 0.0};
+        sample.acceleration = {0.0, 0.0, 0.0};
       }
       Point point;
       point.time_from_start = durationMessage(index * sample_ns);
@@ -409,85 +478,12 @@ private:
       parameters_.hold_position[2], parameters_.hold_yaw_rad);
   }
 
-  void publishStatus()
-  {
-    if (!status_publisher_) {
-      return;
-    }
-    mpc_controller::timing::TimerGuard timer_guard(
-      status_timer_tracker_, mpc_controller::timing::steadyNowNs());
-    const auto timer_sample = timer_guard.sample();
-    refreshGate();
-    HandoverStatus message{};
-    message.header.stamp = get_clock()->now();
-    message.header.frame_id = frame_id_;
-    message.publisher_steady_timestamp_ns = mpc_controller::timing::steadyNowNs();
-    message.timer_sequence = timer_sample.sequence;
-    message.timer_expected_fire_steady_timestamp_ns =
-      timer_sample.expected_fire_steady_timestamp_ns;
-    message.timer_actual_start_steady_timestamp_ns = timer_sample.actual_start_steady_timestamp_ns;
-    message.timer_callback_end_steady_timestamp_ns = mpc_controller::timing::steadyNowNs();
-    const auto state = hold_capture_.state();
-    message.state = static_cast<std::uint8_t>(state);
-    if (latest_input_) {
-      const auto &input = *latest_input_;
-      message.vehicle_state_valid = input.valid;
-      message.vehicle_state_fresh = input.fresh;
-      message.heading_valid = input.heading_valid;
-      message.yaw_valid = input.yaw_valid;
-    message.control_ready = input.control_ready;
-    }
-    message.capture_ready = hold_current_state_on_enable_ &&
-      hold_capture_.currentReady() && hold_capture_.currentStable() &&
-      hold_capture_.dwellComplete(steadySeconds(SteadyClock::now())) &&
-      !hold_capture_.captured();
-    message.stable_hover = hold_capture_.currentStable();
-    message.handover_stability_valid = handover_stability_.stable();
-    message.dwell_complete = hold_capture_.dwellComplete(steadySeconds(SteadyClock::now()));
-    message.capture_valid = hold_capture_.captured();
-    message.capture_timestamp = 0U;
-    message.stable_duration_seconds = hold_capture_.dwellSeconds(steadySeconds(SteadyClock::now()));
-    if (const auto &metrics = hold_capture_.latestMetrics()) {
-      message.stability_metrics = {
-        metrics->velocity_xy_m_s, metrics->velocity_z_m_s,
-        metrics->acceleration_xy_m_s2, metrics->acceleration_z_m_s2,
-        metrics->body_rate_xy_rad_s, metrics->body_rate_z_rad_s,
-        metrics->roll_rad, metrics->pitch_rad};
-    }
-    message.stability_limits = {
-      thresholds_.max_velocity_xy_m_s, thresholds_.max_velocity_z_m_s,
-      thresholds_.max_acceleration_xy_m_s2, thresholds_.max_acceleration_z_m_s2,
-      thresholds_.max_body_rate_xy_rad_s, thresholds_.max_body_rate_z_rad_s,
-      thresholds_.max_roll_rad, thresholds_.max_pitch_rad};
-    if (hold_capture_.captured()) {
-      message.capture_timestamp = hold_capture_.snapshot().timestamp;
-    }
-    status_publisher_->publish(message);
-    const auto source_callback_end_ns = mpc_controller::timing::steadyNowNs();
-    if (status_delivery_diagnostics_publisher_) {
-      DeliveryDiagnostics diagnostics{};
-      diagnostics.header = message.header;
-      diagnostics.role = DeliveryDiagnostics::PRODUCER;
-      diagnostics.diagnostic_sequence = message.timer_sequence;
-      diagnostics.source_publish_sequence = message.timer_sequence;
-      diagnostics.source_publish_steady_timestamp_ns = message.publisher_steady_timestamp_ns;
-      diagnostics.source_publish_ros_timestamp_ns =
-        static_cast<std::uint64_t>(message.header.stamp.sec) * 1000000000ULL +
-        message.header.stamp.nanosec;
-      diagnostics.source_callback_start_steady_timestamp_ns =
-        message.timer_actual_start_steady_timestamp_ns;
-      diagnostics.source_callback_end_steady_timestamp_ns =
-        source_callback_end_ns;
-      status_delivery_diagnostics_publisher_->publish(diagnostics);
-    }
-  }
-
   mpc_controller::reference::Parameters parameters_{};
+  std::array<double, 3> line_relative_delta_{2.0, 0.0, 0.0};
   std::string frame_id_ = "map";
   double horizon_seconds_ = 30.0;
   double sample_period_seconds_ = 0.1;
   double publish_rate_hz_ = 1.0;
-  double status_publish_rate_hz_ = 50.0;
   double state_timeout_seconds_ = 0.25;
   bool hold_current_state_on_enable_ = false;
   bool auto_capture_current_hold_ = false;
@@ -495,22 +491,21 @@ private:
   bool hold_reference_captured_ = false;
   mpc_controller::hold::Thresholds thresholds_{};
   mpc_controller::hold::CaptureOnce hold_capture_{thresholds_};
-  mpc_controller::hold::HysteresisGate handover_stability_{thresholds_};
   std::optional<mpc_controller::hold::Input> latest_input_;
   std::optional<std::uint64_t> last_state_timestamp_;
   std::optional<SteadyClock::time_point> last_state_received_at_;
+  std::optional<SteadyClock::time_point> line_started_at_;
+  std::optional<SteadyClock::time_point> circle_started_at_;
   bool valid_config_ = false;
   uint64_t trajectory_id_ = 1;
   rclcpp::Publisher<Reference>::SharedPtr publisher_;
   rclcpp::Subscription<ReferenceStep>::SharedPtr step_subscription_;
-  rclcpp::Publisher<HandoverStatus>::SharedPtr status_publisher_;
-  rclcpp::Publisher<DeliveryDiagnostics>::SharedPtr status_delivery_diagnostics_publisher_;
   rclcpp::Service<Trigger>::SharedPtr capture_service_;
+  rclcpp::Service<Trigger>::SharedPtr start_line_service_;
+  rclcpp::Service<Trigger>::SharedPtr start_circle_service_;
   rclcpp::Subscription<State>::SharedPtr state_subscription_;
   rclcpp::Subscription<px4_msgs::msg::VehicleControlMode>::SharedPtr control_mode_subscription_;
   rclcpp::TimerBase::SharedPtr timer_;
-  rclcpp::TimerBase::SharedPtr status_timer_;
-  mpc_controller::timing::TimerTracker status_timer_tracker_{};
 };
 
 int main(int argc, char **argv)

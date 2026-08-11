@@ -26,12 +26,5 @@ mpc_controller_node:
     strict_validation: false
     enable_thrust_feasibility: false
     use_force_norm_for_collective_thrust: true
-    max_control_z: 2.0
-    max_control_rate_z: 5.0
-    vehicle_mass: 2.0
-    gravity: 9.80665
-    hover_thrust_normalized: 0.765
-    plant_max_collective_thrust_n: 34.19432
-    max_tilt: 1.5707963267948966
     force_feedback_kp_n_per_m: [0.0, 0.0, 0.0]
     force_feedback_kv_n_per_m_s: [0.0, 0.0, 0.0]

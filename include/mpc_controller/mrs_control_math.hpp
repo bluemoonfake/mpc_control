@@ -23,18 +23,16 @@ struct Parameters
   double gravity_m_s2 = 9.80665;
   double max_tilt_rad = 1.5707963267948966;
 
-  // External PX4 normalized collective contract. The plant maximum is kept
-  // for diagnostics only and must not be used as the control limit.
+  // External PX4 normalized collective contract.
   double hover_thrust_normalized = 0.765;
   double max_normalized_collective_thrust = 1.0;
-  double plant_max_collective_thrust_n = 34.19432;
   bool enable_thrust_feasibility = true;
   bool use_force_norm_for_collective_thrust = false;
 };
 
 struct Input
 {
-  Vector3 desired_acceleration_m_s2{};  // M2 control_input, not predicted a[k+1]
+  Vector3 desired_acceleration_m_s2{};  // M2 first predicted acceleration a[k+1]
   Eigen::Quaterniond measured_body_to_world{Eigen::Quaterniond::Identity()};
   double desired_yaw_rad = 0.0;
   bool attitude_valid = false;
@@ -117,7 +115,7 @@ inline bool validParameters(const Parameters &parameters) noexcept
     && parameters.max_tilt_rad <= 0.5 * M_PI
     && thrust_feasibility::validParameters(thrust_feasibility::Parameters{
       parameters.mass_kg, parameters.gravity_m_s2, parameters.hover_thrust_normalized,
-      parameters.max_normalized_collective_thrust, parameters.plant_max_collective_thrust_n});
+      parameters.max_normalized_collective_thrust});
 }
 
 inline std::optional<Vector3> desiredForce(
@@ -218,7 +216,7 @@ inline Output compute(const Parameters &parameters, const Input &input) noexcept
     const auto feasibility = thrust_feasibility::project(
       thrust_feasibility::Parameters{
         parameters.mass_kg, parameters.gravity_m_s2, parameters.hover_thrust_normalized,
-        parameters.max_normalized_collective_thrust, parameters.plant_max_collective_thrust_n},
+        parameters.max_normalized_collective_thrust},
       input.desired_acceleration_m_s2);
     if (!feasibility) {
       output.failure_reason = FailureReason::feasibility_invalid;

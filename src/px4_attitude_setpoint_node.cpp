@@ -1,7 +1,7 @@
 #include "mpc_controller/msg/attitude_setpoint_preview.hpp"
 #include "mpc_controller/msg/m3_control_output.hpp"
 #include "mpc_controller/msg/vehicle_state.hpp"
-#include "mpc_controller/px4_attitude_setpoint_contract.hpp"
+#include "detail/px4_attitude_setpoint_contract.hpp"
 #include "mpc_controller/timing_diagnostics.hpp"
 
 #include <px4_msgs/msg/hover_thrust_estimate.hpp>

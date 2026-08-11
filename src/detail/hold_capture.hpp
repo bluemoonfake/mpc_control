@@ -19,10 +19,7 @@ enum class CaptureState : std::uint8_t
 
 struct Thresholds
 {
-  // ENTER limits are intentionally strict and are used by explicit hold
-  // capture. EXIT limits are only for the stateful pre-handover stability
-  // gate; they must be wider than ENTER limits and do not relax controller
-  // health, freshness, finite-value, envelope, or saturation checks.
+  // Strict limits used only by explicit hold capture.
   double max_velocity_xy_m_s = 0.032;
   double max_velocity_z_m_s = 0.18;
   double max_acceleration_xy_m_s2 = 0.080;
@@ -32,20 +29,6 @@ struct Thresholds
   double max_roll_rad = 0.0065;
   double max_pitch_rad = 0.0070;
   double dwell_seconds = 2.0;
-
-  // Derived from the M5.2D stock-hover window. v_xy EXIT is 0.0353 m/s,
-  // above the observed 0.033547 m/s maximum. Other EXIT values are 1.1x
-  // their strict ENTER limits. A 0.20 s violation dwell is ten samples at
-  // the nominal 50 Hz status rate.
-  double exit_max_velocity_xy_m_s = 0.0353;
-  double exit_max_velocity_z_m_s = 0.198;
-  double exit_max_acceleration_xy_m_s2 = 0.088;
-  double exit_max_acceleration_z_m_s2 = 0.77;
-  double exit_max_body_rate_xy_rad_s = 0.0495;
-  double exit_max_body_rate_z_rad_s = 0.033;
-  double exit_max_roll_rad = 0.00715;
-  double exit_max_pitch_rad = 0.0077;
-  double exit_dwell_seconds = 0.20;
 };
 
 struct StabilityMetrics
@@ -126,24 +109,7 @@ inline bool validThresholds(const Thresholds &thresholds) noexcept
          thresholds.max_body_rate_z_rad_s > 0.0 &&
          std::isfinite(thresholds.max_roll_rad) && thresholds.max_roll_rad > 0.0 &&
          std::isfinite(thresholds.max_pitch_rad) && thresholds.max_pitch_rad > 0.0 &&
-         std::isfinite(thresholds.dwell_seconds) && thresholds.dwell_seconds > 0.0 &&
-         std::isfinite(thresholds.exit_max_velocity_xy_m_s) &&
-         thresholds.exit_max_velocity_xy_m_s > thresholds.max_velocity_xy_m_s &&
-         std::isfinite(thresholds.exit_max_velocity_z_m_s) &&
-         thresholds.exit_max_velocity_z_m_s > thresholds.max_velocity_z_m_s &&
-         std::isfinite(thresholds.exit_max_acceleration_xy_m_s2) &&
-         thresholds.exit_max_acceleration_xy_m_s2 > thresholds.max_acceleration_xy_m_s2 &&
-         std::isfinite(thresholds.exit_max_acceleration_z_m_s2) &&
-         thresholds.exit_max_acceleration_z_m_s2 > thresholds.max_acceleration_z_m_s2 &&
-         std::isfinite(thresholds.exit_max_body_rate_xy_rad_s) &&
-         thresholds.exit_max_body_rate_xy_rad_s > thresholds.max_body_rate_xy_rad_s &&
-         std::isfinite(thresholds.exit_max_body_rate_z_rad_s) &&
-         thresholds.exit_max_body_rate_z_rad_s > thresholds.max_body_rate_z_rad_s &&
-         std::isfinite(thresholds.exit_max_roll_rad) &&
-         thresholds.exit_max_roll_rad > thresholds.max_roll_rad &&
-         std::isfinite(thresholds.exit_max_pitch_rad) &&
-         thresholds.exit_max_pitch_rad > thresholds.max_pitch_rad &&
-         std::isfinite(thresholds.exit_dwell_seconds) && thresholds.exit_dwell_seconds > 0.0;
+         std::isfinite(thresholds.dwell_seconds) && thresholds.dwell_seconds > 0.0;
 }
 
 inline bool attitudeRollPitch(
@@ -211,82 +177,6 @@ inline bool stable(const StabilityMetrics &metrics, const Thresholds &thresholds
          metrics.roll_rad <= thresholds.max_roll_rad &&
          metrics.pitch_rad <= thresholds.max_pitch_rad;
 }
-
-inline bool withinExitBand(
-  const StabilityMetrics &metrics, const Thresholds &thresholds) noexcept
-{
-  return validThresholds(thresholds) &&
-         metrics.velocity_xy_m_s <= thresholds.exit_max_velocity_xy_m_s &&
-         metrics.velocity_z_m_s <= thresholds.exit_max_velocity_z_m_s &&
-         metrics.acceleration_xy_m_s2 <= thresholds.exit_max_acceleration_xy_m_s2 &&
-         metrics.acceleration_z_m_s2 <= thresholds.exit_max_acceleration_z_m_s2 &&
-         metrics.body_rate_xy_rad_s <= thresholds.exit_max_body_rate_xy_rad_s &&
-         metrics.body_rate_z_rad_s <= thresholds.exit_max_body_rate_z_rad_s &&
-         metrics.roll_rad <= thresholds.exit_max_roll_rad &&
-         metrics.pitch_rad <= thresholds.exit_max_pitch_rad;
-}
-
-// Stateful stability used only before ownership transfer. CaptureOnce below
-// remains strict: a capture still requires ENTER limits and a continuous
-// strict dwell. Once this gate is stable, a short ENTER-band excursion does
-// not revoke handover stability; an EXIT-band violation must persist for the
-// configured exit dwell before it does.
-class HysteresisGate final
-{
-public:
-  explicit HysteresisGate(const Thresholds &thresholds = {}) noexcept
-  : thresholds_(thresholds) {}
-
-  void update(double now_seconds, const Input &input) noexcept
-  {
-    StabilityMetrics metrics;
-    const bool ready = measure(input, metrics) && validThresholds(thresholds_) &&
-      std::isfinite(now_seconds);
-    if (!ready) {
-      stable_ = false;
-      enter_since_seconds_.reset();
-      exit_since_seconds_.reset();
-      return;
-    }
-
-    if (!stable_) {
-      exit_since_seconds_.reset();
-      if (!mpc_controller::hold::stable(metrics, thresholds_)) {
-        enter_since_seconds_.reset();
-        return;
-      }
-      if (!enter_since_seconds_) {
-        enter_since_seconds_ = now_seconds;
-      }
-      if (now_seconds - *enter_since_seconds_ >= thresholds_.dwell_seconds) {
-        stable_ = true;
-      }
-      return;
-    }
-
-    enter_since_seconds_.reset();
-    if (mpc_controller::hold::withinExitBand(metrics, thresholds_)) {
-      exit_since_seconds_.reset();
-      return;
-    }
-    if (!exit_since_seconds_) {
-      exit_since_seconds_ = now_seconds;
-    }
-    if (now_seconds - *exit_since_seconds_ >= thresholds_.exit_dwell_seconds) {
-      stable_ = false;
-      exit_since_seconds_.reset();
-    }
-  }
-
-  bool stable() const noexcept {return stable_;}
-  const Thresholds &thresholds() const noexcept {return thresholds_;}
-
-private:
-  Thresholds thresholds_{};
-  std::optional<double> enter_since_seconds_;
-  std::optional<double> exit_since_seconds_;
-  bool stable_ = false;
-};
 
 class CaptureOnce final
 {

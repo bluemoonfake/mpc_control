@@ -4,9 +4,17 @@ reference_generator_node:
     frame_id: map
     hold_position: [0.0, 0.0, 0.0]
     hold_yaw_rad: 0.0
-    hold_current_state_on_enable: true
+    # Triggered through /reference_generator_node/start_line after Offboard entry.
+    # The start point and yaw are the hold reference captured at that entry.
+    line_relative_delta: [2.0, 0.0, 0.0]
+    line_duration_seconds: 12.0
+    # One C2-continuous revolution, triggered after entering Offboard.
+    # A 3 s quintic velocity ramp removes the start/stop velocity jumps.
+    circle_radius: 10.0
+    circle_period_seconds: 20.0
+    circle_ramp_seconds: 3.0
+    circle_direction: 1
     state_timeout_seconds: 0.25
-    status_publish_rate_hz: 50.0
     stable_hover_max_velocity_xy_m_s: 0.032
     stable_hover_max_velocity_z_m_s: 0.18
     stable_hover_max_acceleration_xy_m_s2: 0.080
@@ -16,15 +24,6 @@ reference_generator_node:
     stable_hover_max_roll_rad: 0.0065
     stable_hover_max_pitch_rad: 0.0070
     stable_hover_dwell_seconds: 2.0
-    stable_hover_exit_max_velocity_xy_m_s: 0.0353
-    stable_hover_exit_max_velocity_z_m_s: 0.198
-    stable_hover_exit_max_acceleration_xy_m_s2: 0.088
-    stable_hover_exit_max_acceleration_z_m_s2: 0.77
-    stable_hover_exit_max_body_rate_xy_rad_s: 0.0495
-    stable_hover_exit_max_body_rate_z_rad_s: 0.033
-    stable_hover_exit_max_roll_rad: 0.00715
-    stable_hover_exit_max_pitch_rad: 0.0077
-    stable_hover_exit_dwell_seconds: 0.20
     horizon_seconds: 30.0
     sample_period_seconds: 0.1
     publish_rate_hz: 1.0
@@ -42,23 +41,30 @@ mpc_controller_node:
     state_timeout_seconds: 0.25
     dt_first: 0.01
     dt_later: 0.20
-    max_iterations: 45
-    solver_verbose: false
-    q_xy: [500.0, 100.0, 100.0]
-    s_xy: [1000.0, 300.0, 300.0]
+    max_iterations: 400
+    # Per-axis acceleration response: beta = 1-alpha. Zero preserves the
+    # direct acceleration-command boundary while enabling the full paper A/B.
+    model_alpha_xyz: [0.0, 0.0, 0.0]
+    admm_rho: 0.02
+    solver_absolute_tolerance: 0.00001
+    solver_relative_tolerance: 0.00001
+    # XY tuning candidate 4: selected after candidate 5 (q_a=200) increased
+    # circle tracking error despite slightly reducing thrust oscillation.
+    # Original baseline: q_xy=[500,100,100], s_xy=[1000,300,300].
+    q_xy: [700.0, 100.0, 100.0]
+    s_xy: [1000.0, 600.0, 300.0]
     q_z: [100.0, 30.0, 10.0]
     s_z: [100.0, 30.0, 10.0]
-    max_speed_xy: 2.0
-    max_control_xy: 2.0
+    max_speed_xy: 5.0
+    max_control_xy: 5.0
     max_control_rate_xy: 5.0
-    max_speed_z: 2.0
-    max_acceleration_z: 2.0
+    max_speed_z: 5.0
+    max_acceleration_z: 5.0
     max_measured_acceleration_z_m_s2: 2.0
-    max_control_z: 50.0
-    max_control_rate_z: 999.0
+    max_control_z: 2.0
+    max_control_rate_z: 5.0
     vehicle_mass: 2.0
     gravity: 9.80665
     hover_thrust_normalized: 0.765
     max_normalized_collective_thrust: 1.0
-    plant_max_collective_thrust_n: 34.19432
-    max_tilt: 0.7853981633974483
+    max_tilt: 1.5707963267948966

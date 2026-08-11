@@ -17,7 +17,6 @@ struct Parameters
   double gravity_m_s2 = 9.80665;
   double hover_thrust_normalized = 0.765;
   double max_normalized_collective_thrust = 1.0;
-  double plant_max_collective_thrust_n = 34.19432;  // diagnostics only
 };
 
 struct Result
@@ -47,9 +46,7 @@ inline bool validParameters(const Parameters &parameters) noexcept
     && parameters.hover_thrust_normalized <= 1.0
     && std::isfinite(parameters.max_normalized_collective_thrust)
     && parameters.max_normalized_collective_thrust > 0.0
-    && parameters.max_normalized_collective_thrust <= 1.0
-    && std::isfinite(parameters.plant_max_collective_thrust_n)
-    && parameters.plant_max_collective_thrust_n > 0.0;
+    && parameters.max_normalized_collective_thrust <= 1.0;
 }
 
 inline double controlMaxCollectiveThrustN(const Parameters &parameters) noexcept

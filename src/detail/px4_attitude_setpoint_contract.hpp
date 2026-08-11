@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mpc_controller/px4_thrust_mapping.hpp"
+#include "px4_thrust_mapping.hpp"
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>

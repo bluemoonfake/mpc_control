@@ -45,3 +45,27 @@ The main command path is:
 - `/fmu/out/hover_thrust_estimate` supplies hover-thrust calibration
 
 Use `/reference_step` for relative point commands while testing.
+
+For the line test, enter Offboard on the captured hold first, then start the
+configured relative line exactly once:
+
+```bash
+ros2 service call /reference_generator_node/start_line std_srvs/srv/Trigger "{}"
+```
+
+The default validation profile uses a 2 m ENU X line over 12 s while holding
+the captured Z and yaw. The line phase advances continuously across the 1 Hz
+reference publications, and the endpoint is held after completion.
+
+For the circle test, enter Offboard on a newly captured hold and start the
+configured circle exactly once:
+
+```bash
+ros2 service call /reference_generator_node/start_circle std_srvs/srv/Trigger "{}"
+```
+
+The default one-revolution circle has radius 3 m and period 20 s, with 3 s quintic
+acceleration and deceleration ramps. It begins at the captured
+position without a setpoint jump, initially moves in ENU +Y, and holds the
+captured Z and yaw. After one revolution it stops and holds the start point.
+Leaving Offboard returns the generator to current-state hold tracking.
