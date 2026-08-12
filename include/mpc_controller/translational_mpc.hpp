@@ -9,8 +9,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
-#include <limits>
-#include <string>
 #include <vector>
 
 namespace mpc_controller::translational
@@ -96,9 +94,6 @@ struct UpdateResult
   std::array<double, 3> control{};  // actuator acceleration command u0 for X/Y/Z
   std::array<double, 3> first_predicted_acceleration{};  // modeled plant state a[k+1]
   std::array<int, 3> iterations{};
-  std::array<double, 3> initial_state_x{};
-  std::array<double, 3> initial_state_y{};
-  std::array<double, 3> initial_state_z{};
   // Layout: prediction[step * 9 + axis * 3 + state], state=[p,v,a].
   std::array<double, kHorizonLength * kAxisCount * kStateSize> prediction{};
   double solve_time_seconds = 0.0;
@@ -280,10 +275,6 @@ public:
 
     setInitialState(measured);
     packReference(reference);
-    result.initial_state_x = {measured.position[0], measured.velocity[0], measured.acceleration[0]};
-    result.initial_state_y = {measured.position[1], measured.velocity[1], measured.acceleration[1]};
-    result.initial_state_z = {measured.position[2], measured.velocity[2], measured.acceleration[2]};
-
     const auto start = std::chrono::steady_clock::now();
     const auto x_solve = solver_x_.solve(initial_x_, reference_x_, last_input_[0]);
     const auto y_solve = solver_y_.solve(initial_y_, reference_y_, last_input_[1]);

@@ -1,6 +1,5 @@
-#include "detail/frame_contract.hpp"
 #include "mpc_controller/msg/vehicle_state.hpp"
-#include "detail/vehicle_state_bridge_diagnostics.hpp"
+#include "mpc_controller/state_bridge.hpp"
 
 #include <px4_msgs/msg/vehicle_angular_velocity.hpp>
 #include <px4_msgs/msg/vehicle_attitude.hpp>
@@ -12,7 +11,6 @@
 #include <functional>
 #include <limits>
 #include <mutex>
-#include <optional>
 
 class VehicleStateBridgeNode final : public rclcpp::Node
 {
@@ -68,7 +66,6 @@ private:
     uint64_t gap_count = 0;
     double gap_sum_seconds = 0.0;
     double gap_max_seconds = 0.0;
-    double last_interarrival_seconds = std::numeric_limits<double>::infinity();
     uint64_t receipt_steady_timestamp_ns = 0;
   };
 
@@ -86,7 +83,6 @@ private:
         ++cache.gap_count;
         cache.gap_sum_seconds += gap;
         cache.gap_max_seconds = std::max(cache.gap_max_seconds, gap);
-        cache.last_interarrival_seconds = gap;
       }
     }
     cache.received_at = now;
@@ -134,27 +130,16 @@ private:
     recordReception(angular_velocity_cache_, Clock::now());
   }
 
-  bool fresh(const Cache &cache, Clock::time_point now) const noexcept
-  {
-    if (!cache.received) {
-      return false;
-    }
-    const double age = std::chrono::duration<double>(now - cache.received_at).count();
-    return mpc_controller::frame::sampleAgeValid(age, state_timeout_seconds_);
-  }
-
-  static mpc_controller::vehicle_state_diagnostics::SourceTiming sourceTiming(
+  static mpc_controller::state_check::Timing sourceTiming(
     const Cache &cache, const uint64_t sample_timestamp, const uint64_t evaluation_ns)
   {
-    mpc_controller::vehicle_state_diagnostics::SourceTiming result;
-    result.sample_timestamp = sample_timestamp;
-    result.receipt_steady_timestamp_ns = cache.receipt_steady_timestamp_ns;
-    result.interarrival_seconds = cache.last_interarrival_seconds;
+    mpc_controller::state_check::Timing result;
+    result.sample_time = sample_timestamp;
     result.received = cache.received;
     if (cache.received && evaluation_ns >= cache.receipt_steady_timestamp_ns) {
-      result.age_seconds = static_cast<double>(evaluation_ns - cache.receipt_steady_timestamp_ns) * 1.0e-9;
+      result.age = static_cast<double>(evaluation_ns - cache.receipt_steady_timestamp_ns) * 1.0e-9;
     } else if (cache.received) {
-      result.age_seconds = std::numeric_limits<double>::quiet_NaN();
+      result.age = std::numeric_limits<double>::quiet_NaN();
     }
     return result;
   }
@@ -190,9 +175,9 @@ private:
     Px4AngularVelocity angular_velocity;
     const auto now = Clock::now();
     const uint64_t evaluation_ns = steadyTimestampNs(now);
-    mpc_controller::vehicle_state_diagnostics::SourceTiming position_timing;
-    mpc_controller::vehicle_state_diagnostics::SourceTiming attitude_timing;
-    mpc_controller::vehicle_state_diagnostics::SourceTiming angular_velocity_timing;
+    mpc_controller::state_check::Timing position_timing;
+    mpc_controller::state_check::Timing attitude_timing;
+    mpc_controller::state_check::Timing angular_velocity_timing;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       reportTiming(now);
@@ -205,14 +190,14 @@ private:
         angular_velocity_cache_, angular_velocity.timestamp_sample, evaluation_ns);
     }
 
-    const auto freshness_decision = mpc_controller::vehicle_state_diagnostics::evaluate(
-      position_timing, attitude_timing, angular_velocity_timing, evaluation_ns,
+    const auto freshness_decision = mpc_controller::state_check::evaluate(
+      position_timing, attitude_timing, angular_velocity_timing,
       state_timeout_seconds_, max_sample_skew_seconds_);
     const double current_sample_skew_ms = sampleSkewMs(
       position.timestamp_sample, attitude.timestamp_sample, angular_velocity.timestamp_sample);
     if (!freshness_decision.valid) {
       if (freshness_decision.reason ==
-        mpc_controller::vehicle_state_diagnostics::RejectReason::sample_skew)
+        mpc_controller::state_check::Reject::sample_skew)
       {
         std::lock_guard<std::mutex> lock(mutex_);
         ++skew_rejection_count_;
@@ -224,9 +209,9 @@ private:
         get_logger(), *get_clock(), 5000,
         "VehicleState not published: reason=%s pos_age=%.3f ms att_age=%.3f ms "
         "ang_age=%.3f ms sample_skew=%.3f ms",
-        mpc_controller::vehicle_state_diagnostics::rejectReasonName(freshness_decision.reason),
-        position_timing.age_seconds * 1.0e3, attitude_timing.age_seconds * 1.0e3,
-        angular_velocity_timing.age_seconds * 1.0e3, current_sample_skew_ms);
+        mpc_controller::state_check::reasonName(freshness_decision.reason),
+        position_timing.age * 1.0e3, attitude_timing.age * 1.0e3,
+        angular_velocity_timing.age * 1.0e3, current_sample_skew_ms);
       return;
     }
 
@@ -237,16 +222,12 @@ private:
     local_sample.v_xy_valid = position.v_xy_valid;
     local_sample.v_z_valid = position.v_z_valid;
     local_sample.heading_good_for_control = position.heading_good_for_control;
-    local_sample.xy_reset_counter = position.xy_reset_counter;
-    local_sample.z_reset_counter = position.z_reset_counter;
-    local_sample.heading_reset_counter = position.heading_reset_counter;
     local_sample.position_ned = {position.x, position.y, position.z};
     local_sample.velocity_ned = {position.vx, position.vy, position.vz};
     local_sample.acceleration_ned = {position.ax, position.ay, position.az};
 
     mpc_controller::frame::Px4AttitudeSample attitude_sample;
     attitude_sample.timestamp_sample = attitude.timestamp_sample;
-    attitude_sample.quat_reset_counter = attitude.quat_reset_counter;
     attitude_sample.body_frd_to_world_ned = {
       attitude.q[0], attitude.q[1], attitude.q[2], attitude.q[3]};
 
@@ -270,9 +251,7 @@ private:
     state.velocity = converted.velocity_enu;
     state.acceleration = converted.acceleration_enu;
     state.attitude = converted.body_flu_to_world_enu;
-    state.body_rate = converted.body_rate_flu;
     state.yaw = converted.yaw_enu;
-    state.yaw_rate = converted.yaw_rate_enu;
     // `valid` means the measured state is usable by the controller
     // processing. Active attitude/thrust control additionally requires
     // PX4's heading readiness, exposed separately below.
@@ -283,12 +262,8 @@ private:
     state.velocity_valid = converted.velocity_valid;
     state.acceleration_valid = converted.acceleration_valid;
     state.attitude_valid = converted.attitude_valid;
-    state.body_rate_valid = converted.body_rate_valid;
     state.heading_valid = converted.heading_valid;
-    state.yaw_valid = converted.heading_valid;
     state.control_ready = converted.control_ready;
-    state.reset_counter = converted.reset_counter;
-    state.reset_counter_valid = true;
     state_publisher_->publish(state);
     {
       std::lock_guard<std::mutex> lock(mutex_);

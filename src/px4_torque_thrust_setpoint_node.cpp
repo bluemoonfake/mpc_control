@@ -1,8 +1,7 @@
 #include "mpc_controller/msg/torque_thrust_setpoint_preview.hpp"
 #include "mpc_controller/msg/m3_control_output.hpp"
 #include "mpc_controller/msg/vehicle_state.hpp"
-#include "detail/px4_torque_thrust_contract.hpp"
-#include "mpc_controller/timing_diagnostics.hpp"
+#include "mpc_controller/geometric_controller.hpp"
 
 #include <px4_msgs/msg/hover_thrust_estimate.hpp>
 #include <px4_msgs/msg/offboard_control_mode.hpp>
@@ -46,6 +45,19 @@ public:
     declare_parameter("hover_thrust_normalized", thrust_mapping_.hover_thrust_normalized);
     declare_parameter("attitude_gain", std::vector<double>{0.8, 0.8, 0.4});
     declare_parameter("rate_gain", std::vector<double>{0.15, 0.15, 0.10});
+    declare_parameter("enable_desired_rate_tracking", enable_desired_rate_tracking_);
+    declare_parameter(
+      "enable_dynamics_compensation", torque_parameters_.enable_dynamics_compensation);
+    declare_parameter("normalized_inertia", std::vector<double>{0.0, 0.0, 0.0});
+    declare_parameter(
+      "desired_kinematics_filter_time_constant_seconds",
+      desired_kinematics_parameters_.filter_time_constant_seconds);
+    declare_parameter(
+      "desired_kinematics_max_sample_interval_seconds",
+      desired_kinematics_parameters_.max_sample_interval_seconds);
+    declare_parameter("max_desired_body_rate_rad_s", std::vector<double>{2.0, 2.0, 1.0});
+    declare_parameter(
+      "max_desired_body_acceleration_rad_s2", std::vector<double>{10.0, 10.0, 5.0});
     declare_parameter("normalized_torque_limit", std::vector<double>{0.30, 0.30, 0.20});
 
     get_parameter("publish_rate_hz", publish_rate_hz_);
@@ -62,9 +74,24 @@ public:
     get_parameter("vehicle_mass", thrust_mapping_.vehicle_mass_kg);
     get_parameter("gravity", thrust_mapping_.gravity_mps2);
     get_parameter("hover_thrust_normalized", thrust_mapping_.hover_thrust_normalized);
+    get_parameter("enable_desired_rate_tracking", enable_desired_rate_tracking_);
+    get_parameter(
+      "enable_dynamics_compensation", torque_parameters_.enable_dynamics_compensation);
+    get_parameter(
+      "desired_kinematics_filter_time_constant_seconds",
+      desired_kinematics_parameters_.filter_time_constant_seconds);
+    get_parameter(
+      "desired_kinematics_max_sample_interval_seconds",
+      desired_kinematics_parameters_.max_sample_interval_seconds);
     const bool torque_parameters_loaded =
       getVector3Parameter("attitude_gain", torque_parameters_.attitude_gain)
       && getVector3Parameter("rate_gain", torque_parameters_.rate_gain)
+      && getVector3Parameter("normalized_inertia", torque_parameters_.normalized_inertia)
+      && getVector3Parameter(
+        "max_desired_body_rate_rad_s", desired_kinematics_parameters_.max_body_rate_rad_s)
+      && getVector3Parameter(
+        "max_desired_body_acceleration_rad_s2",
+        desired_kinematics_parameters_.max_body_acceleration_rad_s2)
       && getVector3Parameter("normalized_torque_limit", torque_parameters_.normalized_limit);
 
     config_valid_ = std::isfinite(publish_rate_hz_) && publish_rate_hz_ > 0.0
@@ -80,10 +107,13 @@ public:
       && hover_thrust_max_rate_per_second_ > 0.0
       && torque_parameters_loaded
       && mpc_controller::px4_control::validTorqueParameters(torque_parameters_)
+      && mpc_controller::px4_control::validDesiredKinematicsParameters(
+        desired_kinematics_parameters_)
       && mpc_controller::px4_thrust::valid(thrust_mapping_);
     if (!config_valid_) {
       RCLCPP_ERROR(get_logger(), "Invalid SITL torque/thrust adapter configuration");
     }
+    desired_kinematics_estimator_.emplace(desired_kinematics_parameters_);
 
     const auto sensor_qos = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort();
     m3_subscription_ = create_subscription<M3Output>(
@@ -93,7 +123,6 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         m3_output_ = *message;
         m3_received_at_ = Clock::now();
-        m3_received_steady_timestamp_ns_ = mpc_controller::timing::steadyNowNs();
       });
     vehicle_state_subscription_ = create_subscription<VehicleState>(
       "vehicle_state", 10,
@@ -101,7 +130,6 @@ public:
         if (!message) return;
         std::lock_guard<std::mutex> lock(mutex_);
         vehicle_state_ = *message;
-        vehicle_state_received_at_ = Clock::now();
       });
     attitude_subscription_ = create_subscription<Px4Attitude>(
       "fmu/out/vehicle_attitude", sensor_qos,
@@ -162,6 +190,7 @@ public:
         const bool was_offboard = offboard_active_;
         offboard_active_ = message->flag_control_offboard_enabled;
         if (!was_offboard && offboard_active_) {
+          resetDesiredKinematics();
           captureYawLocked();
           latchHoverThrustLocked();
           state_ = State::active;
@@ -172,6 +201,7 @@ public:
             latched_hover_thrust_normalized_.value_or(thrust_mapping_.hover_thrust_normalized),
             latched_hover_thrust_from_estimator_ ? "PX4 HTE" : "configured fallback");
         } else if (was_offboard && !offboard_active_) {
+          resetDesiredKinematics();
           yaw_hold_enu_rad_.reset();
           latched_hover_thrust_normalized_.reset();
           latched_hover_thrust_from_estimator_ = false;
@@ -199,8 +229,10 @@ public:
     RCLCPP_INFO(
       get_logger(),
       "SITL-first torque/thrust adapter ready: WAIT_DATA -> PRESTREAM -> ACTIVE; "
-      "SO(3) normalized PD at %.1f Hz; no arm or mode command is sent",
-      publish_rate_hz_);
+      "geometric SO(3) at %.1f Hz; desired-rate=%s dynamics=%s; "
+      "no arm or mode command is sent",
+      publish_rate_hz_, enable_desired_rate_tracking_ ? "on" : "off",
+      torque_parameters_.enable_dynamics_compensation ? "on" : "off");
   }
 
 private:
@@ -232,7 +264,6 @@ private:
     Eigen::Quaterniond measured_attitude_flu_enu{Eigen::Quaterniond::Identity()};
     Eigen::Vector3d measured_body_rate_flu{};
     uint64_t px4_timestamp = 0U;
-    double state_age_seconds = std::numeric_limits<double>::quiet_NaN();
     double attitude_age_seconds = std::numeric_limits<double>::quiet_NaN();
     double body_rate_age_seconds = std::numeric_limits<double>::quiet_NaN();
     double measured_yaw_enu_rad = std::numeric_limits<double>::quiet_NaN();
@@ -240,10 +271,8 @@ private:
     double timesync_age_seconds = std::numeric_limits<double>::quiet_NaN();
     double yaw_command_enu_rad = std::numeric_limits<double>::quiet_NaN();
     double hover_thrust_estimate = std::numeric_limits<double>::quiet_NaN();
-    double hover_thrust_estimate_variance = std::numeric_limits<double>::quiet_NaN();
     double hover_thrust_estimate_age_seconds = std::numeric_limits<double>::quiet_NaN();
     double active_hover_thrust_normalized = std::numeric_limits<double>::quiet_NaN();
-    bool state_fresh = false;
     bool attitude_fresh = false;
     bool body_rate_fresh = false;
     bool m3_fresh = false;
@@ -292,6 +321,35 @@ private:
     } else {
       yaw_hold_enu_rad_.reset();
     }
+  }
+
+  void resetDesiredKinematics()
+  {
+    std::lock_guard<std::mutex> lock(kinematics_mutex_);
+    if (desired_kinematics_estimator_) desired_kinematics_estimator_->reset();
+    desired_kinematics_ = {};
+    desired_kinematics_sequence_ = 0U;
+  }
+
+  mpc_controller::px4_control::DesiredKinematics updateDesiredKinematics(
+    const Eigen::Quaterniond &desired_attitude, const M3Output &m3)
+  {
+    std::lock_guard<std::mutex> lock(kinematics_mutex_);
+    if (!enable_desired_rate_tracking_ || !desired_kinematics_estimator_) {
+      desired_kinematics_ = {};
+      return desired_kinematics_;
+    }
+    if (m3.sequence == desired_kinematics_sequence_) return desired_kinematics_;
+    desired_kinematics_sequence_ = m3.sequence;
+    const rclcpp::Time stamp(m3.header.stamp);
+    if (stamp.nanoseconds() <= 0) {
+      desired_kinematics_estimator_->reset();
+      desired_kinematics_ = {};
+      return desired_kinematics_;
+    }
+    desired_kinematics_ = desired_kinematics_estimator_->update(
+      desired_attitude, stamp.seconds());
+    return desired_kinematics_;
   }
 
   bool hoverThrustEstimateUsableLocked(Clock::time_point current_time) const noexcept
@@ -360,12 +418,7 @@ private:
         current_time - *m3_received_at_).count();
       output.m3_fresh = freshAge(output.m3_age_seconds, command_timeout_seconds_);
     }
-    if (vehicle_state_ && vehicle_state_received_at_) {
-      output.vehicle = *vehicle_state_;
-      output.state_age_seconds = std::chrono::duration<double>(
-        current_time - *vehicle_state_received_at_).count();
-      output.state_fresh = freshAge(output.state_age_seconds, state_timeout_seconds_);
-    }
+    if (vehicle_state_) output.vehicle = *vehicle_state_;
     if (measured_attitude_flu_enu_ && attitude_received_at_) {
       output.measured_attitude_flu_enu = *measured_attitude_flu_enu_;
       const Eigen::Matrix3d rotation = output.measured_attitude_flu_enu.toRotationMatrix();
@@ -391,7 +444,6 @@ private:
     }
     if (hover_thrust_estimate_ && hover_thrust_estimate_received_at_) {
       output.hover_thrust_estimate = hover_thrust_estimate_->hover_thrust;
-      output.hover_thrust_estimate_variance = hover_thrust_estimate_->hover_thrust_var;
       output.hover_thrust_estimate_age_seconds = std::chrono::duration<double>(
         current_time - *hover_thrust_estimate_received_at_).count();
       output.hover_thrust_estimate_fresh = freshAge(
@@ -470,12 +522,25 @@ private:
     const Eigen::Quaterniond m3_attitude(
       sample.m3.desired_attitude_wxyz[0], sample.m3.desired_attitude_wxyz[1],
       sample.m3.desired_attitude_wxyz[2], sample.m3.desired_attitude_wxyz[3]);
-    const auto held_attitude = mpc_controller::px4_control::withEnuYaw(
-      m3_attitude, sample.yaw_command_enu_rad);
-    if (held_attitude) {
+    std::optional<Eigen::Quaterniond> desired_attitude;
+    if (sample.offboard_active && mpc_controller::px4_control::finiteQuaternion(m3_attitude)
+      && m3_attitude.norm() > 1.0e-9) {
+      // ACTIVE follows the trajectory yaw already embedded in M3's attitude.
+      desired_attitude = m3_attitude.normalized();
+    } else {
+      // PRESTREAM retains the measured/captured yaw for a continuous handover.
+      desired_attitude = mpc_controller::px4_control::withEnuYaw(
+        m3_attitude, sample.yaw_command_enu_rad);
+    }
+    mpc_controller::px4_control::DesiredKinematics desired_kinematics;
+    if (desired_attitude) {
+      desired_kinematics = updateDesiredKinematics(*desired_attitude, sample.m3);
       mpc_controller::px4_control::Input input;
-      input.desired_body_flu_to_world_enu = *held_attitude;
+      input.desired_body_flu_to_world_enu = *desired_attitude;
       input.measured_body_flu_to_world_enu = sample.measured_attitude_flu_enu;
+      input.desired_body_rate_flu_rad_s = desired_kinematics.body_rate_rad_s;
+      input.desired_body_acceleration_flu_rad_s2 =
+        desired_kinematics.body_acceleration_rad_s2;
       input.measured_body_rate_flu_rad_s = sample.measured_body_rate_flu;
       input.desired_collective_thrust_n = sample.m3.desired_thrust_force_n;
       input.valid = true;
@@ -486,7 +551,7 @@ private:
         input, active_thrust_mapping, torque_parameters_);
     }
 
-    publishPreview(sample, converted);
+    publishPreview(sample, converted, desired_kinematics.valid);
     if (!converted.valid) {
       RCLCPP_ERROR_THROTTLE(
         get_logger(), *get_clock(), 1000,
@@ -511,52 +576,35 @@ private:
   }
 
   void publishPreview(
-    const Snapshot &sample, const mpc_controller::px4_control::Output &converted)
+    const Snapshot &sample, const mpc_controller::px4_control::Output &converted,
+    bool desired_kinematics_valid = false)
   {
     Preview preview{};
     preview.header.stamp = now();
-    preview.px4_timestamp = sample.px4_timestamp;
     preview.q_d_wxyz = converted.q_d_wxyz;
     preview.torque_body_frd = converted.torque_body_frd;
     preview.thrust_body_frd = converted.thrust_body_frd;
     preview.attitude_error = converted.attitude_error;
     preview.body_rate_error_rad_s = converted.body_rate_error_rad_s;
+    preview.desired_body_rate_flu_rad_s = converted.desired_body_rate_flu_rad_s;
+    preview.desired_body_acceleration_flu_rad_s2 =
+      converted.desired_body_acceleration_flu_rad_s2;
+    preview.feedback_torque_body_flu_normalized =
+      converted.feedback_torque_body_flu_normalized;
+    preview.dynamics_torque_body_flu_normalized =
+      converted.dynamics_torque_body_flu_normalized;
+    preview.desired_kinematics_valid = desired_kinematics_valid;
     preview.torque_saturated = converted.torque_saturated;
     preview.valid = converted.valid;
-    preview.prestream_enabled = stateValue() == State::prestream;
-    preview.px4_offboard_active = sample.offboard_active;
     preview.state = static_cast<uint8_t>(stateValue());
-    preview.state_age_seconds = sample.state_age_seconds;
-    preview.attitude_age_seconds = sample.attitude_age_seconds;
-    preview.body_rate_age_seconds = sample.body_rate_age_seconds;
     preview.attitude_fresh = sample.attitude_fresh;
     preview.body_rate_fresh = sample.body_rate_fresh;
-    preview.m3_age_seconds = sample.m3_age_seconds;
-    preview.timesync_age_seconds = sample.timesync_age_seconds;
-    preview.state_fresh = sample.state_fresh;
     preview.m3_fresh = sample.m3_fresh;
     preview.timesync_fresh = sample.timesync_fresh;
     preview.yaw_hold_valid = sample.yaw_hold_valid;
     preview.yaw_hold_enu_rad = sample.yaw_command_enu_rad;
-    preview.m3_message_valid = sample.m3.valid;
-    preview.m3_math_valid = sample.m3.math_valid;
-    preview.vehicle_state_valid = sample.vehicle.valid;
     preview.failure_reason = static_cast<uint8_t>(converted.failure_reason);
-    preview.m3_sequence = sample.m3.sequence;
-    preview.m3_publisher_steady_timestamp_ns = sample.m3.publisher_steady_timestamp_ns;
-    preview.m3_adapter_received_steady_timestamp_ns = m3_received_steady_timestamp_ns_;
-    preview.m3_delivery_delay_seconds = preview.m3_publisher_steady_timestamp_ns > 0U
-      && preview.m3_adapter_received_steady_timestamp_ns >=
-      preview.m3_publisher_steady_timestamp_ns
-      ? static_cast<double>(preview.m3_adapter_received_steady_timestamp_ns
-        - preview.m3_publisher_steady_timestamp_ns) * 1.0e-9
-      : std::numeric_limits<double>::quiet_NaN();
     preview.hover_thrust_estimate = static_cast<float>(sample.hover_thrust_estimate);
-    preview.hover_thrust_estimate_variance = static_cast<float>(
-      sample.hover_thrust_estimate_variance);
-    preview.hover_thrust_estimate_age_seconds = sample.hover_thrust_estimate_age_seconds;
-    preview.hover_thrust_estimate_valid = sample.hover_thrust_estimate_valid;
-    preview.hover_thrust_estimate_fresh = sample.hover_thrust_estimate_fresh;
     preview.active_hover_thrust_normalized = sample.active_hover_thrust_normalized;
     preview.active_hover_thrust_from_estimator = sample.active_hover_thrust_from_estimator;
     preview_publisher_->publish(preview);
@@ -565,6 +613,7 @@ private:
   mutable std::mutex mutex_;
   bool config_valid_ = false;
   bool offboard_active_ = false;
+  bool enable_desired_rate_tracking_ = true;
   State state_ = State::wait_data;
   double publish_rate_hz_ = 250.0;
   double heartbeat_rate_hz_ = 10.0;
@@ -576,6 +625,12 @@ private:
   double hover_thrust_max_rate_per_second_ = 0.02;
   mpc_controller::px4_thrust::Mapping thrust_mapping_{};
   mpc_controller::px4_control::TorqueParameters torque_parameters_{};
+  mpc_controller::px4_control::DesiredKinematicsParameters desired_kinematics_parameters_{};
+  std::optional<mpc_controller::px4_control::DesiredKinematicsEstimator>
+  desired_kinematics_estimator_;
+  mpc_controller::px4_control::DesiredKinematics desired_kinematics_{};
+  uint64_t desired_kinematics_sequence_ = 0U;
+  std::mutex kinematics_mutex_;
   std::optional<double> yaw_hold_enu_rad_;
   std::optional<double> latched_hover_thrust_normalized_;
   bool latched_hover_thrust_from_estimator_ = false;
@@ -585,14 +640,12 @@ private:
   std::optional<Eigen::Vector3d> measured_body_rate_flu_;
   std::optional<HoverThrustEstimate> hover_thrust_estimate_;
   std::optional<Clock::time_point> m3_received_at_;
-  std::optional<Clock::time_point> vehicle_state_received_at_;
   std::optional<Clock::time_point> attitude_received_at_;
   std::optional<Clock::time_point> body_rate_received_at_;
   std::optional<Clock::time_point> hover_thrust_estimate_received_at_;
   std::optional<Clock::time_point> hover_thrust_tracking_updated_at_;
   std::optional<uint64_t> timesync_timestamp_;
   std::optional<Clock::time_point> timesync_received_at_;
-  uint64_t m3_received_steady_timestamp_ns_ = 0U;
 
   rclcpp::Subscription<M3Output>::SharedPtr m3_subscription_;
   rclcpp::Subscription<VehicleState>::SharedPtr vehicle_state_subscription_;

@@ -1,41 +1,42 @@
 reference_generator_node:
   ros__parameters:
-    trajectory_type: hold
+    # manual_velocity: joystick; trajectory: ReferenceStep/line/circle.
+    reference_input_mode: manual_velocity
     frame_id: map
     hold_position: [0.0, 0.0, 0.0]
     hold_yaw_rad: 0.0
-    # Triggered through /reference_generator_node/start_line after Offboard entry.
-    # The start point and yaw are the hold reference captured at that entry.
     line_relative_delta: [2.0, 0.0, 0.0]
     line_duration_seconds: 12.0
-    # One C2-continuous revolution, triggered after entering Offboard.
-    # A derived quintic velocity ramp removes the start/stop velocity jumps.
-    # Edit only the radius. The generator derives cruise speed, ramp and period
-    # while bounding centripetal and peak quintic-ramp tangential acceleration.
-    # The 4 m/s reference cap leaves tracking margin below 5 m/s measured speed.
-    circle_radius: 80.0
+    # Period and ramp are derived from radius, speed and acceleration limits.
+    circle_radius: 30.0
     circle_reference_speed_limit_m_s: 4.0
     circle_acceleration_limit_m_s2: 1.5
     circle_direction: 1
     state_timeout_seconds: 0.25
-    stable_hover_max_velocity_xy_m_s: 0.032
-    stable_hover_max_velocity_z_m_s: 0.18
-    stable_hover_max_acceleration_xy_m_s2: 0.080
-    stable_hover_max_acceleration_z_m_s2: 0.70
-    stable_hover_max_body_rate_xy_rad_s: 0.045
-    stable_hover_max_body_rate_z_rad_s: 0.030
-    stable_hover_max_roll_rad: 0.0065
-    stable_hover_max_pitch_rad: 0.0070
-    stable_hover_dwell_seconds: 2.0
     horizon_seconds: 30.0
     sample_period_seconds: 0.1
     publish_rate_hz: 1.0
+    # RViz: joystick green, safe reference red, MPC prediction cyan.
+    visualization_enabled: true
+    visualization_publish_rate_hz: 20.0
+    visualization_arrow_length_m: 1.0
+    visualization_direction_deadband: 0.08
+    manual_input_timeout_seconds: 0.25
+    manual_update_rate_hz: 25.0
+    manual_stick_deadband: 0.08
+    manual_max_horizontal_speed_m_s: 2.0
+    manual_max_vertical_speed_m_s: 1.0
+    manual_max_horizontal_acceleration_m_s2: 1.5
+    manual_max_vertical_acceleration_m_s2: 1.0
+    manual_max_yaw_rate_rad_s: 0.8
+    manual_max_horizontal_position_error_m: 2.0
+    manual_max_vertical_position_error_m: 1.0
+    visualization_max_prediction_points: 50
 
 vehicle_state_bridge_node:
   ros__parameters:
     state_timeout_seconds: 0.25
     max_sample_skew_seconds: 0.10
-    # Translational MPC consumes the aggregate state at its own loop rate.
     publish_rate_hz: 50.0
 
 mpc_controller_node:
@@ -43,40 +44,23 @@ mpc_controller_node:
     update_rate_hz: 50.0
     reference_timeout_seconds: 1.5
     state_timeout_seconds: 0.25
-    # The 10 ms first shooting interval is retained after the 20 ms candidate
-    # increased measured Z RMS and thrust activity in the 60 s hover replay.
+    # Nonuniform shooting grid: short first step, longer prediction steps.
     dt_first: 0.01
     dt_later: 0.20
     max_iterations: 400
-    # Per-axis acceleration response: beta = 1-alpha. Zero preserves the
-    # direct acceleration-command boundary while enabling the full paper A/B.
+    # Zero alpha/time constant selects the direct acceleration model.
     model_alpha_xyz: [0.0, 0.0, 0.0]
-    # Use the direct acceleration model on all axes. The measured Z
-    # acceleration is phase-inconsistent with PX4 position/velocity by several
-    # hundred milliseconds; carrying it through a lag state caused a sustained
-    # low-frequency hover oscillation even though the thrust gain was correct.
     model_time_constant_xyz: [0.0, 0.0, 0.0]
-    # The Z lag model can put the first-input rate constraint on its bound.
-    # This rho/tolerance pair keeps ADMM convergent there and fast enough for
-    # the 50 Hz control loop; 1e-5 caused repeated 400-iteration failures.
+    # ADMM solver settings.
     admm_rho: 0.05
     solver_absolute_tolerance: 0.001
     solver_relative_tolerance: 0.001
-    # XY tuning candidate 4: selected after candidate 5 (q_a=200) increased
-    # circle tracking error despite slightly reducing thrust oscillation.
-    # Original baseline: q_xy=[500,100,100], s_xy=[1000,300,300].
-    # Identified lateral plant gain is ~0.98 with 0.12-0.16 s delay. The former
-    # velocity weight 100 produced ~60% overshoot on a 0.2 m X step; the
-    # model-replay candidate 1000 predicts <10% overshoot.
+    # Stage and terminal weights ordered [position, velocity, acceleration].
     q_xy: [700.0, 1000.0, 100.0]
     s_xy: [1000.0, 600.0, 300.0]
-    # Direct-model Z weights retained after the acceleration-50 and
-    # velocity-100/400 candidates degraded tracking in autonomous hover tests.
     q_z: [100.0, 200.0, 10.0]
     s_z: [100.0, 200.0, 10.0]
-    # Position-only Z bias correction. PX4 vertical velocity was measured to be
-    # phase-inconsistent with position, so extra velocity feedback remains off.
-    # Kp_z=0.6 N/m passed the 120 s SITL hover: Z RMS 0.023 m, p2p 0.096 m.
+    # Optional force feedback [X, Y, Z].
     force_feedback_kp_n_per_m: [0.0, 0.0, 0.6]
     force_feedback_kv_n_per_m_s: [0.0, 0.0, 0.0]
     max_speed_xy: 5.0

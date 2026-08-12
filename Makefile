@@ -1,4 +1,4 @@
-# Compact simulator orchestration for the PX4 attitude-setpoint path.
+# Compact simulator orchestration for the PX4 torque/thrust Offboard path.
 #
 # The Makefile does not arm PX4 and does not change PX4 failsafe parameters.
 # PX4 and px4_msgs remain external dependencies of this source-only branch.
@@ -14,6 +14,18 @@ PX4_SIM ?= gz_x500
 PX4_BUILD_DIR ?= $(PX4_DIR)/build/px4_sitl_default
 PX4_EXPECTED_COMMIT ?= 0b6e4687defb353a34201951809efd3f0040a9ba
 GZ_EXPECTED_VERSION ?= 8.11.0
+
+# Hardware-in-the-loop defaults. HIL_DEVICE may be overridden with a concrete
+# /dev/ttyACM* path; leaving it empty makes the recipe prefer a stable PX4
+# /dev/serial/by-id symlink and fall back to the first ttyACM device.
+HIL_BOARD ?= px4_fmu-v6x
+HIL_TARGET ?= px4_fmu-v6x_default
+HIL_DEVICE ?=
+HIL_BAUD ?= 921600
+HIL_RATE_HZ ?= 250
+HIL_HEADLESS ?= 0
+HIL_CONFIG := $(PX4_DIR)/boards/px4/fmu-v6x/default.px4board
+JMAVSIM_RUNNER := $(PX4_DIR)/Tools/simulation/jmavsim/jmavsim_run.sh
 
 DDS_AGENT ?= MicroXRCEAgent
 DDS_TRANSPORT ?= udp4
@@ -32,11 +44,13 @@ PX4_LOG := $(SIM_RUNTIME_DIR)/px4.log
 DDS_LOG := $(SIM_RUNTIME_DIR)/dds.log
 ROS_LOG := $(SIM_RUNTIME_DIR)/ros.log
 GZ_GUI_LOG := $(SIM_RUNTIME_DIR)/gazebo_gui.log
+HIL_LOG := $(SIM_RUNTIME_DIR)/jmavsim_hil.log
 PX4_PID := $(SIM_RUNTIME_DIR)/px4.pid
 DDS_PID := $(SIM_RUNTIME_DIR)/dds.pid
 ROS_PID := $(SIM_RUNTIME_DIR)/ros.pid
 ROS_LOCK := $(SIM_RUNTIME_DIR)/ros.lock
 GZ_GUI_PID := $(SIM_RUNTIME_DIR)/gazebo_gui.pid
+HIL_PID := $(SIM_RUNTIME_DIR)/jmavsim_hil.pid
 
 # The VS Code Snap exports GTK paths pointing at its bundled glibc.  Gazebo's
 # Qt GUI must not inherit those paths, otherwise libpthread/glibc symbols can
@@ -67,7 +81,10 @@ LD_LIBRARY_PATH="$$gui_ld" \
 "$$gui_bin" sim -g -v "$(GZ_GUI_VERBOSE)"
 endef
 
-.PHONY: help check check-build build px4 dds ros gui sim stop status logs
+.PHONY: help check check-build check-hil-tools check-hil-firmware-config \
+	check-hil-device hil-check hil-config hil-firmware hil-upload jmavsim \
+	_jmavsim-start hil hil-stop build px4 dds ros \
+	gui sim stop status logs
 
 define PX4_START_COMMAND
 stale_cache=$$(find "$(PX4_BUILD_DIR)" -type f -name CMakeCache.txt -print 2>/dev/null | while IFS= read -r cache; do \
@@ -86,11 +103,18 @@ help:
 	@echo "make build   - build the ROS 2 package"
 	@echo "make gui     - open Gazebo GUI for an existing SITL server"
 	@echo "make sim     - start PX4 SITL + Gazebo GUI + uXRCE-DDS + ROS 2 launch"
-	@echo "make stop    - stop only processes started by make sim"
+	@echo "make hil     - start jMAVSim HITL on the connected PX4 FC (alias: jmavsim)"
+	@echo "make hil-check    - validate HITL tools, firmware config and FC serial port"
+	@echo "make hil-config   - open the PX4 board configuration UI"
+	@echo "make hil-firmware - build the FC firmware with pwm_out_sim"
+	@echo "make hil-upload   - explicitly build and flash the HITL firmware"
+	@echo "make hil-stop     - stop only jMAVSim started by make hil"
+	@echo "make stop    - stop SITL/HIL processes started by this Makefile"
 	@echo "make status  - show simulator process status"
 	@echo "make logs    - follow PX4, DDS and ROS logs"
 	@echo ""
-	@echo "Overrides: PX4_DIR=... PX4_MSGS_SETUP=... DDS_PORT=... GZ_GUI_QT_PLATFORM=wayland|xcb ROS_LAUNCH=... ROS_LAUNCH_ARGS=..."
+	@echo "Overrides: PX4_DIR=... HIL_DEVICE=/dev/ttyACM0 HIL_BAUD=921600 HIL_RATE_HZ=250 HIL_HEADLESS=0|1"
+	@echo "           PX4_MSGS_SETUP=... DDS_PORT=... GZ_GUI_QT_PLATFORM=wayland|xcb ROS_LAUNCH=... ROS_LAUNCH_ARGS=..."
 
 check-build:
 	@test -f "$(ROS_SETUP)" || { echo "Missing ROS setup: $(ROS_SETUP)"; exit 1; }
@@ -124,6 +148,87 @@ check: check-build
 		echo "px4_msgs:      inherited ROS environment"; \
 	fi
 	@echo "DDS endpoint:  $(DDS_TRANSPORT):$(DDS_PORT)"
+
+check-hil-tools:
+	@test -n "$(PX4_DIR)" && test -d "$(PX4_DIR)" || { echo "PX4_DIR is not set or does not exist"; exit 1; }
+	@test -x "$(JMAVSIM_RUNNER)" || { echo "Missing jMAVSim runner: $(JMAVSIM_RUNNER)"; exit 1; }
+	@test -f "$(HIL_CONFIG)" || { echo "Missing board config: $(HIL_CONFIG)"; exit 1; }
+	@command -v make >/dev/null || { echo "make is not available in PATH"; exit 1; }
+	@command -v ant >/dev/null || { echo "Apache Ant is missing; install it with: sudo apt install ant"; exit 1; }
+	@command -v java >/dev/null || { echo "Java is missing; install a JDK before running jMAVSim"; exit 1; }
+
+check-hil-firmware-config: check-hil-tools
+	@grep -qx 'CONFIG_MODULES_SIMULATION_PWM_OUT_SIM=y' "$(HIL_CONFIG)" || { \
+		echo "pwm_out_sim is not enabled in $(HIL_CONFIG)"; \
+		echo "Run 'make hil-config' and enable Modules -> Simulation -> pwm_out_sim."; exit 1; \
+	}
+
+check-hil-device: check-hil-tools
+	@device="$(HIL_DEVICE)"; \
+	if test -z "$$device"; then \
+		device=$$(compgen -G '/dev/serial/by-id/*PX4*' | head -n 1); \
+	fi; \
+	if test -z "$$device"; then device=$$(compgen -G '/dev/ttyACM*' | head -n 1); fi; \
+	test -n "$$device" && test -e "$$device" || { echo "PX4 FC serial port not found. Connect and boot the FC, or set HIL_DEVICE=/dev/ttyACM#"; exit 1; }; \
+	resolved=$$(readlink -f "$$device"); \
+	test -r "$$resolved" && test -w "$$resolved" || { echo "No read/write access to $$resolved; check dialout membership"; exit 1; }; \
+	if command -v fuser >/dev/null && fuser "$$resolved" >/dev/null 2>&1; then \
+		echo "Serial port $$resolved is busy:"; fuser -v "$$resolved" 2>&1 || true; \
+		echo "Close QGroundControl and other serial clients before starting HITL."; exit 1; \
+	fi; \
+	echo "HIL serial: $$device -> $$resolved"
+
+hil-check: check-hil-firmware-config check-hil-device
+	@echo "HIL board:  $(HIL_BOARD)"
+	@echo "HIL target: $(HIL_TARGET)"
+	@echo "jMAVSim:    baud=$(HIL_BAUD), rate=$(HIL_RATE_HZ) Hz"
+
+hil-config: check-hil-tools
+	@cd "$(PX4_DIR)" && $(MAKE) "$(HIL_BOARD)" boardconfig
+
+hil-firmware: check-hil-firmware-config
+	@cd "$(PX4_DIR)" && $(MAKE) "$(HIL_TARGET)"
+
+hil-upload: check-hil-device hil-firmware
+	@echo "Uploading $(HIL_TARGET) to the connected FC..."
+	@cd "$(PX4_DIR)" && $(MAKE) "$(HIL_TARGET)" upload
+
+jmavsim: check-hil-tools check-hil-firmware-config
+	@if test -f "$(HIL_PID)" && kill -0 "$$(cat "$(HIL_PID)")" 2>/dev/null; then \
+		echo "jMAVSim HITL already running (pid $$(cat "$(HIL_PID)"))."; \
+	else \
+		rm -f "$(HIL_PID)"; \
+		$(MAKE) --no-print-directory _jmavsim-start; \
+	fi
+
+_jmavsim-start: hil-check
+	@mkdir -p "$(SIM_RUNTIME_DIR)"
+	@device="$(HIL_DEVICE)"; \
+	if test -z "$$device"; then device=$$(compgen -G '/dev/serial/by-id/*PX4*' | head -n 1); fi; \
+	if test -z "$$device"; then device=$$(compgen -G '/dev/ttyACM*' | head -n 1); fi; \
+	resolved=$$(readlink -f "$$device"); \
+	setsid env HEADLESS="$(HIL_HEADLESS)" "$(JMAVSIM_RUNNER)" \
+		-q -s -d "$$resolved" -b "$(HIL_BAUD)" -r "$(HIL_RATE_HZ)" \
+		>"$(HIL_LOG)" 2>&1 & echo $$! >"$(HIL_PID)"
+	@sleep 2; pid=$$(cat "$(HIL_PID)"); \
+	if ! kill -0 "$$pid" 2>/dev/null; then \
+		echo "jMAVSim exited during startup; inspect $(HIL_LOG)"; \
+		tail -n 30 "$(HIL_LOG)"; rm -f "$(HIL_PID)"; exit 1; \
+	fi
+	@echo "jMAVSim HITL started; log: $(HIL_LOG)"
+	@echo "Now open QGroundControl; it should connect through the jMAVSim UDP bridge."
+
+hil: jmavsim
+
+hil-stop:
+	@if test -f "$(HIL_PID)"; then \
+		pid=$$(cat "$(HIL_PID)"); \
+		if kill -0 "$$pid" 2>/dev/null; then \
+			echo "Stopping jMAVSim HITL process group $$pid"; \
+			kill -TERM -- -"$$pid" 2>/dev/null || kill -TERM "$$pid" 2>/dev/null || true; \
+		fi; \
+		rm -f "$(HIL_PID)"; \
+	else echo "jMAVSim HITL is stopped."; fi
 
 build: check-build
 	@source "$(ROS_SETUP)"; \
@@ -201,7 +306,7 @@ sim: check build
 
 stop:
 	@set -u; \
-	for pid_file in "$(GZ_GUI_PID)" "$(ROS_PID)" "$(DDS_PID)" "$(PX4_PID)"; do \
+	for pid_file in "$(HIL_PID)" "$(GZ_GUI_PID)" "$(ROS_PID)" "$(DDS_PID)" "$(PX4_PID)"; do \
 		if test -f "$$pid_file"; then \
 			pid=$$(cat "$$pid_file"); \
 			if kill -0 "$$pid" 2>/dev/null; then \
@@ -213,7 +318,7 @@ stop:
 	@echo "Simulator processes stopped."
 
 status:
-	@for entry in "PX4:$(PX4_PID)" "Gazebo GUI:$(GZ_GUI_PID)" "DDS:$(DDS_PID)" "ROS:$(ROS_PID)"; do \
+	@for entry in "PX4:$(PX4_PID)" "Gazebo GUI:$(GZ_GUI_PID)" "jMAVSim HIL:$(HIL_PID)" "DDS:$(DDS_PID)" "ROS:$(ROS_PID)"; do \
 		name=$${entry%%:*}; pid_file=$${entry#*:}; \
 		if test -f "$$pid_file"; then \
 			pid=$$(cat "$$pid_file"); \
@@ -223,4 +328,5 @@ status:
 
 logs:
 	@mkdir -p "$(SIM_RUNTIME_DIR)"
-	@tail -F "$(PX4_LOG)" "$(GZ_GUI_LOG)" "$(DDS_LOG)" "$(ROS_LOG)"
+	@touch "$(PX4_LOG)" "$(GZ_GUI_LOG)" "$(HIL_LOG)" "$(DDS_LOG)" "$(ROS_LOG)"
+	@tail -F "$(PX4_LOG)" "$(GZ_GUI_LOG)" "$(HIL_LOG)" "$(DDS_LOG)" "$(ROS_LOG)"

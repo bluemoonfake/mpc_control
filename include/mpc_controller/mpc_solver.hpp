@@ -7,7 +7,6 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
-#include <limits>
 
 namespace mpc_controller::axis_mpc
 {

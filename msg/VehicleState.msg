@@ -3,17 +3,11 @@ float64[3] position
 float64[3] velocity
 float64[3] acceleration
 float64[4] attitude
-float64[3] body_rate
 float64 yaw
-float64 yaw_rate
 bool valid
 bool position_valid
 bool velocity_valid
 bool acceleration_valid
 bool attitude_valid
-bool body_rate_valid
 bool heading_valid
-bool yaw_valid
 bool control_ready
-uint32 reset_counter
-bool reset_counter_valid

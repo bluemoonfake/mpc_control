@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 
 namespace mpc_controller::frame
 {
@@ -19,9 +20,6 @@ struct Px4LocalPositionSample
   bool v_xy_valid = false;
   bool v_z_valid = false;
   bool heading_good_for_control = false;
-  uint8_t xy_reset_counter = 0;
-  uint8_t z_reset_counter = 0;
-  uint8_t heading_reset_counter = 0;
   Vector3 position_ned{};
   Vector3 velocity_ned{};
   Vector3 acceleration_ned{};
@@ -30,7 +28,6 @@ struct Px4LocalPositionSample
 struct Px4AttitudeSample
 {
   uint64_t timestamp_sample = 0;
-  uint8_t quat_reset_counter = 0;
   Quaternion body_frd_to_world_ned{1.0, 0.0, 0.0, 0.0};
 };
 
@@ -46,10 +43,7 @@ struct VehicleStateData
   Vector3 velocity_enu{};
   Vector3 acceleration_enu{};
   Quaternion body_flu_to_world_enu{1.0, 0.0, 0.0, 0.0};
-  Vector3 body_rate_flu{};
   double yaw_enu = 0.0;
-  double yaw_rate_enu = 0.0;
-  uint32_t reset_counter = 0;
   bool position_valid = false;
   bool velocity_valid = false;
   bool acceleration_valid = false;
@@ -62,13 +56,6 @@ struct VehicleStateData
 inline bool timestampMonotonic(uint64_t previous, uint64_t current) noexcept
 {
   return current != 0 && (previous == 0 || current >= previous);
-}
-
-inline bool sampleAgeValid(double age_seconds, double timeout_seconds) noexcept
-{
-  return std::isfinite(age_seconds) && age_seconds >= 0.0
-    && std::isfinite(timeout_seconds) && timeout_seconds >= 0.0
-    && age_seconds <= timeout_seconds;
 }
 
 inline bool finite(const Vector3 &value) noexcept
@@ -85,11 +72,6 @@ inline bool finite(const Quaternion &value) noexcept
 inline Vector3 nedToEnu(const Vector3 &value_ned) noexcept
 {
   return {value_ned[1], value_ned[0], -value_ned[2]};
-}
-
-inline Vector3 frdToFlu(const Vector3 &value_frd) noexcept
-{
-  return {value_frd[0], -value_frd[1], -value_frd[2]};
 }
 
 inline std::array<std::array<double, 3>, 3> quaternionToMatrix(const Quaternion &q) noexcept
@@ -187,27 +169,11 @@ inline bool convert(
   output.position_enu = nedToEnu(local_position.position_ned);
   output.velocity_enu = nedToEnu(local_position.velocity_ned);
   output.acceleration_enu = nedToEnu(local_position.acceleration_ned);
-  output.body_rate_flu = frdToFlu(angular_velocity.body_rate_frd);
   output.body_flu_to_world_enu = matrixToQuaternion(r_enu_flu);
   output.yaw_enu = std::atan2(r_enu_flu[1][0], r_enu_flu[0][0]);
-  const double roll = std::atan2(r_enu_flu[2][1], r_enu_flu[2][2]);
-  const double pitch = std::asin(std::clamp(-r_enu_flu[2][0], -1.0, 1.0));
-  const double cos_pitch = std::cos(pitch);
-  if (std::abs(cos_pitch) < 1.0e-6) {
-    output.attitude_valid = false;
-    return false;
-  }
-  output.yaw_rate_enu = (output.body_rate_flu[1] * std::sin(roll)
-    + output.body_rate_flu[2] * std::cos(roll)) / cos_pitch;
-  output.reset_counter = std::max({
-    static_cast<uint32_t>(local_position.xy_reset_counter),
-    static_cast<uint32_t>(local_position.z_reset_counter),
-    static_cast<uint32_t>(local_position.heading_reset_counter),
-    static_cast<uint32_t>(attitude.quat_reset_counter)});
   const bool finite_output = std::isfinite(output.yaw_enu) && finite(output.position_enu)
     && finite(output.velocity_enu) && finite(output.acceleration_enu)
-    && finite(output.body_rate_flu) && finite(output.body_flu_to_world_enu)
-    && std::isfinite(output.yaw_rate_enu);
+    && finite(output.body_flu_to_world_enu);
   if (!finite_output) {
     output.position_valid = false;
     output.velocity_valid = false;
@@ -224,3 +190,85 @@ inline bool convert(
 }
 
 }  // namespace mpc_controller::frame
+
+namespace mpc_controller::state_check
+{
+
+// Timing data used to admit three asynchronous PX4 state streams.
+struct Timing
+{
+  std::uint64_t sample_time = 0;
+  double age = std::numeric_limits<double>::infinity();
+  bool received = false;
+};
+
+enum class Reject : std::uint8_t
+{
+  none,
+  position_stale,
+  attitude_stale,
+  rate_stale,
+  sample_skew,
+  timestamp
+};
+
+struct Decision
+{
+  Reject reason = Reject::timestamp;
+  double skew = std::numeric_limits<double>::infinity();
+  bool valid = false;
+};
+
+inline bool fresh(const Timing &source, double timeout) noexcept
+{
+  return source.received && std::isfinite(source.age) && source.age >= 0.0
+    && source.age <= timeout;
+}
+
+inline Decision evaluate(
+  const Timing &position, const Timing &attitude, const Timing &rate,
+  double timeout, double max_skew) noexcept
+{
+  Decision result;
+  if (!fresh(position, timeout)) {
+    result.reason = Reject::position_stale;
+    return result;
+  }
+  if (!fresh(attitude, timeout)) {
+    result.reason = Reject::attitude_stale;
+    return result;
+  }
+  if (!fresh(rate, timeout)) {
+    result.reason = Reject::rate_stale;
+    return result;
+  }
+  if (position.sample_time == 0 || attitude.sample_time == 0 || rate.sample_time == 0) {
+    result.reason = Reject::timestamp;
+    return result;
+  }
+  const auto oldest = std::min({position.sample_time, attitude.sample_time, rate.sample_time});
+  const auto newest = std::max({position.sample_time, attitude.sample_time, rate.sample_time});
+  result.skew = static_cast<double>(newest - oldest) * 1.0e-6;
+  if (!std::isfinite(result.skew) || result.skew > max_skew) {
+    result.reason = Reject::sample_skew;
+    return result;
+  }
+  result.reason = Reject::none;
+  result.valid = true;
+  return result;
+}
+
+inline const char *reasonName(Reject reason) noexcept
+{
+  switch (reason) {
+    case Reject::none: return "NONE";
+    case Reject::position_stale: return "POSITION_STALE";
+    case Reject::attitude_stale: return "ATTITUDE_STALE";
+    case Reject::rate_stale: return "ANGULAR_VELOCITY_STALE";
+    case Reject::sample_skew: return "SAMPLE_SKEW";
+    case Reject::timestamp: return "TIMESTAMP";
+  }
+  return "UNKNOWN";
+}
+
+}  // namespace mpc_controller::state_check
