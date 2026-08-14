@@ -3,7 +3,7 @@ px4_torque_thrust_setpoint_node:
     # SO(3) tuning profile; HTE and allocator feedback come from the active PX4.
     # Direct torque/thrust inner loop.
     publish_rate_hz: 250.0
-    heartbeat_rate_hz: 10.0
+    heartbeat_rate_hz: 50.0
     # Input freshness limits.
     state_timeout_seconds: 0.25
     command_timeout_seconds: 0.25
@@ -17,6 +17,11 @@ px4_torque_thrust_setpoint_node:
     # Geometric SO(3) feedback and desired-rate estimation.
     attitude_gain: [0.8, 0.8, 0.4]
     rate_gain: [0.15, 0.15, 0.10]
+    # Integral gain eliminates steady-state attitude trim offset from CG shift
+    # or asymmetric drag. Set to [0,0,0] to disable. Anti-windup freezes
+    # accumulation when actuators or torque output are saturated.
+    rate_integral_gain: [0.10, 0.10, 0.05]
+    rate_integral_limit: [0.15, 0.15, 0.10]
     enable_desired_rate_tracking: true
     desired_kinematics_filter_time_constant_seconds: 0.05
     desired_kinematics_max_sample_interval_seconds: 0.10

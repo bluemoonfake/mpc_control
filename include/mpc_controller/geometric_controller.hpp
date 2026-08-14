@@ -71,6 +71,8 @@ struct TorqueParameters
   // J divided by the physical-to-normalized torque scale of each body axis.
   Vector3 attitude_gain{0.8, 0.8, 0.4};
   Vector3 rate_gain{0.15, 0.15, 0.10};
+  Vector3 rate_integral_gain{Vector3::Zero()};
+  Vector3 rate_integral_limit{0.15, 0.15, 0.10};
   Vector3 normalized_inertia{Vector3::Zero()};
   Vector3 normalized_limit{0.30, 0.30, 0.20};
   bool enable_dynamics_compensation = false;
@@ -209,9 +211,12 @@ inline std::optional<Quaternion> withEnuYaw(
 inline bool validTorqueParameters(const TorqueParameters &parameters) noexcept
 {
   return parameters.attitude_gain.allFinite() && parameters.rate_gain.allFinite()
+    && parameters.rate_integral_gain.allFinite() && parameters.rate_integral_limit.allFinite()
     && parameters.normalized_inertia.allFinite() && parameters.normalized_limit.allFinite()
     && (parameters.attitude_gain.array() >= 0.0).all()
     && (parameters.rate_gain.array() >= 0.0).all()
+    && (parameters.rate_integral_gain.array() >= 0.0).all()
+    && (parameters.rate_integral_limit.array() >= 0.0).all()
     && (parameters.normalized_inertia.array() >= 0.0).all()
     && (!parameters.enable_dynamics_compensation
       || (parameters.normalized_inertia.array() > 0.0).all())

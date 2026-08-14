@@ -41,6 +41,65 @@ struct AccelGate
   }
 };
 
+// Model-consistent XY acceleration observer. The plant prediction supplies
+// the fast response while the PX4 estimate corrects drift and model error:
+//   a- = alpha*a_hat + (1-alpha)*u_previous
+//   a_hat = a- + (1-alpha)*(a_measured-a-), alpha=exp(-dt/tau).
+// Z stays measured until its separately tuned baseline is revisited.
+struct AccelObserver
+{
+  std::array<double, 3> value{};
+  std::array<double, 3> command{};
+  int64_t stamp_ns = 0;
+  bool initialized = false;
+
+  void reset() noexcept
+  {
+    value = {};
+    command = {};
+    stamp_ns = 0;
+    initialized = false;
+  }
+
+  std::array<double, 3> update(
+    const std::array<double, 3> &measured,
+    const std::array<double, 3> &time_constant,
+    const rclcpp::Time &stamp, double max_gap) noexcept
+  {
+    const int64_t next_stamp_ns = stamp.nanoseconds();
+    if (initialized && next_stamp_ns == stamp_ns) {
+      return value;
+    }
+    const double dt = static_cast<double>(next_stamp_ns - stamp_ns) * 1.0e-9;
+    if (!initialized || next_stamp_ns < stamp_ns || !std::isfinite(dt)
+      || dt > max_gap) {
+      value = measured;
+      stamp_ns = next_stamp_ns;
+      initialized = true;
+      return value;
+    }
+
+    for (std::size_t axis = 0; axis < 2; ++axis) {
+      const double tau = time_constant[axis];
+      if (!(std::isfinite(tau) && tau > 0.0)) {
+        value[axis] = measured[axis];
+        continue;
+      }
+      const double alpha = std::exp(-dt / tau);
+      const double predicted = alpha * value[axis] + (1.0 - alpha) * command[axis];
+      value[axis] = predicted + (1.0 - alpha) * (measured[axis] - predicted);
+    }
+    value[2] = measured[2];
+    stamp_ns = next_stamp_ns;
+    return value;
+  }
+
+  void setCommand(const std::array<double, 3> &input) noexcept
+  {
+    command = input;
+  }
+};
+
 }  // namespace
 
 class MpcControllerNode final : public rclcpp::Node
@@ -51,59 +110,46 @@ public:
   {
     // Parameters are split into solver/model limits, acceleration validation,
     // recovery braking, and force-to-attitude mapping.
-    declare_parameter("update_rate_hz", update_rate_hz_);
-    declare_parameter("reference_timeout_seconds", reference_timeout_seconds_);
-    declare_parameter("state_timeout_seconds", state_timeout_seconds_);
-    declare_parameter("strict_validation", strict_validation_);
-    declare_parameter("output_frame_id", output_frame_id_);
-    declare_parameter("dt_first", config_.dt_first);
-    declare_parameter("dt_later", config_.dt_later);
-    declare_parameter("solver_deadline_seconds", config_.solver_deadline_seconds);
-    declare_parameter("max_iterations", config_.max_iterations);
-    declare_parameter("admm_rho", config_.admm_rho);
-    declare_parameter("solver_absolute_tolerance", config_.solver_absolute_tolerance);
-    declare_parameter("solver_relative_tolerance", config_.solver_relative_tolerance);
-    declare_parameter("max_speed_xy", config_.max_speed_xy);
-    declare_parameter("max_acceleration_xy", config_.max_acceleration_xy);
-    declare_parameter("max_control_xy", config_.max_control_xy);
-    declare_parameter("max_control_rate_xy", config_.max_control_rate_xy);
-    declare_parameter("max_speed_z", config_.max_speed_z);
-    declare_parameter("max_acceleration_z", config_.max_acceleration_z);
-    declare_parameter("max_measured_acceleration_z_m_s2", accel_gate_.max_z);
-    declare_parameter("max_control_z", config_.max_control_z);
-    declare_parameter("max_control_rate_z", config_.max_control_rate_z);
-    declare_parameter("recovery_velocity_gain", recovery_velocity_gain_);
-    declare_parameter("recovery_position_gain_z", recovery_position_gain_z_);
-    declare_parameter("recovery_max_acceleration_xy", recovery_max_acceleration_xy_);
-    declare_parameter("recovery_max_acceleration_z", recovery_max_acceleration_z_);
-    declare_parameter("max_tilt", mapping_config_.max_tilt_rad);
+    declareAndGet("update_rate_hz", update_rate_hz_);
+    declareAndGet("reference_timeout_seconds", reference_timeout_seconds_);
+    declareAndGet("state_timeout_seconds", state_timeout_seconds_);
+    declareAndGet("strict_validation", strict_validation_);
+    declareAndGet("output_frame_id", output_frame_id_);
+    declareAndGet("dt_first", config_.dt_first);
+    declareAndGet("dt_later", config_.dt_later);
+    declareAndGet("solver_deadline_seconds", config_.solver_deadline_seconds);
+    declareAndGet("max_iterations", config_.max_iterations);
+    declareAndGet("admm_rho", config_.admm_rho);
+    declareAndGet("coupled_admm_rho", config_.coupled_admm_rho);
+    declareAndGet("solver_absolute_tolerance", config_.solver_absolute_tolerance);
+    declareAndGet("solver_relative_tolerance", config_.solver_relative_tolerance);
+    declareAndGet("controller_backend", controller_backend_);
+    declareAndGet("control_weight_xy", config_.control_weight_xy);
+    declareAndGet("control_rate_weight_xy", config_.control_rate_weight_xy);
+    declareAndGet("control_weight_z", config_.control_weight_z);
+    declareAndGet("control_rate_weight_z", config_.control_rate_weight_z);
+    declareAndGet("max_speed_xy", config_.max_speed_xy);
+    declareAndGet("max_acceleration_xy", config_.max_acceleration_xy);
+    declareAndGet("max_control_xy", config_.max_control_xy);
+    declareAndGet("max_control_rate_xy", config_.max_control_rate_xy);
+    declareAndGet("max_speed_z", config_.max_speed_z);
+    declareAndGet("max_acceleration_z", config_.max_acceleration_z);
+    declareAndGet("max_measured_acceleration_z_m_s2", accel_gate_.max_z);
+    declareAndGet("max_control_z", config_.max_control_z);
+    declareAndGet("max_control_rate_z", config_.max_control_rate_z);
+    declareAndGet("min_collective_specific_force_m_s2", config_.min_collective_specific_force_m_s2);
+    declareAndGet("max_collective_specific_force_m_s2", config_.max_collective_specific_force_m_s2);
+    declareAndGet("constraint_slack_weight", config_.constraint_slack_weight);
+    declareAndGet("max_constraint_slack", config_.max_constraint_slack);
+    declareAndGet("recovery_velocity_gain", recovery_velocity_gain_);
+    declareAndGet("recovery_position_gain_z", recovery_position_gain_z_);
+    declareAndGet("recovery_max_acceleration_xy", recovery_max_acceleration_xy_);
+    declareAndGet("recovery_max_acceleration_z", recovery_max_acceleration_z_);
+    declareAndGet("max_tilt", mapping_config_.max_tilt_rad);
 
-    get_parameter("update_rate_hz", update_rate_hz_);
-    get_parameter("reference_timeout_seconds", reference_timeout_seconds_);
-    get_parameter("state_timeout_seconds", state_timeout_seconds_);
-    get_parameter("strict_validation", strict_validation_);
-    get_parameter("output_frame_id", output_frame_id_);
-    get_parameter("dt_first", config_.dt_first);
-    get_parameter("dt_later", config_.dt_later);
-    get_parameter("solver_deadline_seconds", config_.solver_deadline_seconds);
-    get_parameter("max_iterations", config_.max_iterations);
-    get_parameter("admm_rho", config_.admm_rho);
-    get_parameter("solver_absolute_tolerance", config_.solver_absolute_tolerance);
-    get_parameter("solver_relative_tolerance", config_.solver_relative_tolerance);
-    get_parameter("max_speed_xy", config_.max_speed_xy);
-    get_parameter("max_acceleration_xy", config_.max_acceleration_xy);
-    get_parameter("max_control_xy", config_.max_control_xy);
-    get_parameter("max_control_rate_xy", config_.max_control_rate_xy);
-    get_parameter("max_speed_z", config_.max_speed_z);
-    get_parameter("max_acceleration_z", config_.max_acceleration_z);
-    get_parameter("max_measured_acceleration_z_m_s2", accel_gate_.max_z);
-    get_parameter("max_control_z", config_.max_control_z);
-    get_parameter("max_control_rate_z", config_.max_control_rate_z);
-    get_parameter("recovery_velocity_gain", recovery_velocity_gain_);
-    get_parameter("recovery_position_gain_z", recovery_position_gain_z_);
-    get_parameter("recovery_max_acceleration_xy", recovery_max_acceleration_xy_);
-    get_parameter("recovery_max_acceleration_z", recovery_max_acceleration_z_);
-    get_parameter("max_tilt", mapping_config_.max_tilt_rad);
+    const bool backend_valid = parseBackend(controller_backend_, config_.backend);
+    config_.gravity_m_s2 = mapping_config_.gravity_m_s2;
+    config_.max_tilt_rad = mapping_config_.max_tilt_rad;
 
     // Fixed-size vector parameters use explicit defaults and shape checks.
     declare_parameter("model_time_constant_xyz", std::vector<double>{0.0, 0.0, 0.0});
@@ -117,7 +163,7 @@ public:
       && getArrayParameter("s_z", config_.s_z)
       && getArrayParameter("model_time_constant_xyz", config_.model_time_constant_xyz);
     const bool update_rate_valid = std::isfinite(update_rate_hz_) && update_rate_hz_ > 0.0;
-    config_valid_ = vector_parameters_valid
+    config_valid_ = vector_parameters_valid && backend_valid
       && update_rate_valid
       && std::isfinite(reference_timeout_seconds_) && reference_timeout_seconds_ > 0.0
       && std::isfinite(state_timeout_seconds_) && state_timeout_seconds_ > 0.0
@@ -150,6 +196,8 @@ public:
     }
 
     controller_.emplace(config_);
+    RCLCPP_INFO(
+      get_logger(), "MPC backend selected at startup: %s", controller_backend_.c_str());
     timer_ = create_wall_timer(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::duration<double>(1.0 / update_rate_hz_)),
@@ -157,6 +205,13 @@ public:
   }
 
 private:
+  template <typename T>
+  void declareAndGet(const std::string &name, T &target)
+  {
+    declare_parameter(name, target);
+    get_parameter(name, target);
+  }
+
   using Reference = mpc_controller::msg::ReferenceTrajectory;
   using State = mpc_controller::msg::VehicleState;
   using Output = mpc_controller::msg::MpcTranslationalOutput;
@@ -168,6 +223,24 @@ private:
   using Sampler = mpc_controller::translational::ReferenceSampler;
   using Controller = mpc_controller::translational::TranslationalMpc;
   using FailureReason = mpc_controller::translational::FailureReason;
+
+  static bool parseBackend(
+    const std::string &name, mpc_controller::translational::Backend &backend) noexcept
+  {
+    if (name == "legacy") {
+      backend = mpc_controller::translational::Backend::legacy;
+      return true;
+    }
+    if (name == "coupled_shadow") {
+      backend = mpc_controller::translational::Backend::coupled_shadow;
+      return true;
+    }
+    if (name == "coupled") {
+      backend = mpc_controller::translational::Backend::coupled;
+      return true;
+    }
+    return false;
+  }
 
   static double durationSeconds(const builtin_interfaces::msg::Duration &duration) noexcept
   {
@@ -262,8 +335,8 @@ private:
 
   void update()
   {
-    // One callback performs admission, horizon sampling, three scalar QPs,
-    // bounded recovery on failure, and the force/attitude conversion.
+    // One callback performs admission, horizon sampling, the selected MPC
+    // backend, bounded recovery on failure, and force/attitude conversion.
     std::lock_guard<std::mutex> lock(mutex_);
     if (!config_valid_ || !controller_ || !reference_ || !state_) {
       return;
@@ -280,6 +353,7 @@ private:
         // by the first-input rate constraint.  Restart from neutral acceleration
         // when fresh measurements return instead of reusing the pre-gap state.
         controller_->reset();
+        accel_observer_.reset();
         stale_input_active_ = true;
       }
       RCLCPP_WARN_THROTTLE(
@@ -307,7 +381,8 @@ private:
     MeasuredState measured;
     measured.position = state_->position;
     measured.velocity = state_->velocity;
-    measured.acceleration = state_->acceleration;
+    const std::array<double, 3> raw_acceleration = state_->acceleration;
+    measured.acceleration = raw_acceleration;
     if (!mpc_controller::translational::finite(measured.position)
       || !mpc_controller::translational::finite(measured.velocity)
       || !mpc_controller::translational::finite(measured.acceleration)) {
@@ -317,14 +392,16 @@ private:
       return;
     }
     if (strict_validation_) {
-      if (!accel_gate_.accept(measured.acceleration)) {
+      if (!accel_gate_.accept(raw_acceleration)) {
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 2000,
           "MPC update rejected: acceleration is non-finite or |az|=%.3f exceeds %.3f m/s^2",
-          std::abs(measured.acceleration[2]), accel_gate_.max_z);
+          std::abs(raw_acceleration[2]), accel_gate_.max_z);
         return;
       }
     }
+    measured.acceleration = accel_observer_.update(
+      raw_acceleration, config_.model_time_constant_xyz, state_stamp_, state_timeout_seconds_);
 
     const double elapsed = now.seconds() - reference_->header_time_seconds;
     Horizon horizon;
@@ -352,6 +429,7 @@ private:
     output.solve_time_seconds = result.solve_time_seconds;
     output.solver_deadline_missed = result.deadline_missed;
     output.failure_reason = static_cast<uint8_t>(result.failure_reason);
+    output.active_backend = static_cast<uint8_t>(config_.backend);
     for (std::size_t axis = 0; axis < 3; ++axis) {
       const auto &axis_result = result.axes[axis];
       output.solver_iterations[axis] = axis_result.iterations;
@@ -362,11 +440,34 @@ private:
       output.solver_dual_tolerance[axis] = axis_result.dual_tolerance;
       output.recovery_constraint_active[axis] = axis_result.recovery_constraint_active;
     }
+    output.coupled_solver_ran = result.coupled_solver_ran;
+    output.coupled_solver_valid = result.coupled.valid;
+    output.coupled_control_active = result.coupled_control_active;
+    output.coupled_solver_iterations = result.coupled.iterations;
+    output.coupled_solver_status = static_cast<uint8_t>(result.coupled.status);
+    output.coupled_primal_residual = result.coupled.primal_residual;
+    output.coupled_dual_residual = result.coupled.dual_residual;
+    output.coupled_primal_tolerance = result.coupled.primal_tolerance;
+    output.coupled_dual_tolerance = result.coupled.dual_tolerance;
+    output.coupled_velocity_slack = result.coupled.max_velocity_slack;
+    output.coupled_acceleration_slack = result.coupled.max_acceleration_slack;
+    output.coupled_max_constraint_violation = result.coupled.max_constraint_violation;
+    output.coupled_max_speed_xy = result.coupled.max_predicted_speed_xy;
+    output.coupled_max_acceleration_xy = result.coupled.max_predicted_acceleration_xy;
+    output.coupled_max_tilt_rad = result.coupled.max_predicted_tilt_rad;
+    output.coupled_max_collective_specific_force_m_s2 =
+      result.coupled.max_predicted_collective_specific_force_m_s2;
+    output.coupled_solve_time_seconds = result.coupled_solve_time_seconds;
+    output.shadow_control_difference_norm = result.shadow_control_difference_norm;
+    updateShadowAdmission(result);
+    output.shadow_admission_samples = shadow_admission_samples_;
+    output.shadow_admission_ready = shadow_admission_ready_;
     ++solve_count_;
     solve_time_total_seconds_ += result.solve_time_seconds;
     solve_time_max_seconds_ = std::max(solve_time_max_seconds_, result.solve_time_seconds);
     if (!result.valid) {
       const auto recovery = recoveryAcceleration(measured, horizon.points.front());
+      accel_observer_.setCommand(recovery);
       output.control_input = recovery;
       output.recovery_command_active = true;
       output.valid = false;
@@ -374,14 +475,17 @@ private:
       publishSetpoint(output.header, output.sequence, recovery, state_->yaw, true);
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "MPC failed: %s status=[%u %u %u] iter=[%d %d %d] "
+        "MPC failed: %s legacy_status=[%u %u %u] coupled_status=%u "
+        "iter=[%d %d %d]/%d "
         "primal=[%.3g %.3g %.3g] dual=[%.3g %.3g %.3g] solve=%.3f ms; "
         "recovery a=[%.2f %.2f %.2f]",
         failureReasonString(result.failure_reason),
         static_cast<unsigned>(result.axes[0].status),
         static_cast<unsigned>(result.axes[1].status),
         static_cast<unsigned>(result.axes[2].status),
+        static_cast<unsigned>(result.coupled.status),
         result.axes[0].iterations, result.axes[1].iterations, result.axes[2].iterations,
+        result.coupled.iterations,
         result.axes[0].primal_residual, result.axes[1].primal_residual,
         result.axes[2].primal_residual,
         result.axes[0].dual_residual, result.axes[1].dual_residual,
@@ -396,8 +500,13 @@ private:
     for (std::size_t step = 0; step < mpc_controller::translational::kHorizonLength; ++step) {
       for (std::size_t axis = 0; axis < 3; ++axis) {
         for (std::size_t state = 0; state < 3; ++state) {
-          output.predicted_states[step * 9 + axis * 3 + state] =
-            result.axes[axis].prediction[step](state);
+          if (result.coupled_control_active) {
+            output.predicted_states[step * 9 + axis * 3 + state] =
+              result.coupled.prediction[step](3 * state + axis);
+          } else {
+            output.predicted_states[step * 9 + axis * 3 + state] =
+              result.axes[axis].prediction[step](state);
+          }
         }
       }
     }
@@ -406,21 +515,29 @@ private:
 
     const auto &command_reference = horizon.points.front();
     output.control_input = result.control;
+    accel_observer_.setCommand(result.control);
     output_publisher_->publish(output);
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 2000,
       "MPC update seq=%lu measured_x0=[p %.3f %.3f %.3f v %.3f %.3f %.3f "
-      "a %.3f %.3f %.3f] u=[%.3f %.3f %.3f] ref_age=%.1f ms state_age=%.1f ms "
-      "solve=%.3f ms mean=%.3f ms max=%.3f ms",
+      "a_hat %.3f %.3f %.3f a_raw %.3f %.3f %.3f] "
+      "u=[%.3f %.3f %.3f] ref_age=%.1f ms state_age=%.1f ms "
+      "solve=%.3f ms mean=%.3f ms max=%.3f ms coupled_valid=%s "
+      "shadow_ready=%s(%u) delta_u=%.3f tilt_max=%.3f thrust_max=%.3f",
       static_cast<unsigned long>(output.sequence),
       measured.position[0], measured.position[1], measured.position[2],
       measured.velocity[0], measured.velocity[1], measured.velocity[2],
       measured.acceleration[0], measured.acceleration[1], measured.acceleration[2],
+      raw_acceleration[0], raw_acceleration[1], raw_acceleration[2],
       result.control[0], result.control[1], result.control[2],
       reference_age * 1.0e3, state_age * 1.0e3,
       output.solve_time_seconds * 1000.0,
       (solve_time_total_seconds_ / static_cast<double>(solve_count_)) * 1000.0,
-      solve_time_max_seconds_ * 1000.0);
+      solve_time_max_seconds_ * 1000.0,
+      result.coupled.valid ? "true" : "false",
+      shadow_admission_ready_ ? "true" : "false", shadow_admission_samples_,
+      result.shadow_control_difference_norm, result.coupled.max_predicted_tilt_rad,
+      result.coupled.max_predicted_collective_specific_force_m_s2);
     publishSetpoint(
       output.header, output.sequence, result.control, command_reference.yaw, false);
   }
@@ -444,6 +561,46 @@ private:
     command[2] = std::clamp(
       command[2], -recovery_max_acceleration_z_, recovery_max_acceleration_z_);
     return command;
+  }
+
+  void updateShadowAdmission(
+    const mpc_controller::translational::UpdateResult &result) noexcept
+  {
+    if (config_.backend == mpc_controller::translational::Backend::legacy
+      || !result.coupled_solver_ran) {
+      shadow_admission_samples_ = 0;
+      shadow_admission_ready_ = false;
+      return;
+    }
+    const bool stable = result.coupled.valid && !result.deadline_missed
+      && std::isfinite(result.coupled_solve_time_seconds)
+      && result.coupled_solve_time_seconds <= config_.solver_deadline_seconds
+      && std::isfinite(result.coupled.max_constraint_violation)
+      && result.coupled.max_constraint_violation
+      <= 10.0 * (config_.solver_absolute_tolerance + config_.solver_relative_tolerance)
+      && result.coupled.max_predicted_tilt_rad <= config_.max_tilt_rad + 1.0e-6
+      && result.coupled.max_predicted_collective_specific_force_m_s2
+      <= config_.max_collective_specific_force_m_s2 + 1.0e-6;
+    if (!stable && shadow_admission_samples_ > 0U) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "Coupled shadow admission reset: valid=%s deadline=%s status=%u iter=%d "
+        "solve=%.3f ms primal=%.3g/%.3g dual=%.3g/%.3g violation=%.3g "
+        "tilt=%.3f thrust=%.3f samples=%u",
+        result.coupled.valid ? "true" : "false",
+        result.deadline_missed ? "true" : "false",
+        static_cast<unsigned>(result.coupled.status), result.coupled.iterations,
+        result.coupled_solve_time_seconds * 1.0e3,
+        result.coupled.primal_residual, result.coupled.primal_tolerance,
+        result.coupled.dual_residual, result.coupled.dual_tolerance,
+        result.coupled.max_constraint_violation,
+        result.coupled.max_predicted_tilt_rad,
+        result.coupled.max_predicted_collective_specific_force_m_s2,
+        shadow_admission_samples_);
+    }
+    shadow_admission_samples_ = stable ? std::min(
+      shadow_admission_samples_ + 1U, shadow_admission_required_samples_) : 0U;
+    shadow_admission_ready_ = shadow_admission_samples_ >= shadow_admission_required_samples_;
   }
 
   void publishSetpoint(
@@ -524,9 +681,11 @@ private:
   double recovery_position_gain_z_ = 0.5;
   double recovery_max_acceleration_xy_ = 2.5;
   double recovery_max_acceleration_z_ = 1.5;
+  std::string controller_backend_ = "coupled_shadow";
   std::string output_frame_id_ = "map";
   mpc_controller::translational::Config config_{};
   AccelGate accel_gate_{};
+  AccelObserver accel_observer_{};
   mpc_controller::force_attitude::Parameters mapping_config_{};
   std::optional<Controller> controller_;
   std::optional<ReferenceData> reference_;
@@ -538,6 +697,9 @@ private:
   uint64_t reference_trajectory_id_ = 0;
   uint64_t sequence_ = 0;
   uint64_t solve_count_ = 0;
+  uint32_t shadow_admission_samples_ = 0;
+  static constexpr uint32_t shadow_admission_required_samples_ = 250;
+  bool shadow_admission_ready_ = false;
   double solve_time_total_seconds_ = 0.0;
   double solve_time_max_seconds_ = 0.0;
   rclcpp::Subscription<Reference>::SharedPtr reference_subscription_;

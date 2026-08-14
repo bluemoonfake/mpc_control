@@ -20,8 +20,9 @@ out-of-order, or cross-topic-skewed samples.
 
 The reusable controller code is kept under `include/mpc_controller`:
 
-- `mpc_solver.hpp`: project API for one-axis MPC.
-- `translational_mpc.hpp`: runs that API for the X, Y and Z axes.
+- `mpc_solver.hpp`: project API for the legacy per-axis and coupled 3-D QPs.
+- `translational_mpc.hpp`: packs measured/reference states, runs the selected
+  startup backend, and compares coupled output while shadowing.
 - `force_attitude_mapping.hpp`: converts desired acceleration into specific
   force and attitude.
 - `geometric_controller.hpp`: SO(3) torque control and PX4 thrust mapping.
@@ -35,20 +36,55 @@ object. This keeps OSQP types out of the rest of the controller. There is no
 second custom solver or hand-written ADMM loop.
 
 Node-specific checks stay inside their node source. In particular, the strict
-Z-acceleration gate is local to `mpc_controller_node.cpp`; it is not a reusable
-controller API.
+Z-acceleration gate and the XY acceleration observer are local to
+`mpc_controller_node.cpp`; they are not reusable controller APIs.
 
 Successive final desired rotations are differentiated at the 50 Hz
 force/attitude-setpoint boundary
 
 The acceleration prediction uses the identified first-order time constants
 from `model_time_constant_xyz`. The supplied x500 profile uses
-`tau_xy=0.11 s` and `tau_z=0.13 s`; another airframe must identify only these
-response constants rather than changing controller code. Each
-horizon interval computes `alpha(dt)=exp(-dt/tau)`.
+`tau_xy=0.11 s` and `tau_z=0.04 s`; another airframe must identify only these
+response constants rather than changing controller code. Each horizon interval
+computes `alpha(dt)=exp(-dt/tau)` and `b=1-alpha`. Both the old-acceleration
+path in `A` and the new-command path in `B` are weighted, so `alpha+b=1` and a
+constant `a=u` remains constant instead of being counted twice. The XY feedback
+observer uses the same model:
+it predicts acceleration from the previous command and then corrects that
+prediction with the PX4 acceleration estimate. This rejects estimator spikes
+without adding a separate filter time constant or changing the Z baseline.
 
 The first prediction interval is `dt_first=0.01 s`; later intervals use
-`dt_later = 0.2s.
+`dt_later=0.2 s`.
+
+The tracking objective also contains control-effort and control-increment
+penalties. `control_weight_xy/z` tunes `||U||^2`, and
+`control_rate_weight_xy/z` tunes `||U[k]-U[k-1]||^2`. These are soft cost terms;
+the existing maximum command and command-rate constraints remain hard.
+
+## Coupled MPC admission
+
+`controller_backend` is read only when `mpc_controller_node` starts:
+
+- `legacy`: three independent axis QPs control.
+- `coupled_shadow`: legacy controls while one 3-D QP is evaluated.
+- `coupled`: the 3-D QP controls.
+
+The default is `coupled_shadow`. Do not enter coupled control merely because
+the solver produced one valid sample. First inspect:
+
+```bash
+ros2 topic echo /mpc_translational_output --once
+```
+
+Require `shadow_admission_ready: true`, 250 consecutive samples, no deadline
+miss, bounded slack and no tilt/thrust violation. Then return to Position, stop
+the pipeline, set `controller_backend: coupled`, and restart. The backend never
+changes automatically while Offboard is active.
+
+The coupled QP uses a fixed 12-sided inner polygon. Airframe parameters remain
+the physical speed, acceleration, command, tilt and collective-specific-force
+limits; the polygon side count is not a tuning parameter.
 
 ## Build only
 
@@ -153,6 +189,7 @@ PX4 publishes this diagnostic with transient-local durability. Inspect it with:
 source install/setup.bash
 ros2 topic echo /fmu/out/control_allocator_status --once \
   --qos-reliability best_effort --qos-durability transient_local
+```
 
 To restore autonomous trajectory tests, set
 `reference_input_mode: trajectory` in `config/controller.yaml`, rebuild and

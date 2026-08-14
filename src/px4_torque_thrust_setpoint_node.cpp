@@ -26,6 +26,68 @@
 #include <string>
 #include <vector>
 
+// Body-rate integral with conditional integration and per-axis anti-windup.
+// The integrator accumulates e_omega in the FLU body frame and contributes
+// tau_I = -K_I * integral(e_omega) dt to the SO(3) torque law, eliminating
+// steady-state attitude trim offsets caused by CG shifts or asymmetric drag.
+class RateIntegrator final
+{
+public:
+  void configure(
+    const Eigen::Vector3d &gain,
+    const Eigen::Vector3d &limit) noexcept
+  {
+    gain_ = gain;
+    limit_ = limit;
+  }
+
+  void reset() noexcept
+  {
+    integral_.setZero();
+    last_update_.reset();
+  }
+
+  // Returns the integral torque contribution in FLU body frame.
+  // Freezes accumulation when the actuator or torque output is saturated
+  // (conditional integration anti-windup).
+  Eigen::Vector3d update(
+    const Eigen::Vector3d &rate_error,
+    bool actuator_saturated,
+    bool torque_saturated) noexcept
+  {
+    const auto current_time = std::chrono::steady_clock::now();
+    if (!last_update_) {
+      last_update_ = current_time;
+      return -gain_.cwiseProduct(integral_);
+    }
+    const double dt = std::chrono::duration<double>(
+      current_time - *last_update_).count();
+    last_update_ = current_time;
+    if (!std::isfinite(dt) || dt <= 0.0 || dt > 0.1) {
+      // Reject large or invalid dt to avoid integration windup on timer jitter.
+      return -gain_.cwiseProduct(integral_);
+    }
+
+    // Conditional integration: freeze when actuators are saturated.
+    if (!actuator_saturated && !torque_saturated) {
+      for (int axis = 0; axis < 3; ++axis) {
+        integral_[axis] += rate_error[axis] * dt;
+        integral_[axis] = std::clamp(
+          integral_[axis], -limit_[axis], limit_[axis]);
+      }
+    }
+    return -gain_.cwiseProduct(integral_);
+  }
+
+  const Eigen::Vector3d &integral() const noexcept {return integral_;}
+
+private:
+  Eigen::Vector3d gain_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d limit_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d integral_{Eigen::Vector3d::Zero()};
+  std::optional<std::chrono::steady_clock::time_point> last_update_;
+};
+
 class Px4TorqueThrustSetpointNode final : public rclcpp::Node
 {
 public:
@@ -34,56 +96,35 @@ public:
   {
     // Adapter parameters cover freshness, HTE thrust calibration, geometric
     // SO(3) gains/limits, and desired angular-kinematics estimation.
-    declare_parameter("publish_rate_hz", publish_rate_hz_);
-    declare_parameter("heartbeat_rate_hz", heartbeat_rate_hz_);
-    declare_parameter("state_timeout_seconds", state_timeout_seconds_);
-    declare_parameter("command_timeout_seconds", command_timeout_seconds_);
-    declare_parameter("timesync_timeout_seconds", timesync_timeout_seconds_);
-    declare_parameter(
-      "hover_thrust_estimate_timeout_seconds", hover_thrust_estimate_timeout_seconds_);
-    declare_parameter(
-      "hover_thrust_tracking_time_constant_seconds",
-      hover_thrust_tracking_time_constant_seconds_);
-    declare_parameter("hover_thrust_max_rate_per_second", hover_thrust_max_rate_per_second_);
-    declare_parameter("hover_thrust_normalized", thrust_mapping_.hover_thrust_normalized);
-    declare_parameter("attitude_gain", std::vector<double>{0.8, 0.8, 0.4});
-    declare_parameter("rate_gain", std::vector<double>{0.15, 0.15, 0.10});
-    declare_parameter("enable_desired_rate_tracking", enable_desired_rate_tracking_);
-    declare_parameter(
-      "enable_dynamics_compensation", torque_parameters_.enable_dynamics_compensation);
-    declare_parameter("normalized_inertia", std::vector<double>{0.0, 0.0, 0.0});
-    declare_parameter(
+    declareAndGet("publish_rate_hz", publish_rate_hz_);
+    declareAndGet("heartbeat_rate_hz", heartbeat_rate_hz_);
+    declareAndGet("state_timeout_seconds", state_timeout_seconds_);
+    declareAndGet("command_timeout_seconds", command_timeout_seconds_);
+    declareAndGet("timesync_timeout_seconds", timesync_timeout_seconds_);
+    declareAndGet("hover_thrust_estimate_timeout_seconds", hover_thrust_estimate_timeout_seconds_);
+    declareAndGet("hover_thrust_tracking_time_constant_seconds", hover_thrust_tracking_time_constant_seconds_);
+    declareAndGet("hover_thrust_max_rate_per_second", hover_thrust_max_rate_per_second_);
+    declareAndGet("hover_thrust_normalized", thrust_mapping_.hover_thrust_normalized);
+    declareAndGet("enable_desired_rate_tracking", enable_desired_rate_tracking_);
+    declareAndGet("enable_dynamics_compensation", torque_parameters_.enable_dynamics_compensation);
+    declareAndGet(
       "desired_kinematics_filter_time_constant_seconds",
       desired_kinematics_parameters_.filter_time_constant_seconds);
-    declare_parameter(
+    declareAndGet(
       "desired_kinematics_max_sample_interval_seconds",
       desired_kinematics_parameters_.max_sample_interval_seconds);
+
+    // Vector parameters defaults
+    declare_parameter("attitude_gain", std::vector<double>{0.8, 0.8, 0.4});
+    declare_parameter("rate_gain", std::vector<double>{0.15, 0.15, 0.10});
+    declare_parameter("normalized_inertia", std::vector<double>{0.0, 0.0, 0.0});
     declare_parameter("max_desired_body_rate_rad_s", std::vector<double>{2.0, 2.0, 1.0});
     declare_parameter(
       "max_desired_body_acceleration_rad_s2", std::vector<double>{10.0, 10.0, 5.0});
     declare_parameter("normalized_torque_limit", std::vector<double>{0.30, 0.30, 0.20});
+    declare_parameter("rate_integral_gain", std::vector<double>{0.0, 0.0, 0.0});
+    declare_parameter("rate_integral_limit", std::vector<double>{0.15, 0.15, 0.10});
 
-    get_parameter("publish_rate_hz", publish_rate_hz_);
-    get_parameter("heartbeat_rate_hz", heartbeat_rate_hz_);
-    get_parameter("state_timeout_seconds", state_timeout_seconds_);
-    get_parameter("command_timeout_seconds", command_timeout_seconds_);
-    get_parameter("timesync_timeout_seconds", timesync_timeout_seconds_);
-    get_parameter(
-      "hover_thrust_estimate_timeout_seconds", hover_thrust_estimate_timeout_seconds_);
-    get_parameter(
-      "hover_thrust_tracking_time_constant_seconds",
-      hover_thrust_tracking_time_constant_seconds_);
-    get_parameter("hover_thrust_max_rate_per_second", hover_thrust_max_rate_per_second_);
-    get_parameter("hover_thrust_normalized", thrust_mapping_.hover_thrust_normalized);
-    get_parameter("enable_desired_rate_tracking", enable_desired_rate_tracking_);
-    get_parameter(
-      "enable_dynamics_compensation", torque_parameters_.enable_dynamics_compensation);
-    get_parameter(
-      "desired_kinematics_filter_time_constant_seconds",
-      desired_kinematics_parameters_.filter_time_constant_seconds);
-    get_parameter(
-      "desired_kinematics_max_sample_interval_seconds",
-      desired_kinematics_parameters_.max_sample_interval_seconds);
     const bool torque_parameters_loaded =
       getVector3Parameter("attitude_gain", torque_parameters_.attitude_gain)
       && getVector3Parameter("rate_gain", torque_parameters_.rate_gain)
@@ -93,7 +134,9 @@ public:
       && getVector3Parameter(
         "max_desired_body_acceleration_rad_s2",
         desired_kinematics_parameters_.max_body_acceleration_rad_s2)
-      && getVector3Parameter("normalized_torque_limit", torque_parameters_.normalized_limit);
+      && getVector3Parameter("normalized_torque_limit", torque_parameters_.normalized_limit)
+      && getVector3Parameter("rate_integral_gain", torque_parameters_.rate_integral_gain)
+      && getVector3Parameter("rate_integral_limit", torque_parameters_.rate_integral_limit);
 
     config_valid_ = std::isfinite(publish_rate_hz_) && publish_rate_hz_ > 0.0
       && std::isfinite(heartbeat_rate_hz_) && heartbeat_rate_hz_ > 0.0
@@ -115,6 +158,8 @@ public:
       RCLCPP_ERROR(get_logger(), "Invalid SITL torque/thrust adapter configuration");
     }
     desired_kinematics_estimator_.emplace(desired_kinematics_parameters_);
+    rate_integrator_.configure(
+      torque_parameters_.rate_integral_gain, torque_parameters_.rate_integral_limit);
 
     // PX4 sensor/output topics use best-effort QoS. Callbacks only cache data;
     // the timers below are the sole heartbeat and wrench publishers.
@@ -194,6 +239,7 @@ public:
         offboard_active_ = message->flag_control_offboard_enabled;
         if (!was_offboard && offboard_active_) {
           resetDesiredKinematics();
+          rate_integrator_.reset();
           captureYawLocked();
           latchHoverThrustLocked();
           state_ = State::active;
@@ -205,6 +251,7 @@ public:
             latched_hover_thrust_from_estimator_ ? "PX4 HTE" : "configured fallback");
         } else if (was_offboard && !offboard_active_) {
           resetDesiredKinematics();
+          rate_integrator_.reset();
           yaw_hold_enu_rad_.reset();
           latched_hover_thrust_normalized_.reset();
           latched_hover_thrust_from_estimator_ = false;
@@ -269,6 +316,13 @@ private:
   using AllocatorStatus = px4_msgs::msg::ControlAllocatorStatus;
   using ActuatorMotors = px4_msgs::msg::ActuatorMotors;
   using Clock = std::chrono::steady_clock;
+
+  template <typename T>
+  void declareAndGet(const std::string &name, T &target)
+  {
+    declare_parameter(name, target);
+    get_parameter(name, target);
+  }
 
   enum class State : uint8_t
   {
@@ -356,6 +410,7 @@ private:
     if (desired_kinematics_estimator_) desired_kinematics_estimator_->reset();
     desired_kinematics_ = {};
     desired_kinematics_sequence_ = 0U;
+    rate_integrator_.reset();
   }
 
   mpc_controller::px4_control::DesiredKinematics updateDesiredKinematics(
@@ -621,6 +676,27 @@ private:
       return;
     }
 
+    // Rate-error integral torque: tau_I = -K_I * integral(e_omega) in FLU.
+    // Conditional integration freezes when actuators or torque are saturated.
+    const Eigen::Vector3d rate_error_flu(
+      converted.body_rate_error_rad_s[0],
+      converted.body_rate_error_rad_s[1],
+      converted.body_rate_error_rad_s[2]);
+    const Eigen::Vector3d integral_torque_flu = rate_integrator_.update(
+      rate_error_flu, sample.actuator_saturated, converted.torque_saturated);
+
+    // Add integral contribution in FRD frame: FLU→FRD is diag(1, -1, -1).
+    converted.torque_body_frd[0] += static_cast<float>(integral_torque_flu.x());
+    converted.torque_body_frd[1] += static_cast<float>(-integral_torque_flu.y());
+    converted.torque_body_frd[2] += static_cast<float>(-integral_torque_flu.z());
+
+    // Re-clamp combined (PD+I) torque to normalized limit.
+    for (int axis = 0; axis < 3; ++axis) {
+      const float limit = static_cast<float>(torque_parameters_.normalized_limit[axis]);
+      converted.torque_body_frd[axis] = std::clamp(
+        converted.torque_body_frd[axis], -limit, limit);
+    }
+
     // PX4's allocator is scheduled by the torque update, so publish thrust
     // first to make the matching collective command visible to that cycle.
     Thrust thrust{};
@@ -684,7 +760,7 @@ private:
   bool enable_desired_rate_tracking_ = true;
   State state_ = State::wait_data;
   double publish_rate_hz_ = 250.0;
-  double heartbeat_rate_hz_ = 10.0;
+  double heartbeat_rate_hz_ = 50.0;
   double state_timeout_seconds_ = 0.25;
   double command_timeout_seconds_ = 0.25;
   double timesync_timeout_seconds_ = 1.5;
@@ -699,6 +775,7 @@ private:
   mpc_controller::px4_control::DesiredKinematics desired_kinematics_{};
   uint64_t desired_kinematics_sequence_ = 0U;
   std::mutex kinematics_mutex_;
+  RateIntegrator rate_integrator_;
   std::optional<double> yaw_hold_enu_rad_;
   std::optional<double> latched_hover_thrust_normalized_;
   bool latched_hover_thrust_from_estimator_ = false;

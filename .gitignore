@@ -1,4 +1,23 @@
 build/
 install/
 log/
+bags/
 .sim/
+__pycache__/
+*.pyc
+
+# Local development evidence and tools are not part of the runtime package.
+scripts/
+test/
+docs/
+third_party/px4_msgs/
+third_party/acados/
+nmpc/generated/Makefile
+nmpc/generated/*.json
+nmpc/generated/*.pxd
+nmpc/generated/acados_sim_solver_*
+nmpc/generated/main_*
+symlink_install_manifest.txt
+agent.md
+implementation_plan.md
+message.md

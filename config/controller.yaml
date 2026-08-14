@@ -25,21 +25,21 @@ reference_generator_node:
     visualization_direction_deadband: 0.08
     manual_input_timeout_seconds: 0.25
     manual_update_rate_hz: 25.0
-    manual_stick_deadband: 0.08
-    manual_max_horizontal_speed_m_s: 5.0
-    manual_max_vertical_speed_m_s: 3.0
+    manual_stick_deadband: 0.05
+    manual_max_horizontal_speed_m_s: 3.0
+    manual_max_vertical_speed_m_s: 1.2
     manual_max_horizontal_acceleration_m_s2: 2.5
-    manual_max_vertical_acceleration_m_s2: 2.0
+    manual_max_vertical_acceleration_m_s2: 1.0
     manual_max_horizontal_jerk_m_s3: 4.0
-    manual_max_vertical_jerk_m_s3: 3.0
+    manual_max_vertical_jerk_m_s3: 1.5
     manual_max_yaw_rate_rad_s: 0.8
     manual_max_horizontal_position_error_m: 2.0
-    manual_max_vertical_position_error_m: 1.0
+    manual_max_vertical_position_error_m: 0.5
     # Rolling motion primitives. Collision checking is an explicit no-op until
     # an obstacle representation is connected.
     planner_horizon_seconds: 5.0
     planner_sample_period_seconds: 0.1
-    planner_velocity_response_seconds: 0.8
+    planner_velocity_response_seconds: 0.5
     planner_heading_offsets_deg: [-45.0, -30.0, -15.0, 0.0, 15.0, 30.0, 45.0]
     planner_speed_scales: [0.5, 0.75, 1.0]
     planner_intent_weight: 4.0
@@ -70,32 +70,57 @@ mpc_controller_node:
     # Whole X/Y/Z solve must finish before the 20 ms controller period.
     solver_deadline_seconds: 0.018
     max_iterations: 400
-    # Identified acceleration-response lag. This first-order approximation
-    # captures the measured 0.10-0.12 s XY delay; Z retains its 0.13 s model.
-    model_time_constant_xyz: [0.11, 0.11, 0.13]
+    # Identified acceleration-response lag. XY uses the same constants in its
+    # command-aided acceleration observer; Z keeps direct measured feedback.
+    model_time_constant_xyz: [0.11, 0.11, 0.04]
     # ADMM solver settings.
     admm_rho: 0.05
-    solver_absolute_tolerance: 0.001
+    # A lower initial rho converges faster when polygon/rate constraints become
+    # active; OSQP still adapts it internally as the active set changes.
+    coupled_admm_rho: 0.05
+    # Absolute dual tolerance must remain below the normalized tracking
+    # gradient; 3e-4 preserves the command sign on small position errors.
+    solver_absolute_tolerance: 0.0003
     solver_relative_tolerance: 0.001
+    # legacy: three independent QPs; coupled_shadow: compare while legacy controls;
+    # coupled: one 3D QP owns the command. Backend is read only at startup.
+    # Temporary flight-validation profile: isolate the corrected plant model
+    # and XY observer from coupled-shadow scheduling jitter.
+    controller_backend: legacy
     # Stage and terminal weights ordered [position, velocity, acceleration].
     # Prioritize position/velocity tracking. Acceleration remains weighted,
     # but does not dominate fast manual direction changes.
-    q_xy: [1200.0, 1000.0, 60.0]
-    s_xy: [1800.0, 1000.0, 100.0]
-    q_z: [100.0, 200.0, 10.0]
-    s_z: [100.0, 200.0, 10.0]
+    # Acceleration remains in the prediction model and constraints, but gets a
+    # light tracking weight so estimator acceleration noise cannot dominate hover.
+    q_xy: [1200.0, 1500.0, 5.0]
+    s_xy: [1800.0, 1500.0, 10.0]
+    q_z: [500.0, 500.0, 2.0]
+    s_z: [800.0, 600.0, 5.0]
+    # J also penalizes control effort and input increments. XY regularization
+    # preserves small-step tracking; the lighter Z terms damp vertical command
+    # reversals without masking altitude error.
+    control_weight_xy: 5.0
+    control_rate_weight_xy: 10.0
+    control_weight_z: 3.0
+    control_rate_weight_z: 6.0
     # Keep 1 m/s margin above the 5 m/s validation reference so the optimum is
     # not forced onto the velocity constraint.
     max_speed_xy: 6.0
     max_acceleration_xy: 5.0
     max_control_xy: 5.0
     max_control_rate_xy: 8.0
-    max_speed_z: 5.0
-    max_acceleration_z: 5.0
+    max_speed_z: 2.0
+    max_acceleration_z: 2.0
     # Used only when strict_validation is enabled.
     max_measured_acceleration_z_m_s2: 10.0
-    max_control_z: 5.0
-    max_control_rate_z: 5.0
+    max_control_z: 3.0
+    max_control_rate_z: 4.0
+    # Coupled-QP physical envelope. The 8-sided polygon (octagon) is an
+    # implementation choice; only these physical limits are airframe-specific.
+    min_collective_specific_force_m_s2: 1.0
+    max_collective_specific_force_m_s2: 16.0
+    constraint_slack_weight: 10000.0
+    max_constraint_slack: 20.0
     # Bounded command used only while MPC is invalid or misses its deadline.
     recovery_velocity_gain: 1.0
     recovery_position_gain_z: 0.5

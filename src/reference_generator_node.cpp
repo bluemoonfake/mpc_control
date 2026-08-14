@@ -31,92 +31,54 @@ public:
   {
     // Declare one configuration surface for both autonomous trajectories and
     // the rolling joystick planner. Mode-specific settings remain dormant.
-    declare_parameter("reference_input_mode", reference_input_mode_);
-    declare_parameter("frame_id", frame_id_);
+    declareAndGet("reference_input_mode", reference_input_mode_);
+    declareAndGet("frame_id", frame_id_);
+    declareAndGet("line_duration_seconds", parameters_.line_duration_seconds);
+    declareAndGet("circle_radius", parameters_.circle_radius);
+    declareAndGet("circle_reference_speed_limit_m_s", circle_reference_speed_limit_m_s_);
+    declareAndGet("circle_acceleration_limit_m_s2", circle_acceleration_limit_m_s2_);
+    declareAndGet("circle_direction", parameters_.circle_direction);
+    declareAndGet("hold_yaw_rad", parameters_.hold_yaw_rad);
+    declareAndGet("auto_capture_current_hold", auto_capture_current_hold_);
+    declareAndGet("state_timeout_seconds", state_timeout_seconds_);
+    declareAndGet("horizon_seconds", horizon_seconds_);
+    declareAndGet("sample_period_seconds", sample_period_seconds_);
+    declareAndGet("publish_rate_hz", publish_rate_hz_);
+    declareAndGet("visualization_enabled", visualization_enabled_);
+    declareAndGet("visualization_publish_rate_hz", visualization_publish_rate_hz_);
+    declareAndGet("visualization_arrow_length_m", visualization_arrow_length_m_);
+    declareAndGet("visualization_direction_deadband", visualization_direction_deadband_);
+    declareAndGet("manual_input_timeout_seconds", manual_timeout_);
+    declareAndGet("manual_update_rate_hz", manual_rate_hz_);
+    declareAndGet("manual_stick_deadband", manual_deadband_);
+    declareAndGet("manual_max_horizontal_speed_m_s", planner_config_.max_speed_xy);
+    declareAndGet("manual_max_vertical_speed_m_s", planner_config_.max_speed_z);
+    declareAndGet("manual_max_horizontal_acceleration_m_s2", planner_config_.max_acceleration_xy);
+    declareAndGet("manual_max_vertical_acceleration_m_s2", planner_config_.max_acceleration_z);
+    declareAndGet("manual_max_horizontal_jerk_m_s3", planner_config_.max_jerk_xy);
+    declareAndGet("manual_max_vertical_jerk_m_s3", planner_config_.max_jerk_z);
+    declareAndGet("manual_max_yaw_rate_rad_s", manual_yaw_rate_max_);
+    declareAndGet("manual_max_horizontal_position_error_m", manual_lead_xy_);
+    declareAndGet("manual_max_vertical_position_error_m", manual_lead_z_);
+    declareAndGet("planner_horizon_seconds", planner_config_.horizon_seconds);
+    declareAndGet("planner_sample_period_seconds", planner_config_.sample_seconds);
+    declareAndGet("planner_velocity_response_seconds", planner_config_.response_seconds);
+    declareAndGet("planner_intent_weight", planner_config_.intent_weight);
+    declareAndGet("planner_progress_weight", planner_config_.progress_weight);
+    declareAndGet("planner_acceleration_weight", planner_config_.acceleration_weight);
+    declareAndGet("planner_jerk_weight", planner_config_.jerk_weight);
+    declareAndGet("planner_switch_weight", planner_config_.switch_weight);
+    declareAndGet("planner_hysteresis", planner_config_.hysteresis);
+    declareAndGet("visualization_max_prediction_points", visualization_max_prediction_points_);
+
     declare_parameter("hold_position", std::vector<double>{0.0, 0.0, 1.0});
     declare_parameter("line_relative_delta", std::vector<double>{2.0, 0.0, 0.0});
-    declare_parameter("line_duration_seconds", parameters_.line_duration_seconds);
-    declare_parameter("circle_radius", parameters_.circle_radius);
-    declare_parameter("circle_reference_speed_limit_m_s", circle_reference_speed_limit_m_s_);
-    declare_parameter("circle_acceleration_limit_m_s2", circle_acceleration_limit_m_s2_);
-    declare_parameter("circle_direction", parameters_.circle_direction);
-    declare_parameter("hold_yaw_rad", parameters_.hold_yaw_rad);
-    declare_parameter("auto_capture_current_hold", false);
-    declare_parameter("state_timeout_seconds", state_timeout_seconds_);
-    declare_parameter("horizon_seconds", horizon_seconds_);
-    declare_parameter("sample_period_seconds", sample_period_seconds_);
-    declare_parameter("publish_rate_hz", publish_rate_hz_);
-    declare_parameter("visualization_enabled", visualization_enabled_);
-    declare_parameter("visualization_publish_rate_hz", visualization_publish_rate_hz_);
-    declare_parameter("visualization_arrow_length_m", visualization_arrow_length_m_);
-    declare_parameter("visualization_direction_deadband", visualization_direction_deadband_);
-    declare_parameter("manual_input_timeout_seconds", manual_timeout_);
-    declare_parameter("manual_update_rate_hz", manual_rate_hz_);
-    declare_parameter("manual_stick_deadband", manual_deadband_);
-    declare_parameter("manual_max_horizontal_speed_m_s", planner_config_.max_speed_xy);
-    declare_parameter("manual_max_vertical_speed_m_s", planner_config_.max_speed_z);
-    declare_parameter(
-      "manual_max_horizontal_acceleration_m_s2", planner_config_.max_acceleration_xy);
-    declare_parameter(
-      "manual_max_vertical_acceleration_m_s2", planner_config_.max_acceleration_z);
-    declare_parameter("manual_max_horizontal_jerk_m_s3", planner_config_.max_jerk_xy);
-    declare_parameter("manual_max_vertical_jerk_m_s3", planner_config_.max_jerk_z);
-    declare_parameter("manual_max_yaw_rate_rad_s", manual_yaw_rate_max_);
-    declare_parameter("manual_max_horizontal_position_error_m", manual_lead_xy_);
-    declare_parameter("manual_max_vertical_position_error_m", manual_lead_z_);
-    declare_parameter("planner_horizon_seconds", planner_config_.horizon_seconds);
-    declare_parameter("planner_sample_period_seconds", planner_config_.sample_seconds);
-    declare_parameter("planner_velocity_response_seconds", planner_config_.response_seconds);
-    declare_parameter(
-      "planner_heading_offsets_deg", std::vector<double>{-45.0, -30.0, -15.0, 0.0, 15.0, 30.0, 45.0});
+    declare_parameter("planner_heading_offsets_deg", std::vector<double>{-45.0, -30.0, -15.0, 0.0, 15.0, 30.0, 45.0});
     declare_parameter("planner_speed_scales", planner_config_.speed_scales);
-    declare_parameter("planner_intent_weight", planner_config_.intent_weight);
-    declare_parameter("planner_progress_weight", planner_config_.progress_weight);
-    declare_parameter("planner_acceleration_weight", planner_config_.acceleration_weight);
-    declare_parameter("planner_jerk_weight", planner_config_.jerk_weight);
-    declare_parameter("planner_switch_weight", planner_config_.switch_weight);
-    declare_parameter("planner_hysteresis", planner_config_.hysteresis);
-    declare_parameter("visualization_max_prediction_points", visualization_max_prediction_points_);
 
-    // Load parameters once at startup; runtime mutation is intentionally not
-    // supported so one flight uses one deterministic reference profile.
-    get_parameter("reference_input_mode", reference_input_mode_);
-    get_parameter("frame_id", frame_id_);
     valid_config_ = true;
     getVectorParameter("hold_position", parameters_.hold_position);
     getVectorParameter("line_relative_delta", line_relative_delta_);
-    get_parameter("line_duration_seconds", parameters_.line_duration_seconds);
-    get_parameter("circle_radius", parameters_.circle_radius);
-    get_parameter("circle_reference_speed_limit_m_s", circle_reference_speed_limit_m_s_);
-    get_parameter("circle_acceleration_limit_m_s2", circle_acceleration_limit_m_s2_);
-    get_parameter("circle_direction", parameters_.circle_direction);
-    get_parameter("hold_yaw_rad", parameters_.hold_yaw_rad);
-    get_parameter("auto_capture_current_hold", auto_capture_current_hold_);
-    get_parameter("state_timeout_seconds", state_timeout_seconds_);
-    get_parameter("horizon_seconds", horizon_seconds_);
-    get_parameter("sample_period_seconds", sample_period_seconds_);
-    get_parameter("publish_rate_hz", publish_rate_hz_);
-    get_parameter("visualization_enabled", visualization_enabled_);
-    get_parameter("visualization_publish_rate_hz", visualization_publish_rate_hz_);
-    get_parameter("visualization_arrow_length_m", visualization_arrow_length_m_);
-    get_parameter("visualization_direction_deadband", visualization_direction_deadband_);
-    get_parameter("manual_input_timeout_seconds", manual_timeout_);
-    get_parameter("manual_update_rate_hz", manual_rate_hz_);
-    get_parameter("manual_stick_deadband", manual_deadband_);
-    get_parameter("manual_max_horizontal_speed_m_s", planner_config_.max_speed_xy);
-    get_parameter("manual_max_vertical_speed_m_s", planner_config_.max_speed_z);
-    get_parameter(
-      "manual_max_horizontal_acceleration_m_s2", planner_config_.max_acceleration_xy);
-    get_parameter(
-      "manual_max_vertical_acceleration_m_s2", planner_config_.max_acceleration_z);
-    get_parameter("manual_max_horizontal_jerk_m_s3", planner_config_.max_jerk_xy);
-    get_parameter("manual_max_vertical_jerk_m_s3", planner_config_.max_jerk_z);
-    get_parameter("manual_max_yaw_rate_rad_s", manual_yaw_rate_max_);
-    get_parameter("manual_max_horizontal_position_error_m", manual_lead_xy_);
-    get_parameter("manual_max_vertical_position_error_m", manual_lead_z_);
-    get_parameter("planner_horizon_seconds", planner_config_.horizon_seconds);
-    get_parameter("planner_sample_period_seconds", planner_config_.sample_seconds);
-    get_parameter("planner_velocity_response_seconds", planner_config_.response_seconds);
     const auto heading_offsets_deg = get_parameter("planner_heading_offsets_deg").as_double_array();
     planner_config_.heading_offsets_rad.clear();
     planner_config_.heading_offsets_rad.reserve(heading_offsets_deg.size());
@@ -262,6 +224,13 @@ public:
   }
 
 private:
+  template <typename T>
+  void declareAndGet(const std::string &name, T &target)
+  {
+    declare_parameter(name, target);
+    get_parameter(name, target);
+  }
+
   using Reference = mpc_controller::msg::ReferenceTrajectory;
   using ReferenceStep = mpc_controller::msg::ReferenceStep;
   using MpcOutput = mpc_controller::msg::MpcTranslationalOutput;

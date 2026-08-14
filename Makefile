@@ -96,7 +96,7 @@ if test -n "$$stale_cache"; then \
 	echo "Recreating only the generated PX4 build directory: $(PX4_BUILD_DIR)"; \
 	rm -rf "$(PX4_BUILD_DIR)"; \
 fi; \
-cd "$(PX4_DIR)" && exec make "$(PX4_TARGET)" "$(PX4_SIM)" < <(exec tail -f /dev/null)
+	cd "$(PX4_DIR)" && exec make "$(PX4_TARGET)" "$(PX4_SIM)" < <(exec tail -f /dev/null)
 endef
 
 help:
@@ -298,7 +298,6 @@ sim: check build
 	@setsid bash -c 'exec "$(DDS_AGENT)" "$(DDS_TRANSPORT)" -p "$(DDS_PORT)"' \
 		>"$(DDS_LOG)" 2>&1 & echo $$! >"$(DDS_PID)"
 	@sleep 2
-	@$(MAKE) --no-print-directory gui
 	@setsid bash -c 'exec 9>"$(ROS_LOCK)"; if ! flock -n 9; then echo "Another MPC ROS 2 pipeline already holds $(ROS_LOCK)"; exit 75; fi; echo $$$$ >"$(ROS_PID)"; source "$(ROS_SETUP)"; if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; exec ros2 launch "$(ROS_PACKAGE)" "$(ROS_LAUNCH)" $(ROS_LAUNCH_ARGS)' \
 		>"$(ROS_LOG)" 2>&1 &
 	@echo "Simulation started with Gazebo GUI. No arm/offboard command was sent."
