@@ -16,33 +16,34 @@ inline constexpr double kNormalizedLimit = 1.0;
 // Linear force-to-PX4 mapping around hover. A fresh PX4 HTE updates hover_thrust.
 struct Mapping
 {
-  double vehicle_mass_kg = 2.0;
   double gravity_mps2 = 9.80665;
   double hover_thrust_normalized = 0.765;
 };
 
 inline bool valid(const Mapping &mapping) noexcept
 {
-  return std::isfinite(mapping.vehicle_mass_kg) && mapping.vehicle_mass_kg > 0.0
-    && std::isfinite(mapping.gravity_mps2) && mapping.gravity_mps2 > 0.0
+  return std::isfinite(mapping.gravity_mps2) && mapping.gravity_mps2 > 0.0
     && std::isfinite(mapping.hover_thrust_normalized)
     && mapping.hover_thrust_normalized > 0.0
     && mapping.hover_thrust_normalized <= kNormalizedLimit;
 }
 
-inline std::optional<double> forceToBodyFrdZ(
-  double force_n, const Mapping &mapping) noexcept
+inline std::optional<double> specificForceToBodyFrdZ(
+  double specific_force_m_s2, const Mapping &mapping) noexcept
 {
-  if (!valid(mapping) || !std::isfinite(force_n) || force_n < 0.0) {
+  if (!valid(mapping) || !std::isfinite(specific_force_m_s2)
+    || specific_force_m_s2 < 0.0) {
     return std::nullopt;
   }
-  const double hover_force = mapping.vehicle_mass_kg * mapping.gravity_mps2;
-  const double max_force = hover_force / mapping.hover_thrust_normalized;
-  if (!std::isfinite(max_force) || force_n > max_force) {
+  // Linearized HTE mapping: thrust_FRD,z=-h*||F_d/m||/g, where h is PX4's
+  // current normalized hover-thrust estimate.
+  const double maximum_specific_force =
+    mapping.gravity_mps2 / mapping.hover_thrust_normalized;
+  if (!std::isfinite(maximum_specific_force) || specific_force_m_s2 > maximum_specific_force) {
     return std::nullopt;
   }
   // Positive FLU collective force becomes negative body-FRD Z thrust.
-  return -mapping.hover_thrust_normalized * force_n / hover_force;
+  return -mapping.hover_thrust_normalized * specific_force_m_s2 / mapping.gravity_mps2;
 }
 
 }  // namespace mpc_controller::px4_thrust
@@ -98,8 +99,9 @@ struct Input
   Vector3 desired_body_rate_flu_rad_s{Vector3::Zero()};
   Vector3 desired_body_acceleration_flu_rad_s2{Vector3::Zero()};
   Vector3 measured_body_rate_flu_rad_s{Vector3::Zero()};
-  // M3's verified collective-force projection, in Newtons.
-  double desired_collective_thrust_n = 0.0;
+  // Mass-normalized collective force. This keeps thrust mapping independent
+  // of airframe mass; PX4 HTE supplies the vehicle-specific scale.
+  double desired_collective_specific_force_m_s2 = 0.0;
   bool valid = false;
 };
 
@@ -117,7 +119,6 @@ struct Output
   std::array<double, 3> desired_body_acceleration_flu_rad_s2{};
   std::array<double, 3> feedback_torque_body_flu_normalized{};
   std::array<double, 3> dynamics_torque_body_flu_normalized{};
-  bool dynamics_compensation_enabled = false;
   bool torque_saturated = false;
   bool valid = false;
   FailureReason failure_reason = FailureReason::invalid_input;
@@ -170,7 +171,7 @@ inline std::optional<Quaternion> frdNedToFluEnu(const Quaternion &q_frd_ned) noe
 
 // Preserve the desired body-Z/tilt direction and replace only its ENU heading.
 // This lets the adapter latch yaw at the PX4 Offboard ownership boundary while
-// leaving translational-force construction in M3.
+// leaving translational-force construction in the force/attitude mapping stage.
 inline std::optional<Quaternion> withEnuYaw(
   const Quaternion &desired_body_flu_to_world_enu, double yaw_enu_rad) noexcept
 {
@@ -294,6 +295,8 @@ public:
       return output;
     }
 
+    // SO(3) finite difference: omega_d=Log(R_prev'R_d)/dt. A first-order
+    // low-pass then provides bounded omega_d and omega_dot_d.
     const Eigen::AngleAxisd delta(previous_rotation_.transpose() * rotation);
     Vector3 raw_rate = delta.axis() * delta.angle() / dt;
     if (!raw_rate.allFinite()) {
@@ -350,7 +353,8 @@ inline Output convert(
   const TorqueParameters &torque_parameters) noexcept
 {
   Output output;
-  if (!input.valid || !std::isfinite(input.desired_collective_thrust_n)) {
+  if (!input.valid
+    || !std::isfinite(input.desired_collective_specific_force_m_s2)) {
     output.failure_reason = FailureReason::invalid_input;
     return output;
   }
@@ -382,6 +386,8 @@ inline Output convert(
   const Quaternion measured = input.measured_body_flu_to_world_enu.normalized();
   const Eigen::Matrix3d desired_rotation = desired.toRotationMatrix();
   const Eigen::Matrix3d measured_rotation = measured.toRotationMatrix();
+  // Full geometric attitude/rate errors:
+  // e_R=0.5*vee(Rd'R-R'Rd), e_w=w-R'Rd*w_d.
   const Vector3 attitude_error = 0.5 * vee(
     desired_rotation.transpose() * measured_rotation
     - measured_rotation.transpose() * desired_rotation);
@@ -394,6 +400,9 @@ inline Output convert(
     return output;
   }
 
+  // Normalized SO(3) wrench law:
+  // tau=-K_R*e_R-K_w*e_w + w x J_n*w
+  //     -J_n[hat(w)R'Rd*w_d-R'Rd*w_dot_d].
   const Vector3 feedback_torque_flu =
     -torque_parameters.attitude_gain.cwiseProduct(attitude_error)
     - torque_parameters.rate_gain.cwiseProduct(rate_error);
@@ -428,8 +437,8 @@ inline Output convert(
     return output;
   }
 
-  const auto thrust_z = px4_thrust::forceToBodyFrdZ(
-    input.desired_collective_thrust_n, thrust_mapping);
+  const auto thrust_z = px4_thrust::specificForceToBodyFrdZ(
+    input.desired_collective_specific_force_m_s2, thrust_mapping);
   if (!thrust_z || !std::isfinite(*thrust_z)) {
     output.failure_reason = FailureReason::invalid_thrust;
     return output;
@@ -449,7 +458,6 @@ inline Output convert(
     static_cast<float>(-limited_torque_flu.y()),
     static_cast<float>(-limited_torque_flu.z())};
   output.thrust_body_frd = {0.0F, 0.0F, static_cast<float>(*thrust_z)};
-  output.dynamics_compensation_enabled = torque_parameters.enable_dynamics_compensation;
   output.valid = true;
   output.failure_reason = FailureReason::none;
   return output;

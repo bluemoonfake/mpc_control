@@ -17,9 +17,7 @@ def generate_launch_description():
             package="mpc_controller",
             executable="reference_generator_node",
             name="reference_generator_node",
-            parameters=[
-                controller_config,
-                offboard_config],
+            parameters=[controller_config],
             output="screen",
         ),
         Node(
@@ -33,7 +31,7 @@ def generate_launch_description():
             package="mpc_controller",
             executable="mpc_controller_node",
             name="mpc_controller_node",
-            parameters=[controller_config, offboard_config],
+            parameters=[controller_config],
             output="screen",
         ),
         Node(

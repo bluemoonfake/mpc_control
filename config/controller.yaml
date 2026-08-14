@@ -3,20 +3,22 @@ reference_generator_node:
     # manual_velocity: joystick; trajectory: ReferenceStep/line/circle.
     reference_input_mode: manual_velocity
     frame_id: map
-    hold_position: [0.0, 0.0, 0.0]
-    hold_yaw_rad: 0.0
+    # Follow measured position/yaw before Offboard and freeze at mode entry.
+    auto_capture_current_hold: true
     line_relative_delta: [2.0, 0.0, 0.0]
     line_duration_seconds: 12.0
     # Period and ramp are derived from radius, speed and acceleration limits.
     circle_radius: 30.0
-    circle_reference_speed_limit_m_s: 4.0
-    circle_acceleration_limit_m_s2: 1.5
+    # Fast trajectory profile. Small circles may run slower to respect the
+    # centripetal-acceleration limit.
+    circle_reference_speed_limit_m_s: 5.0
+    circle_acceleration_limit_m_s2: 2.5
     circle_direction: 1
     state_timeout_seconds: 0.25
     horizon_seconds: 30.0
     sample_period_seconds: 0.1
     publish_rate_hz: 1.0
-    # RViz: joystick green, safe reference red, MPC prediction cyan.
+    # RViz: joystick green, selected reference red, MPC prediction cyan.
     visualization_enabled: true
     visualization_publish_rate_hz: 20.0
     visualization_arrow_length_m: 1.0
@@ -24,13 +26,28 @@ reference_generator_node:
     manual_input_timeout_seconds: 0.25
     manual_update_rate_hz: 25.0
     manual_stick_deadband: 0.08
-    manual_max_horizontal_speed_m_s: 2.0
-    manual_max_vertical_speed_m_s: 1.0
-    manual_max_horizontal_acceleration_m_s2: 1.5
-    manual_max_vertical_acceleration_m_s2: 1.0
+    manual_max_horizontal_speed_m_s: 5.0
+    manual_max_vertical_speed_m_s: 3.0
+    manual_max_horizontal_acceleration_m_s2: 2.5
+    manual_max_vertical_acceleration_m_s2: 2.0
+    manual_max_horizontal_jerk_m_s3: 4.0
+    manual_max_vertical_jerk_m_s3: 3.0
     manual_max_yaw_rate_rad_s: 0.8
     manual_max_horizontal_position_error_m: 2.0
     manual_max_vertical_position_error_m: 1.0
+    # Rolling motion primitives. Collision checking is an explicit no-op until
+    # an obstacle representation is connected.
+    planner_horizon_seconds: 5.0
+    planner_sample_period_seconds: 0.1
+    planner_velocity_response_seconds: 0.8
+    planner_heading_offsets_deg: [-45.0, -30.0, -15.0, 0.0, 15.0, 30.0, 45.0]
+    planner_speed_scales: [0.5, 0.75, 1.0]
+    planner_intent_weight: 4.0
+    planner_progress_weight: 1.0
+    planner_acceleration_weight: 0.15
+    planner_jerk_weight: 0.05
+    planner_switch_weight: 0.4
+    planner_hysteresis: 0.1
     visualization_max_prediction_points: 50
 
 vehicle_state_bridge_node:
@@ -41,38 +58,48 @@ vehicle_state_bridge_node:
 
 mpc_controller_node:
   ros__parameters:
+    # Tuned x500 profile. For another airframe, keep the code unchanged and
+    # identify the model constants, gains, and physical operating limits here.
     update_rate_hz: 50.0
+    strict_validation: false
     reference_timeout_seconds: 1.5
     state_timeout_seconds: 0.25
-    # Nonuniform shooting grid: short first step, longer prediction steps.
+    # Short first prediction knot remains independent of the 50 Hz callback.
     dt_first: 0.01
     dt_later: 0.20
+    # Whole X/Y/Z solve must finish before the 20 ms controller period.
+    solver_deadline_seconds: 0.018
     max_iterations: 400
-    # Zero alpha/time constant selects the direct acceleration model.
-    model_alpha_xyz: [0.0, 0.0, 0.0]
-    model_time_constant_xyz: [0.0, 0.0, 0.0]
+    # Identified acceleration-response lag. This first-order approximation
+    # captures the measured 0.10-0.12 s XY delay; Z retains its 0.13 s model.
+    model_time_constant_xyz: [0.11, 0.11, 0.13]
     # ADMM solver settings.
     admm_rho: 0.05
     solver_absolute_tolerance: 0.001
     solver_relative_tolerance: 0.001
     # Stage and terminal weights ordered [position, velocity, acceleration].
-    q_xy: [700.0, 1000.0, 100.0]
-    s_xy: [1000.0, 600.0, 300.0]
+    # Prioritize position/velocity tracking. Acceleration remains weighted,
+    # but does not dominate fast manual direction changes.
+    q_xy: [1200.0, 1000.0, 60.0]
+    s_xy: [1800.0, 1000.0, 100.0]
     q_z: [100.0, 200.0, 10.0]
     s_z: [100.0, 200.0, 10.0]
-    # Optional force feedback [X, Y, Z].
-    force_feedback_kp_n_per_m: [0.0, 0.0, 0.6]
-    force_feedback_kv_n_per_m_s: [0.0, 0.0, 0.0]
-    max_speed_xy: 5.0
+    # Keep 1 m/s margin above the 5 m/s validation reference so the optimum is
+    # not forced onto the velocity constraint.
+    max_speed_xy: 6.0
+    max_acceleration_xy: 5.0
     max_control_xy: 5.0
-    max_control_rate_xy: 5.0
+    max_control_rate_xy: 8.0
     max_speed_z: 5.0
     max_acceleration_z: 5.0
+    # Used only when strict_validation is enabled.
     max_measured_acceleration_z_m_s2: 10.0
     max_control_z: 5.0
     max_control_rate_z: 5.0
-    vehicle_mass: 2.0
-    gravity: 9.80665
-    hover_thrust_normalized: 0.765
-    max_normalized_collective_thrust: 1.0
-    max_tilt: 1.5707963267948966
+    # Bounded command used only while MPC is invalid or misses its deadline.
+    recovery_velocity_gain: 1.0
+    recovery_position_gain_z: 0.5
+    recovery_max_acceleration_xy: 2.5
+    recovery_max_acceleration_z: 1.5
+    # Hard translational-force tilt limit: 45 degrees.
+    max_tilt: 0.7853981633974483

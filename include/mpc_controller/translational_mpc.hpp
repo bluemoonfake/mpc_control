@@ -2,20 +2,19 @@
 
 #include "mpc_controller/mpc_solver.hpp"
 
-#include <Eigen/Core>
-
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <memory>
 #include <vector>
 
 namespace mpc_controller::translational
 {
 
-inline constexpr std::size_t kHorizonLength = 26;
-inline constexpr std::size_t kStateSize = 3;
+inline constexpr std::size_t kHorizonLength = axis_mpc::kHorizonLength;
+inline constexpr std::size_t kStateSize = axis_mpc::kStateDimension;
 inline constexpr std::size_t kAxisCount = 3;
 inline constexpr double kDtFirst = 0.01;
 inline constexpr double kDtLater = 0.20;
@@ -42,7 +41,6 @@ struct ReferenceTrajectoryData
 struct ReferenceHorizon
 {
   std::array<ReferencePoint, kHorizonLength> points{};
-  std::array<double, kHorizonLength> time_offsets{};
 };
 
 struct MeasuredState
@@ -56,25 +54,24 @@ struct Config
 {
   double dt_first = kDtFirst;
   double dt_later = kDtLater;
+  double solver_deadline_seconds = 0.018;
   int max_iterations = 400;
-  std::array<double, 3> model_alpha_xyz{0.0, 0.0, 0.0};
   std::array<double, 3> model_time_constant_xyz{0.0, 0.0, 0.0};
   double admm_rho = 0.02;
   double solver_absolute_tolerance = 1.0e-5;
   double solver_relative_tolerance = 1.0e-5;
-
   std::array<double, 3> q_xy{500.0, 100.0, 100.0};
   std::array<double, 3> s_xy{1000.0, 300.0, 300.0};
   std::array<double, 3> q_z{100.0, 10.0, 10.0};
   std::array<double, 3> s_z{100.0, 10.0, 10.0};
-
   double max_speed_xy = 2.0;
+  double max_acceleration_xy = 2.0;
   double max_control_xy = 2.0;
   double max_control_rate_xy = 5.0;
   double max_speed_z = 2.0;
   double max_acceleration_z = 2.0;
   double max_control_z = 50.0;
-  double max_control_rate_z = 999.0;
+  double max_control_rate_z = 5.0;
 };
 
 enum class FailureReason
@@ -91,17 +88,18 @@ struct UpdateResult
 {
   bool valid = false;
   FailureReason failure_reason = FailureReason::none;
-  std::array<double, 3> control{};  // actuator acceleration command u0 for X/Y/Z
-  std::array<double, 3> first_predicted_acceleration{};  // modeled plant state a[k+1]
-  std::array<int, 3> iterations{};
-  // Layout: prediction[step * 9 + axis * 3 + state], state=[p,v,a].
-  std::array<double, kHorizonLength * kAxisCount * kStateSize> prediction{};
+  Vector3 control{};
+  Vector3 first_predicted_acceleration{};
+  std::array<axis_mpc::Result, kAxisCount> axes{};
+  bool deadline_missed = false;
   double solve_time_seconds = 0.0;
 };
 
 inline bool finite(const Vector3 &value) noexcept
 {
-  return std::isfinite(value[0]) && std::isfinite(value[1]) && std::isfinite(value[2]);
+  return std::all_of(value.begin(), value.end(), [](double item) {
+    return std::isfinite(item);
+  });
 }
 
 inline bool finite(const ReferencePoint &point) noexcept
@@ -113,35 +111,25 @@ inline bool finite(const ReferencePoint &point) noexcept
 
 inline bool validConfig(const Config &config) noexcept
 {
-  const auto finite_array = [](const std::array<double, 3> &values) {
+  const auto nonnegative = [](const std::array<double, 3> &values) {
       return std::all_of(values.begin(), values.end(), [](double value) {
         return std::isfinite(value) && value >= 0.0;
       });
     };
-  return std::isfinite(config.dt_first) && config.dt_first > 0.0
-    && std::isfinite(config.dt_later) && config.dt_later > 0.0
-    && config.max_iterations > 0 && finite_array(config.q_xy) && finite_array(config.s_xy)
-    && finite_array(config.q_z) && finite_array(config.s_z)
-    && std::all_of(config.model_alpha_xyz.begin(), config.model_alpha_xyz.end(), [](double value) {
-      return std::isfinite(value) && value >= 0.0 && value < 1.0;
-    })
-    && std::all_of(
-      config.model_time_constant_xyz.begin(), config.model_time_constant_xyz.end(),
-      [](double value) {
-        return std::isfinite(value) && value >= 0.0;
-      })
-    && std::isfinite(config.admm_rho) && config.admm_rho > 0.0
-    && std::isfinite(config.solver_absolute_tolerance)
-    && config.solver_absolute_tolerance > 0.0
-    && std::isfinite(config.solver_relative_tolerance)
-    && config.solver_relative_tolerance > 0.0
-    && std::isfinite(config.max_speed_xy) && config.max_speed_xy > 0.0
-    && std::isfinite(config.max_control_xy) && config.max_control_xy > 0.0
-    && std::isfinite(config.max_control_rate_xy) && config.max_control_rate_xy > 0.0
-    && std::isfinite(config.max_speed_z) && config.max_speed_z > 0.0
-    && std::isfinite(config.max_acceleration_z) && config.max_acceleration_z > 0.0
-    && std::isfinite(config.max_control_z) && config.max_control_z > 0.0
-    && std::isfinite(config.max_control_rate_z) && config.max_control_rate_z > 0.0;
+  const std::array positive_values{
+    config.dt_first, config.dt_later, config.solver_deadline_seconds,
+    config.admm_rho, config.solver_absolute_tolerance,
+    config.solver_relative_tolerance, config.max_speed_xy,
+    config.max_acceleration_xy, config.max_control_xy,
+    config.max_control_rate_xy, config.max_speed_z,
+    config.max_acceleration_z, config.max_control_z,
+    config.max_control_rate_z};
+  return std::all_of(positive_values.begin(), positive_values.end(), [](double value) {
+      return std::isfinite(value) && value > 0.0;
+    }) && config.max_iterations > 0
+    && nonnegative(config.q_xy) && nonnegative(config.s_xy)
+    && nonnegative(config.q_z) && nonnegative(config.s_z)
+    && nonnegative(config.model_time_constant_xyz);
 }
 
 class ReferenceSampler final
@@ -157,11 +145,13 @@ public:
     if (!std::isfinite(trajectory.header_time_seconds) || trajectory.points.empty()) {
       return false;
     }
-    for (std::size_t i = 0; i < trajectory.points.size(); ++i) {
-      if (!finite(trajectory.points[i])) {
+    for (std::size_t index = 0; index < trajectory.points.size(); ++index) {
+      if (!finite(trajectory.points[index])) {
         return false;
       }
-      if (i > 0 && trajectory.points[i].time_from_start <= trajectory.points[i - 1].time_from_start) {
+      if (index > 0
+        && trajectory.points[index].time_from_start
+        <= trajectory.points[index - 1].time_from_start) {
         return false;
       }
     }
@@ -169,18 +159,20 @@ public:
   }
 
   static bool sampleAt(
-    const ReferenceTrajectoryData &trajectory, double time_from_start, ReferencePoint &output) noexcept
+    const ReferenceTrajectoryData &trajectory, double time_from_start,
+    ReferencePoint &output) noexcept
   {
-    if (!validTrajectory(trajectory) || !std::isfinite(time_from_start) || time_from_start < 0.0) {
+    if (!validTrajectory(trajectory) || !std::isfinite(time_from_start)
+      || time_from_start < 0.0) {
       return false;
     }
     if (time_from_start <= trajectory.points.front().time_from_start) {
       output = trajectory.points.front();
       return true;
     }
-    for (std::size_t i = 1; i < trajectory.points.size(); ++i) {
-      const auto &left = trajectory.points[i - 1];
-      const auto &right = trajectory.points[i];
+    for (std::size_t index = 1; index < trajectory.points.size(); ++index) {
+      const auto &left = trajectory.points[index - 1];
+      const auto &right = trajectory.points[index];
       if (time_from_start <= right.time_from_start) {
         const double alpha = (time_from_start - left.time_from_start)
           / (right.time_from_start - left.time_from_start);
@@ -199,13 +191,14 @@ public:
     const ReferenceTrajectoryData &trajectory, double elapsed_seconds,
     double dt_first, double dt_later, ReferenceHorizon &output) noexcept
   {
-    if (!validTrajectory(trajectory) || !std::isfinite(elapsed_seconds) || elapsed_seconds < 0.0
-      || !std::isfinite(dt_first) || dt_first <= 0.0 || !std::isfinite(dt_later) || dt_later <= 0.0) {
+    if (!validTrajectory(trajectory) || !std::isfinite(elapsed_seconds)
+      || elapsed_seconds < 0.0 || !std::isfinite(dt_first) || dt_first <= 0.0
+      || !std::isfinite(dt_later) || dt_later <= 0.0) {
       return false;
     }
-    for (std::size_t i = 0; i < kHorizonLength; ++i) {
-      output.time_offsets[i] = dt_first + static_cast<double>(i) * dt_later;
-      if (!sampleAt(trajectory, elapsed_seconds + output.time_offsets[i], output.points[i])) {
+    for (std::size_t index = 0; index < kHorizonLength; ++index) {
+      const double offset = dt_first + static_cast<double>(index) * dt_later;
+      if (!sampleAt(trajectory, elapsed_seconds + offset, output.points[index])) {
         return false;
       }
     }
@@ -214,14 +207,17 @@ public:
 
 private:
   static ReferencePoint interpolate(
-    const ReferencePoint &left, const ReferencePoint &right, double alpha) noexcept
+    const ReferencePoint &left, const ReferencePoint &right,
+    double alpha) noexcept
   {
     ReferencePoint output;
     output.time_from_start = left.time_from_start
       + alpha * (right.time_from_start - left.time_from_start);
-    for (int axis = 0; axis < 3; ++axis) {
-      output.position[axis] = left.position[axis] + alpha * (right.position[axis] - left.position[axis]);
-      output.velocity[axis] = left.velocity[axis] + alpha * (right.velocity[axis] - left.velocity[axis]);
+    for (std::size_t axis = 0; axis < kAxisCount; ++axis) {
+      output.position[axis] = left.position[axis]
+        + alpha * (right.position[axis] - left.position[axis]);
+      output.velocity[axis] = left.velocity[axis]
+        + alpha * (right.velocity[axis] - left.velocity[axis]);
       output.acceleration[axis] = left.acceleration[axis]
         + alpha * (right.acceleration[axis] - left.acceleration[axis]);
     }
@@ -235,110 +231,94 @@ class TranslationalMpc final
 {
 public:
   explicit TranslationalMpc(const Config &config)
-  : config_(config),
-    solver_x_(axisConfiguration(config, 0, config.q_xy, config.s_xy,
-      config.max_speed_xy, 999.0, config.max_control_xy, config.max_control_rate_xy)),
-    solver_y_(axisConfiguration(config, 1, config.q_xy, config.s_xy,
-      config.max_speed_xy, 999.0, config.max_control_xy, config.max_control_rate_xy)),
-    solver_z_(axisConfiguration(config, 2, config.q_z, config.s_z,
-      config.max_speed_z, config.max_acceleration_z, config.max_control_z,
-      config.max_control_rate_z))
+  : config_(config)
   {
+    for (std::size_t axis = 0; axis < kAxisCount; ++axis) {
+      solvers_[axis] = std::make_unique<axis_mpc::Solver>(
+        axisConfiguration(config, axis, axis == 2));
+    }
   }
 
-  void reset() noexcept
+  void reset() noexcept {reset({0.0, 0.0, 0.0});}
+
+  void reset(const Vector3 &input_memory) noexcept
   {
-    last_input_ = {0.0, 0.0, 0.0};
-    solver_x_.reset();
-    solver_y_.reset();
-    solver_z_.reset();
+    last_input_ = input_memory;
+    for (const auto &solver : solvers_) {
+      solver->reset();
+    }
   }
 
   UpdateResult update(const MeasuredState &measured, const ReferenceHorizon &reference)
   {
-    UpdateResult result;
-    if (!validConfig(config_) || !solver_x_.configured()
-      || !solver_y_.configured() || !solver_z_.configured()) {
-      result.failure_reason = FailureReason::invalid_configuration;
-      return result;
+    UpdateResult output;
+    if (!validConfig(config_) || !std::all_of(
+        solvers_.begin(), solvers_.end(),
+        [](const auto &solver) {return solver && solver->configured();})) {
+      output.failure_reason = FailureReason::invalid_configuration;
+      return output;
     }
-    if (!finite(measured.position) || !finite(measured.velocity) || !finite(measured.acceleration)) {
-      result.failure_reason = FailureReason::invalid_measured_state;
-      return result;
+    if (!finite(measured.position) || !finite(measured.velocity)
+      || !finite(measured.acceleration)) {
+      output.failure_reason = FailureReason::invalid_measured_state;
+      return output;
     }
-    for (const auto &point : reference.points) {
-      if (!finite(point)) {
-        result.failure_reason = FailureReason::invalid_reference;
-        return result;
-      }
-    }
-
-    setInitialState(measured);
-    packReference(reference);
-    const auto start = std::chrono::steady_clock::now();
-    const auto x_solve = solver_x_.solve(initial_x_, reference_x_, last_input_[0]);
-    const auto y_solve = solver_y_.solve(initial_y_, reference_y_, last_input_[1]);
-    const auto z_solve = solver_z_.solve(initial_z_, reference_z_, last_input_[2]);
-    result.iterations = {x_solve.iterations, y_solve.iterations, z_solve.iterations};
-    result.solve_time_seconds = std::chrono::duration<double>(
-      std::chrono::steady_clock::now() - start).count();
-
-    if (!x_solve.valid || !y_solve.valid || !z_solve.valid) {
-      result.failure_reason = FailureReason::solver_not_converged;
-      return result;
+    if (!std::all_of(reference.points.begin(), reference.points.end(),
+      [](const ReferencePoint &point) {return finite(point);})) {
+      output.failure_reason = FailureReason::invalid_reference;
+      return output;
     }
 
-    prediction_x_ = x_solve.prediction;
-    prediction_y_ = y_solve.prediction;
-    prediction_z_ = z_solve.prediction;
-    result.control = {
-      x_solve.first_control, y_solve.first_control, z_solve.first_control};
-    result.first_predicted_acceleration = {
-      prediction_x_[0](2), prediction_y_[0](2), prediction_z_[0](2)};
-
-    for (std::size_t step = 0; step < kHorizonLength; ++step) {
-      for (std::size_t axis = 0; axis < kAxisCount; ++axis) {
-        const axis_mpc::Prediction *prediction = axis == 0 ? &prediction_x_
-          : (axis == 1 ? &prediction_y_ : &prediction_z_);
-        for (std::size_t state = 0; state < kStateSize; ++state) {
-          result.prediction[step * 9 + axis * 3 + state] =
-            (*prediction)[step](static_cast<Eigen::Index>(state));
-        }
-      }
+    setInputs(measured, reference);
+    const auto start = axis_mpc::Clock::now();
+    const auto deadline = start + std::chrono::duration_cast<axis_mpc::Clock::duration>(
+      std::chrono::duration<double>(config_.solver_deadline_seconds));
+    for (std::size_t axis = 0; axis < kAxisCount; ++axis) {
+      output.axes[axis] = solvers_[axis]->solve(
+        initial_[axis], references_[axis], last_input_[axis], deadline);
+      output.deadline_missed = output.deadline_missed
+        || output.axes[axis].status == axis_mpc::Status::deadline_exceeded;
     }
-    if (!std::isfinite(result.solve_time_seconds)
-      || !finite(result.control) || !finite(result.first_predicted_acceleration)
-      || !std::all_of(result.prediction.begin(), result.prediction.end(),
-        [](double value) {return std::isfinite(value);})) {
-      result.failure_reason = FailureReason::non_finite_solver_output;
-      return result;
+    output.solve_time_seconds = std::chrono::duration<double>(
+      axis_mpc::Clock::now() - start).count();
+    if (!std::all_of(output.axes.begin(), output.axes.end(),
+      [](const axis_mpc::Result &result) {return result.valid;})) {
+      output.failure_reason = FailureReason::solver_not_converged;
+      return output;
     }
 
-    // The rate-limit memory advances only after all three axis solves and
-    // their outputs have passed validation.
-    last_input_ = result.control;
-    result.valid = true;
-    result.failure_reason = FailureReason::none;
-    return result;
+    for (std::size_t axis = 0; axis < kAxisCount; ++axis) {
+      output.control[axis] = output.axes[axis].first_control;
+      output.first_predicted_acceleration[axis] = output.axes[axis].prediction[0](2);
+    }
+    if (!std::isfinite(output.solve_time_seconds) || !finite(output.control)
+      || !finite(output.first_predicted_acceleration)) {
+      output.failure_reason = FailureReason::non_finite_solver_output;
+      return output;
+    }
+
+    last_input_ = output.control;
+    output.valid = true;
+    output.failure_reason = FailureReason::none;
+    return output;
   }
 
 private:
   static axis_mpc::Configuration axisConfiguration(
-    const Config &config, std::size_t axis, const std::array<double, 3> &stage_weights,
-    const std::array<double, 3> &terminal_weights, double max_speed,
-    double max_acceleration, double max_control, double max_control_rate)
+    const Config &config, std::size_t axis, bool vertical)
   {
     axis_mpc::Configuration output;
     output.dt_first = config.dt_first;
     output.dt_later = config.dt_later;
-    output.model_alpha = config.model_alpha_xyz[axis];
     output.model_time_constant = config.model_time_constant_xyz[axis];
-    output.stage_weights = stage_weights;
-    output.terminal_weights = terminal_weights;
-    output.max_speed = max_speed;
-    output.max_acceleration = max_acceleration;
-    output.max_control = max_control;
-    output.max_control_rate = max_control_rate;
+    output.stage_weights = vertical ? config.q_z : config.q_xy;
+    output.terminal_weights = vertical ? config.s_z : config.s_xy;
+    output.max_speed = vertical ? config.max_speed_z : config.max_speed_xy;
+    output.max_acceleration = vertical ?
+      config.max_acceleration_z : config.max_acceleration_xy;
+    output.max_control = vertical ? config.max_control_z : config.max_control_xy;
+    output.max_control_rate = vertical ?
+      config.max_control_rate_z : config.max_control_rate_xy;
     output.max_iterations = config.max_iterations;
     output.admm_rho = config.admm_rho;
     output.absolute_tolerance = config.solver_absolute_tolerance;
@@ -346,42 +326,27 @@ private:
     return output;
   }
 
-  void setInitialState(const MeasuredState &measured)
+  void setInputs(
+    const MeasuredState &measured,
+    const ReferenceHorizon &reference) noexcept
   {
-    initial_x_ = axis_mpc::State(measured.position[0], measured.velocity[0], measured.acceleration[0]);
-    initial_y_ = axis_mpc::State(measured.position[1], measured.velocity[1], measured.acceleration[1]);
-    initial_z_ = axis_mpc::State(measured.position[2], measured.velocity[2], measured.acceleration[2]);
-  }
-
-  void packReference(const ReferenceHorizon &reference)
-  {
-    for (std::size_t i = 0; i < kHorizonLength; ++i) {
-      reference_x_[i] = axis_mpc::State(
-        reference.points[i].position[0], reference.points[i].velocity[0],
-        reference.points[i].acceleration[0]);
-      reference_y_[i] = axis_mpc::State(
-        reference.points[i].position[1], reference.points[i].velocity[1],
-        reference.points[i].acceleration[1]);
-      reference_z_[i] = axis_mpc::State(
-        reference.points[i].position[2], reference.points[i].velocity[2],
-        reference.points[i].acceleration[2]);
+    for (std::size_t axis = 0; axis < kAxisCount; ++axis) {
+      initial_[axis] = axis_mpc::State(
+        measured.position[axis], measured.velocity[axis], measured.acceleration[axis]);
+      for (std::size_t step = 0; step < kHorizonLength; ++step) {
+        references_[axis][step] = axis_mpc::State(
+          reference.points[step].position[axis],
+          reference.points[step].velocity[axis],
+          reference.points[step].acceleration[axis]);
+      }
     }
   }
 
   Config config_;
-  axis_mpc::Solver solver_x_;
-  axis_mpc::Solver solver_y_;
-  axis_mpc::Solver solver_z_;
-  axis_mpc::State initial_x_ = axis_mpc::State::Zero();
-  axis_mpc::State initial_y_ = axis_mpc::State::Zero();
-  axis_mpc::State initial_z_ = axis_mpc::State::Zero();
-  axis_mpc::Reference reference_x_{};
-  axis_mpc::Reference reference_y_{};
-  axis_mpc::Reference reference_z_{};
-  axis_mpc::Prediction prediction_x_{};
-  axis_mpc::Prediction prediction_y_{};
-  axis_mpc::Prediction prediction_z_{};
-  std::array<double, 3> last_input_{0.0, 0.0, 0.0};
+  std::array<std::unique_ptr<axis_mpc::Solver>, kAxisCount> solvers_{};
+  std::array<axis_mpc::State, 3> initial_{};
+  std::array<axis_mpc::Reference, 3> references_{};
+  Vector3 last_input_{};
 };
 
 }  // namespace mpc_controller::translational

@@ -1,10 +1,6 @@
-reference_generator_node:
-  ros__parameters:
-    # Follow measured position/yaw before Offboard, then freeze at the rising edge.
-    auto_capture_current_hold: true
-
 px4_torque_thrust_setpoint_node:
   ros__parameters:
+    # SO(3) tuning profile; HTE and allocator feedback come from the active PX4.
     # Direct torque/thrust inner loop.
     publish_rate_hz: 250.0
     heartbeat_rate_hz: 10.0
@@ -16,8 +12,6 @@ px4_torque_thrust_setpoint_node:
     # Rate-limited HTE tracking avoids thrust steps.
     hover_thrust_tracking_time_constant_seconds: 2.0
     hover_thrust_max_rate_per_second: 0.02
-    vehicle_mass: 2.0
-    gravity: 9.80665
     # Fallback used only when PX4 HTE is unavailable.
     hover_thrust_normalized: 0.60
     # Geometric SO(3) feedback and desired-rate estimation.
@@ -32,10 +26,3 @@ px4_torque_thrust_setpoint_node:
     enable_dynamics_compensation: false
     normalized_inertia: [0.0, 0.0, 0.0]
     normalized_torque_limit: [0.30, 0.30, 0.20]
-
-mpc_controller_node:
-  ros__parameters:
-    # Optional validation and collective-force projection.
-    strict_validation: false
-    enable_thrust_feasibility: false
-    use_force_norm_for_collective_thrust: true

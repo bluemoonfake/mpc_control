@@ -29,6 +29,8 @@ public:
   ReferenceGeneratorNode()
   : Node("reference_generator_node")
   {
+    // Declare one configuration surface for both autonomous trajectories and
+    // the rolling joystick planner. Mode-specific settings remain dormant.
     declare_parameter("reference_input_mode", reference_input_mode_);
     declare_parameter("frame_id", frame_id_);
     declare_parameter("hold_position", std::vector<double>{0.0, 0.0, 1.0});
@@ -51,15 +53,33 @@ public:
     declare_parameter("manual_input_timeout_seconds", manual_timeout_);
     declare_parameter("manual_update_rate_hz", manual_rate_hz_);
     declare_parameter("manual_stick_deadband", manual_deadband_);
-    declare_parameter("manual_max_horizontal_speed_m_s", manual_speed_xy_);
-    declare_parameter("manual_max_vertical_speed_m_s", manual_speed_z_);
-    declare_parameter("manual_max_horizontal_acceleration_m_s2", manual_accel_xy_);
-    declare_parameter("manual_max_vertical_acceleration_m_s2", manual_accel_z_);
+    declare_parameter("manual_max_horizontal_speed_m_s", planner_config_.max_speed_xy);
+    declare_parameter("manual_max_vertical_speed_m_s", planner_config_.max_speed_z);
+    declare_parameter(
+      "manual_max_horizontal_acceleration_m_s2", planner_config_.max_acceleration_xy);
+    declare_parameter(
+      "manual_max_vertical_acceleration_m_s2", planner_config_.max_acceleration_z);
+    declare_parameter("manual_max_horizontal_jerk_m_s3", planner_config_.max_jerk_xy);
+    declare_parameter("manual_max_vertical_jerk_m_s3", planner_config_.max_jerk_z);
     declare_parameter("manual_max_yaw_rate_rad_s", manual_yaw_rate_max_);
     declare_parameter("manual_max_horizontal_position_error_m", manual_lead_xy_);
     declare_parameter("manual_max_vertical_position_error_m", manual_lead_z_);
+    declare_parameter("planner_horizon_seconds", planner_config_.horizon_seconds);
+    declare_parameter("planner_sample_period_seconds", planner_config_.sample_seconds);
+    declare_parameter("planner_velocity_response_seconds", planner_config_.response_seconds);
+    declare_parameter(
+      "planner_heading_offsets_deg", std::vector<double>{-45.0, -30.0, -15.0, 0.0, 15.0, 30.0, 45.0});
+    declare_parameter("planner_speed_scales", planner_config_.speed_scales);
+    declare_parameter("planner_intent_weight", planner_config_.intent_weight);
+    declare_parameter("planner_progress_weight", planner_config_.progress_weight);
+    declare_parameter("planner_acceleration_weight", planner_config_.acceleration_weight);
+    declare_parameter("planner_jerk_weight", planner_config_.jerk_weight);
+    declare_parameter("planner_switch_weight", planner_config_.switch_weight);
+    declare_parameter("planner_hysteresis", planner_config_.hysteresis);
     declare_parameter("visualization_max_prediction_points", visualization_max_prediction_points_);
 
+    // Load parameters once at startup; runtime mutation is intentionally not
+    // supported so one flight uses one deterministic reference profile.
     get_parameter("reference_input_mode", reference_input_mode_);
     get_parameter("frame_id", frame_id_);
     valid_config_ = true;
@@ -83,15 +103,38 @@ public:
     get_parameter("manual_input_timeout_seconds", manual_timeout_);
     get_parameter("manual_update_rate_hz", manual_rate_hz_);
     get_parameter("manual_stick_deadband", manual_deadband_);
-    get_parameter("manual_max_horizontal_speed_m_s", manual_speed_xy_);
-    get_parameter("manual_max_vertical_speed_m_s", manual_speed_z_);
-    get_parameter("manual_max_horizontal_acceleration_m_s2", manual_accel_xy_);
-    get_parameter("manual_max_vertical_acceleration_m_s2", manual_accel_z_);
+    get_parameter("manual_max_horizontal_speed_m_s", planner_config_.max_speed_xy);
+    get_parameter("manual_max_vertical_speed_m_s", planner_config_.max_speed_z);
+    get_parameter(
+      "manual_max_horizontal_acceleration_m_s2", planner_config_.max_acceleration_xy);
+    get_parameter(
+      "manual_max_vertical_acceleration_m_s2", planner_config_.max_acceleration_z);
+    get_parameter("manual_max_horizontal_jerk_m_s3", planner_config_.max_jerk_xy);
+    get_parameter("manual_max_vertical_jerk_m_s3", planner_config_.max_jerk_z);
     get_parameter("manual_max_yaw_rate_rad_s", manual_yaw_rate_max_);
     get_parameter("manual_max_horizontal_position_error_m", manual_lead_xy_);
     get_parameter("manual_max_vertical_position_error_m", manual_lead_z_);
+    get_parameter("planner_horizon_seconds", planner_config_.horizon_seconds);
+    get_parameter("planner_sample_period_seconds", planner_config_.sample_seconds);
+    get_parameter("planner_velocity_response_seconds", planner_config_.response_seconds);
+    const auto heading_offsets_deg = get_parameter("planner_heading_offsets_deg").as_double_array();
+    planner_config_.heading_offsets_rad.clear();
+    planner_config_.heading_offsets_rad.reserve(heading_offsets_deg.size());
+    constexpr double degrees_to_radians = 0.017453292519943295;
+    for (double offset : heading_offsets_deg) {
+      planner_config_.heading_offsets_rad.push_back(offset * degrees_to_radians);
+    }
+    planner_config_.speed_scales = get_parameter("planner_speed_scales").as_double_array();
+    get_parameter("planner_intent_weight", planner_config_.intent_weight);
+    get_parameter("planner_progress_weight", planner_config_.progress_weight);
+    get_parameter("planner_acceleration_weight", planner_config_.acceleration_weight);
+    get_parameter("planner_jerk_weight", planner_config_.jerk_weight);
+    get_parameter("planner_switch_weight", planner_config_.switch_weight);
+    get_parameter("planner_hysteresis", planner_config_.hysteresis);
     get_parameter("visualization_max_prediction_points", visualization_max_prediction_points_);
 
+    // Circle period and ramp are derived, not independently tuned, so radius,
+    // speed and centripetal acceleration cannot contradict each other.
     const auto circle_timing = mpc_controller::reference::deriveCircleTiming(
       parameters_.circle_radius, circle_reference_speed_limit_m_s_,
       circle_acceleration_limit_m_s2_);
@@ -118,13 +161,10 @@ public:
       && std::isfinite(manual_rate_hz_) && manual_rate_hz_ > 0.0
       && std::isfinite(manual_deadband_) && manual_deadband_ >= 0.0
       && manual_deadband_ < 1.0
-      && std::isfinite(manual_speed_xy_) && manual_speed_xy_ > 0.0
-      && std::isfinite(manual_speed_z_) && manual_speed_z_ > 0.0
-      && std::isfinite(manual_accel_xy_) && manual_accel_xy_ > 0.0
-      && std::isfinite(manual_accel_z_) && manual_accel_z_ > 0.0
       && std::isfinite(manual_yaw_rate_max_) && manual_yaw_rate_max_ > 0.0
       && std::isfinite(manual_lead_xy_) && manual_lead_xy_ > 0.0
       && std::isfinite(manual_lead_z_) && manual_lead_z_ > 0.0
+      && mpc_controller::reference::valid(planner_config_)
       && visualization_max_prediction_points_ > 0
       && !frame_id_.empty();
     if (!valid_config_) {
@@ -137,6 +177,8 @@ public:
         parameters_.circle_radius, circle_cruise_speed_m_s_,
         parameters_.circle_ramp_seconds, parameters_.circle_period_seconds,
         circle_acceleration_limit_m_s2_);
+      // ROS wiring: measured state/manual input enter here; exactly one
+      // ReferenceTrajectory stream leaves this node.
       publisher_ = create_publisher<Reference>("reference_trajectory", 10);
       step_subscription_ = create_subscription<ReferenceStep>("reference_step", 10,std::bind(&ReferenceGeneratorNode::referenceStepCallback, this, std::placeholders::_1));
       state_subscription_ = create_subscription<State>(
@@ -184,15 +226,20 @@ public:
             manual_received_at_ = SteadyClock::now();
           });
       }
+      mpc_output_subscription_ = create_subscription<MpcOutput>(
+        "mpc_translational_output", rclcpp::QoS(10),
+        [this](MpcOutput::SharedPtr message) {
+          if (!message) return;
+          latest_mpc_output_ = *message;
+          mpc_output_received_at_ = SteadyClock::now();
+          if (!message->valid) cancelTrajectoryForMpcFailure();
+          if (visualization_enabled_) publishVisualization();
+        });
       if (visualization_enabled_) {
         visualization_publisher_ = create_publisher<MarkerArray>("mpc_visualization", rclcpp::QoS(1).transient_local());
-        mpc_output_subscription_ = create_subscription<MpcOutput>("mpc_translational_output", rclcpp::QoS(10),
-          [this](MpcOutput::SharedPtr message) {
-            if (!message) return;
-            latest_mpc_output_ = *message;
-            publishVisualization();
-          });
-        RCLCPP_INFO(get_logger(),"MPC visualization enabled on /mpc_visualization: user=green safe=red prediction=cyan");
+        RCLCPP_INFO(
+          get_logger(),
+          "MPC visualization enabled: user=green reference=red prediction=cyan");
       }
       timer_ = create_wall_timer(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(1.0 / publish_rate_hz_)),
@@ -202,9 +249,14 @@ public:
           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(1.0 / manual_rate_hz_)),
           std::bind(&ReferenceGeneratorNode::manualUpdate, this));
         RCLCPP_INFO(get_logger(),
-          "Manual velocity reference enabled: horizontal=%.2f m/s vertical=%.2f m/s "
-          "acceleration_xy=%.2f m/s^2 acceleration_z=%.2f m/s^2 yaw_rate=%.2f rad/s ""deadband=%.2f",
-          manual_speed_xy_, manual_speed_z_, manual_accel_xy_, manual_accel_z_, manual_yaw_rate_max_, manual_deadband_);
+          "Predictive joystick planner enabled: horizon=%.2f s candidates=%zu "
+          "speed=[%.2f %.2f] m/s acceleration=[%.2f %.2f] m/s^2 "
+          "jerk=[%.2f %.2f] m/s^3",
+          planner_config_.horizon_seconds,
+          planner_config_.heading_offsets_rad.size() * planner_config_.speed_scales.size() + 1U,
+          planner_config_.max_speed_xy, planner_config_.max_speed_z,
+          planner_config_.max_acceleration_xy, planner_config_.max_acceleration_z,
+          planner_config_.max_jerk_xy, planner_config_.max_jerk_z);
       }
     }
   }
@@ -226,6 +278,7 @@ private:
   {
     std::array<double, 3> position{};
     std::array<double, 3> velocity{};
+    std::array<double, 3> acceleration{};
     double yaw = 0.0;
     std::uint64_t timestamp = 0;
     bool valid = false;
@@ -234,6 +287,35 @@ private:
   bool manualVelocityMode() const noexcept
   {
     return reference_input_mode_ == "manual_velocity";
+  }
+
+  bool mpcHealthy() const noexcept
+  {
+    return latest_mpc_output_ && mpc_output_received_at_
+      && latest_mpc_output_->valid && !latest_mpc_output_->recovery_command_active
+      && std::chrono::duration<double>(SteadyClock::now() - *mpc_output_received_at_).count()
+      <= state_timeout_seconds_;
+  }
+
+  void cancelTrajectoryForMpcFailure()
+  {
+    if (!offboard_active_ || (parameters_.type != "line" && parameters_.type != "circle")) {
+      return;
+    }
+    const std::string cancelled = parameters_.type;
+    parameters_.type = "hold";
+    line_started_at_.reset();
+    circle_started_at_.reset();
+    if (latest_input_ && latest_input_->valid) {
+      parameters_.hold_position = latest_input_->position;
+      parameters_.hold_yaw_rad = latest_input_->yaw;
+      hold_reference_captured_ = true;
+    }
+    publish();
+    RCLCPP_ERROR(
+      get_logger(),
+      "%s cancelled because MPC became invalid; current position/yaw changed to hold",
+      cancelled.c_str());
   }
 
   void stateCallback(const State::SharedPtr message)
@@ -254,6 +336,12 @@ private:
     StateInput input;
     input.position = {message->position[0], message->position[1], message->position[2]};
     input.velocity = {message->velocity[0], message->velocity[1], message->velocity[2]};
+    const std::array<double, 3> measured_acceleration{
+      message->acceleration[0], message->acceleration[1], message->acceleration[2]};
+    if (message->acceleration_valid
+      && mpc_controller::reference::finite(measured_acceleration)) {
+      input.acceleration = measured_acceleration;
+    }
     input.yaw = message->yaw;
     input.timestamp = static_cast<std::uint64_t>(timestamp);
     input.valid = message->valid && message->position_valid && message->velocity_valid
@@ -371,6 +459,11 @@ private:
       response->message = "circle rejected: a captured hold reference is not active";
       return;
     }
+    if (!mpcHealthy()) {
+      response->success = false;
+      response->message = "circle rejected: MPC output is stale, invalid, or recovering";
+      return;
+    }
 
     // phase=0 starts at center+[radius, 0, 0]. Offset the center so the
     // circle begins exactly at the captured hold, without a position jump.
@@ -452,7 +545,7 @@ private:
     marker.ns = name;
     marker.id = id;
     marker.type = Marker::ARROW;
-    marker.action = valid ? Marker::ADD : Marker::DELETE;
+    marker.action = Marker::DELETE;
     marker.scale.x = 0.055;
     marker.scale.y = 0.13;
     marker.scale.z = 0.18;
@@ -478,6 +571,7 @@ private:
     end.y += visualization_arrow_length_m_ * direction[1] / magnitude;
     end.z += visualization_arrow_length_m_ * direction[2] / magnitude;
     marker.points = {start, end};
+    marker.action = Marker::ADD;
     return marker;
   }
 
@@ -518,35 +612,36 @@ private:
       direction[0] /= horizontal_norm;
       direction[1] /= horizontal_norm;
     }
-    direction[0] *= manual_speed_xy_;
-    direction[1] *= manual_speed_xy_;
-    direction[2] = std::clamp(direction[2], -1.0, 1.0) * manual_speed_z_;
+    direction[0] *= planner_config_.max_speed_xy;
+    direction[1] *= planner_config_.max_speed_xy;
+    direction[2] = std::clamp(direction[2], -1.0, 1.0) * planner_config_.max_speed_z;
     return direction;
   }
 
-  std::array<double, 3> limitVelocity(
-    const std::array<double, 3> &current, const std::array<double, 3> &target,
-    double dt) const noexcept
+  mpc_controller::reference::PlannerState plannerState() const noexcept
   {
-    std::array<double, 3> output = current;
-    double delta_x = target[0] - current[0];
-    double delta_y = target[1] - current[1];
-    const double delta_xy = std::hypot(delta_x, delta_y);
-    const double max_delta_xy = manual_accel_xy_ * dt;
-    if (delta_xy > max_delta_xy && delta_xy > 0.0) {
-      const double scale = max_delta_xy / delta_xy;
-      delta_x *= scale;
-      delta_y *= scale;
-    }
-    output[0] += delta_x;
-    output[1] += delta_y;
-    const double max_delta_z = manual_accel_z_ * dt;
-    output[2] += std::clamp(target[2] - current[2], -max_delta_z, max_delta_z);
-    return output;
+    return {manual_position_, manual_velocity_, manual_acceleration_};
+  }
+
+  void setPlannerState(const mpc_controller::reference::PlannerState &state) noexcept
+  {
+    manual_position_ = state.position;
+    manual_velocity_ = state.velocity;
+    manual_acceleration_ = state.acceleration;
+  }
+
+  bool collisionFree(
+    const std::vector<mpc_controller::reference::Sample> &) const noexcept
+  {
+    // Obstacle sensing is intentionally absent in this development stage.
+    // This interface becomes the hard collision check without changing MPC.
+    return true;
   }
 
   bool resetManual()
   {
+    // Start a manual session from measured p/v/a and captured yaw. Clamping
+    // only initializes the reference model; measured controller feedback is untouched.
     if (!latest_input_ || !last_state_received_at_ || !latest_input_->valid ||
       !mpc_controller::reference::finite(latest_input_->position) ||
       !mpc_controller::reference::finite(latest_input_->velocity) ||
@@ -561,12 +656,26 @@ private:
     manual_velocity_ = latest_input_->velocity;
     const double horizontal_speed = std::hypot(
       manual_velocity_[0], manual_velocity_[1]);
-    if (horizontal_speed > manual_speed_xy_) {
-      const double scale = manual_speed_xy_ / horizontal_speed;
+    if (horizontal_speed > planner_config_.max_speed_xy) {
+      const double scale = planner_config_.max_speed_xy / horizontal_speed;
       manual_velocity_[0] *= scale;
       manual_velocity_[1] *= scale;
     }
-    manual_velocity_[2] = std::clamp(manual_velocity_[2], -manual_speed_z_, manual_speed_z_);
+    manual_velocity_[2] = std::clamp(
+      manual_velocity_[2], -planner_config_.max_speed_z, planner_config_.max_speed_z);
+    manual_acceleration_ = latest_input_->acceleration;
+    const double horizontal_acceleration = std::hypot(
+      manual_acceleration_[0], manual_acceleration_[1]);
+    if (horizontal_acceleration > planner_config_.max_acceleration_xy) {
+      const double scale = planner_config_.max_acceleration_xy / horizontal_acceleration;
+      manual_acceleration_[0] *= scale;
+      manual_acceleration_[1] *= scale;
+    }
+    manual_acceleration_[2] = std::clamp(
+      manual_acceleration_[2], -planner_config_.max_acceleration_z,
+      planner_config_.max_acceleration_z);
+    manual_target_velocity_ = manual_velocity_;
+    selected_candidate_id_ = -1;
     manual_yaw_ = wrapAngle(latest_input_->yaw);
     parameters_.hold_yaw_rad = manual_yaw_;
     manual_updated_at_ = SteadyClock::now();
@@ -592,78 +701,93 @@ private:
       -manual_lead_z_, manual_lead_z_);
   }
 
-  void updateSafeDirection(const Reference &message)
+  void updateReferenceDirection(const Reference &message)
   {
-    safe_direction_valid_ = false;
-    safe_direction_enu_ = {0.0, 0.0, 0.0};
+    reference_direction_valid_ = false;
+    reference_direction_enu_ = {0.0, 0.0, 0.0};
     for (const auto &point : message.points) {
       const std::array<double, 3> direction{
         point.velocity[0], point.velocity[1], point.velocity[2]};
       if (norm(direction) > visualization_direction_deadband_) {
-        safe_direction_enu_ = direction;
-        safe_direction_valid_ = true;
+        reference_direction_enu_ = direction;
+        reference_direction_valid_ = true;
         break;
       }
     }
-    if (!safe_direction_valid_ && latest_input_ && !message.points.empty()) {
+    if (!reference_direction_valid_ && latest_input_ && !message.points.empty()) {
       const auto &target = message.points.front().position;
       const std::array<double, 3> displacement{
         target[0] - latest_input_->position[0],
         target[1] - latest_input_->position[1],
         target[2] - latest_input_->position[2]};
       if (norm(displacement) > visualization_direction_deadband_) {
-        safe_direction_enu_ = displacement;
-        safe_direction_valid_ = true;
+        reference_direction_enu_ = displacement;
+        reference_direction_valid_ = true;
       }
     }
   }
 
   void publishManual()
   {
+    // Re-plan the full rolling horizon, publish only the selected candidate,
+    // and retain it for the next-cycle branch memory and RViz overlay.
     if (!manual_ready_) return;
-    const uint64_t sample_ns = static_cast<uint64_t>(std::llround(sample_period_seconds_ * 1.0e9));
-    const uint64_t horizon_ns = static_cast<uint64_t>(std::llround(horizon_seconds_ * 1.0e9));
+    const uint64_t sample_ns = static_cast<uint64_t>(
+      std::llround(planner_config_.sample_seconds * 1.0e9));
     if (sample_ns == 0) return;
+
+    const auto intent = targetVelocity();
+    const auto plan = mpc_controller::reference::selectPlan(
+      planner_config_, plannerState(), intent, selected_candidate_id_,
+      [this](const std::vector<mpc_controller::reference::Sample> &samples) {
+        return collisionFree(samples);
+      });
+    if (!plan.valid || plan.selected.samples.empty()) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "Predictive joystick planner found no dynamically feasible candidate");
+      return;
+    }
 
     Reference message;
     message.header.stamp = get_clock()->now();
     message.header.frame_id = frame_id_;
     message.trajectory_id = trajectory_id_++;
     message.hold_after_end = true;
-    const uint64_t count = horizon_ns / sample_ns + 1;
-    message.points.reserve(static_cast<std::size_t>(count));
-    const auto target_velocity = targetVelocity();
+    message.points.reserve(plan.selected.samples.size());
     const double yaw_rate = targetYawRate();
-    auto position = manual_position_;
-    auto velocity = manual_velocity_;
-    double yaw = manual_yaw_;
-    for (uint64_t index = 0; index < count; ++index) {
-      const auto next_velocity = limitVelocity(
-        velocity, target_velocity, sample_period_seconds_);
+    for (std::size_t index = 0; index < plan.selected.samples.size(); ++index) {
+      const auto &sample = plan.selected.samples[index];
       Point point;
       point.time_from_start = durationMessage(index * sample_ns);
-      point.position = position;
-      point.velocity = velocity;
-      for (std::size_t axis = 0; axis < 3; ++axis) {
-        point.acceleration[axis] =
-          (next_velocity[axis] - velocity[axis]) / sample_period_seconds_;
-      }
-      point.yaw = yaw;
+      point.position = sample.position;
+      point.velocity = sample.velocity;
+      point.acceleration = sample.acceleration;
+      point.yaw = wrapAngle(
+        manual_yaw_ + yaw_rate * planner_config_.sample_seconds * static_cast<double>(index));
       point.yaw_rate = yaw_rate;
       message.points.push_back(point);
-      for (std::size_t axis = 0; axis < 3; ++axis) {
-        position[axis] += 0.5 * (velocity[axis] + next_velocity[axis])
-          * sample_period_seconds_;
-      }
-      velocity = next_velocity;
-      yaw = wrapAngle(yaw + yaw_rate * sample_period_seconds_);
     }
-    updateSafeDirection(message);
+    selected_candidate_id_ = plan.selected.id;
+    selected_candidate_cost_ = plan.selected.cost;
+    feasible_candidate_count_ = plan.feasible_count;
+    manual_target_velocity_ = plan.selected.target_velocity;
+    last_reference_ = message;
+    updateReferenceDirection(message);
     publisher_->publish(message);
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "Planner candidate=%d feasible=%d cost=%.3f intent=[%.2f %.2f %.2f] "
+      "selected=[%.2f %.2f %.2f]",
+      selected_candidate_id_, feasible_candidate_count_, selected_candidate_cost_,
+      intent[0], intent[1], intent[2], manual_target_velocity_[0],
+      manual_target_velocity_[1], manual_target_velocity_[2]);
   }
 
   void manualUpdate()
   {
+    // Receding-horizon policy: execute one short step of the previously chosen
+    // primitive, correct excessive reference lead, then optimize again.
     if (!manualVelocityMode() || !offboard_active_) return;
     if (!manual_ready_ && !resetManual()) {
       RCLCPP_WARN_THROTTLE(
@@ -679,15 +803,11 @@ private:
     }
     if (!std::isfinite(dt) || dt <= 0.0) return;
     dt = std::min(dt, 2.0 / manual_rate_hz_);
-    const auto target_velocity = targetVelocity();
     const double yaw_rate = targetYawRate();
-    const auto next_velocity = limitVelocity(manual_velocity_, target_velocity, dt);
-    for (std::size_t axis = 0; axis < 3; ++axis) {
-      manual_position_[axis] += 0.5 * (manual_velocity_[axis] + next_velocity[axis]) * dt;
-    }
+    setPlannerState(mpc_controller::reference::advance(
+      planner_config_, plannerState(), manual_target_velocity_, dt));
     limitManualLead();
     manual_yaw_ = wrapAngle(manual_yaw_ + yaw_rate * dt);
-    manual_velocity_ = next_velocity;
     manual_updated_at_ = current_time;
     parameters_.hold_position = manual_position_;
     parameters_.hold_yaw_rad = manual_yaw_;
@@ -704,7 +824,6 @@ private:
     marker.type = Marker::LINE_STRIP;
     marker.action = Marker::DELETE;
     marker.scale.x = 0.045;
-    marker.color.r = 0.0F;
     marker.color.g = 0.85F;
     marker.color.b = 1.0F;
     marker.color.a = 0.95F;
@@ -742,8 +861,38 @@ private:
     return marker;
   }
 
+  Marker selectedPathMarker() const
+  {
+    Marker marker;
+    marker.header.stamp = get_clock()->now();
+    marker.header.frame_id = frame_id_;
+    marker.ns = "selected_reference_path";
+    marker.id = 3;
+    marker.type = Marker::LINE_STRIP;
+    marker.action = Marker::DELETE;
+    marker.scale.x = 0.055;
+    marker.color.r = 1.0F;
+    marker.color.g = 0.1F;
+    marker.color.b = 0.05F;
+    marker.color.a = 0.95F;
+    if (!last_reference_ || last_reference_->points.size() < 2U) return marker;
+    marker.points.reserve(last_reference_->points.size());
+    for (const auto &sample : last_reference_->points) {
+      geometry_msgs::msg::Point point;
+      point.x = sample.position[0];
+      point.y = sample.position[1];
+      point.z = sample.position[2];
+      if (std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z)) {
+        marker.points.push_back(point);
+      }
+    }
+    if (marker.points.size() >= 2U) marker.action = Marker::ADD;
+    return marker;
+  }
+
   void publishVisualization()
   {
+    // Marker contract: user intent=green, selected reference=red, MPC=cyan.
     if (!visualization_publisher_) return;
     const auto current_time = SteadyClock::now();
     if (last_visualization_published_at_) {
@@ -758,14 +907,17 @@ private:
     markers.markers.push_back(directionMarker(
       0, "user_direction", manual_direction, manual_valid, 1.0e-6, 0.0F, 1.0F, 0.0F));
     markers.markers.push_back(directionMarker(
-      1, "safe_direction", safe_direction_enu_, safe_direction_valid_,
+      1, "reference_direction", reference_direction_enu_, reference_direction_valid_,
       visualization_direction_deadband_, 1.0F, 0.0F, 0.0F));
     markers.markers.push_back(predictedPathMarker());
+    markers.markers.push_back(selectedPathMarker());
     visualization_publisher_->publish(markers);
   }
 
   void publish()
   {
+    // Autonomous hold/line/circle publisher. Manual ACTIVE publication is
+    // owned by manualUpdate() at the higher joystick update rate.
     // The high-rate manual timer owns ReferenceTrajectory while Offboard is
     // active. Keep this low-rate timer only for prestream hold publication.
     if (manualVelocityMode() && offboard_active_) return;
@@ -781,6 +933,23 @@ private:
       return;
     }
 
+    const auto steady_now = SteadyClock::now();
+    if (parameters_.type == "line" && line_started_at_
+      && std::chrono::duration<double>(steady_now - *line_started_at_).count()
+      >= parameters_.line_duration_seconds) {
+      parameters_.hold_position = parameters_.line_end;
+      parameters_.type = "hold";
+      line_started_at_.reset();
+      RCLCPP_INFO(get_logger(), "Line completed; endpoint promoted to hold");
+    } else if (parameters_.type == "circle" && circle_started_at_
+      && std::chrono::duration<double>(steady_now - *circle_started_at_).count()
+      >= parameters_.circle_period_seconds) {
+      // A complete lap returns exactly to its captured start position.
+      parameters_.type = "hold";
+      circle_started_at_.reset();
+      RCLCPP_INFO(get_logger(), "Circle completed; start point promoted to hold");
+    }
+
     Reference message;
     message.header.stamp = get_clock()->now();
     message.header.frame_id = frame_id_;
@@ -791,10 +960,10 @@ private:
     double trajectory_elapsed_seconds = 0.0;
     if (parameters_.type == "line" && line_started_at_) {
       trajectory_elapsed_seconds = std::max(
-        0.0, std::chrono::duration<double>(SteadyClock::now() - *line_started_at_).count());
+        0.0, std::chrono::duration<double>(steady_now - *line_started_at_).count());
     } else if (parameters_.type == "circle" && circle_started_at_) {
       trajectory_elapsed_seconds = std::max(
-        0.0, std::chrono::duration<double>(SteadyClock::now() - *circle_started_at_).count());
+        0.0, std::chrono::duration<double>(steady_now - *circle_started_at_).count());
     }
     for (uint64_t index = 0; index < count; ++index) {
       const double time = trajectory_elapsed_seconds +
@@ -824,7 +993,8 @@ private:
       point.yaw_rate = sample.yaw_rate;
       message.points.push_back(point);
     }
-    updateSafeDirection(message);
+    last_reference_ = message;
+    updateReferenceDirection(message);
     publisher_->publish(message);
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 5000,
@@ -850,10 +1020,6 @@ private:
   double manual_timeout_ = 0.25;
   double manual_rate_hz_ = 25.0;
   double manual_deadband_ = 0.08;
-  double manual_speed_xy_ = 2.0;
-  double manual_speed_z_ = 1.0;
-  double manual_accel_xy_ = 1.5;
-  double manual_accel_z_ = 1.0;
   double manual_yaw_rate_max_ = 0.8;
   double manual_lead_xy_ = 2.0;
   double manual_lead_z_ = 1.0;
@@ -873,14 +1039,22 @@ private:
   std::optional<ManualControl> manual_input_;
   std::optional<SteadyClock::time_point> manual_received_at_;
   std::optional<MpcOutput> latest_mpc_output_;
+  std::optional<SteadyClock::time_point> mpc_output_received_at_;
   std::optional<SteadyClock::time_point> last_visualization_published_at_;
   std::optional<SteadyClock::time_point> manual_updated_at_;
   std::array<double, 3> manual_position_{0.0, 0.0, 0.0};
   std::array<double, 3> manual_velocity_{0.0, 0.0, 0.0};
+  std::array<double, 3> manual_acceleration_{0.0, 0.0, 0.0};
+  std::array<double, 3> manual_target_velocity_{0.0, 0.0, 0.0};
+  mpc_controller::reference::PlannerConfig planner_config_{};
+  std::optional<Reference> last_reference_;
+  int selected_candidate_id_ = -1;
+  int feasible_candidate_count_ = 0;
+  double selected_candidate_cost_ = 0.0;
   double manual_yaw_ = 0.0;
   bool manual_ready_ = false;
-  std::array<double, 3> safe_direction_enu_{0.0, 0.0, 0.0};
-  bool safe_direction_valid_ = false;
+  std::array<double, 3> reference_direction_enu_{0.0, 0.0, 0.0};
+  bool reference_direction_valid_ = false;
   bool valid_config_ = false;
   uint64_t trajectory_id_ = 1;
   rclcpp::Publisher<Reference>::SharedPtr publisher_;

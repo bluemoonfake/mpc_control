@@ -34,7 +34,7 @@ DDS_PORT ?= 8888
 ROS_PACKAGE ?= mpc_controller
 ROS_LAUNCH ?= mpc_offboard.launch.py
 ROS_LAUNCH_ARGS ?=
-ROS_BUILD_ARGS ?= --symlink-install
+ROS_BUILD_ARGS ?= --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 # The package contains several Eigen-heavy translation units. Building all of
 # them with the host-default job count can exhaust RAM and kill cc1plus.
 ROS_BUILD_PARALLEL_WORKERS ?= 1

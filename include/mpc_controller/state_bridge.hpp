@@ -58,6 +58,14 @@ inline bool timestampMonotonic(uint64_t previous, uint64_t current) noexcept
   return current != 0 && (previous == 0 || current >= previous);
 }
 
+inline bool synchronizedTimestamp(uint64_t timestamp) noexcept
+{
+  // Microseconds since Unix epoch are currently O(10^15); PX4 boot time is
+  // O(10^8..10^11). Keep independent monotonic histories for both domains.
+  constexpr uint64_t synchronized_epoch_threshold_us = 1000000000000ULL;
+  return timestamp >= synchronized_epoch_threshold_us;
+}
+
 inline bool finite(const Vector3 &value) noexcept
 {
   return std::isfinite(value[0]) && std::isfinite(value[1]) && std::isfinite(value[2]);

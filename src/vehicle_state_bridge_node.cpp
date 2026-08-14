@@ -18,6 +18,8 @@ public:
   VehicleStateBridgeNode()
   : Node("vehicle_state_bridge_node")
   {
+    // Topic names stay configurable because PX4 DDS names can differ between
+    // firmware/message revisions; frame and timing policy are fixed per run.
     declare_parameter("position_topic", position_topic_);
     declare_parameter("attitude_topic", attitude_topic_);
     declare_parameter("angular_velocity_topic", angular_velocity_topic_);
@@ -59,10 +61,14 @@ private:
 
   struct Cache
   {
+    // Receipt timing is kept separately from PX4 sample time: steady clock
+    // measures freshness while timestamp_sample measures cross-topic skew.
     Clock::time_point received_at{};
     uint64_t last_timestamp_sample = 0;
+    uint64_t last_boot_timestamp_sample = 0;
+    uint64_t last_synced_timestamp_sample = 0;
+    bool last_timestamp_was_synced = false;
     bool received = false;
-    uint64_t accepted_count = 0;
     uint64_t gap_count = 0;
     double gap_sum_seconds = 0.0;
     double gap_max_seconds = 0.0;
@@ -88,7 +94,6 @@ private:
     cache.received_at = now;
     cache.receipt_steady_timestamp_ns = steadyTimestampNs(now);
     cache.received = true;
-    ++cache.accepted_count;
   }
 
   void positionCallback(const Px4Position::SharedPtr message)
@@ -158,18 +163,34 @@ private:
 
   bool acceptTimestamp(Cache &cache, uint64_t timestamp_sample)
   {
-    if (!mpc_controller::frame::timestampMonotonic(cache.last_timestamp_sample, timestamp_sample)) {
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 5000,
-        "VehicleState input rejected: PX4 timestamp is zero or moved backwards");
+    if (timestamp_sample == 0U) {
+      ++timestamp_rejection_count_;
       return false;
     }
-    cache.last_timestamp_sample = timestamp_sample;
-    return true;
+    const bool synchronized = mpc_controller::frame::synchronizedTimestamp(timestamp_sample);
+    uint64_t &history = synchronized
+      ? cache.last_synced_timestamp_sample : cache.last_boot_timestamp_sample;
+    if (mpc_controller::frame::timestampMonotonic(
+        history, timestamp_sample)) {
+      if (cache.received && synchronized != cache.last_timestamp_was_synced) {
+        ++timestamp_domain_switch_count_;
+      }
+      history = timestamp_sample;
+      cache.last_timestamp_sample = timestamp_sample;
+      cache.last_timestamp_was_synced = synchronized;
+      return true;
+    }
+    ++timestamp_rejection_count_;
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "VehicleState input rejected: PX4 timestamp is zero or moved backwards");
+    return false;
   }
 
   void publish()
   {
+    // Atomically snapshot the three asynchronous PX4 streams, validate their
+    // freshness/skew, convert NED/FRD to ENU/FLU, then publish one state.
     Px4Position position;
     Px4Attitude attitude;
     Px4AngularVelocity angular_velocity;
@@ -297,10 +318,13 @@ private:
       ? static_cast<double>(maximum_sample - minimum_sample) * 1.0e-3 : 0.0;
     RCLCPP_INFO(
       get_logger(),
-      "VehicleState timing: published=%lu stale_reject=%lu skew_reject=%lu "
+      "VehicleState timing: published=%lu timestamp_reject=%lu "
+      "clock_switch=%lu stale_reject=%lu skew_reject=%lu "
       "age_ms[pos att ang]=[%.1f %.1f %.1f] gap_mean_ms[pos att ang]=[%.2f %.2f %.2f] "
       "gap_max_ms[pos att ang]=[%.2f %.2f %.2f] sample_skew_ms=%.3f",
       static_cast<unsigned long>(state_publish_count_),
+      static_cast<unsigned long>(timestamp_rejection_count_),
+      static_cast<unsigned long>(timestamp_domain_switch_count_),
       static_cast<unsigned long>(stale_rejection_count_),
       static_cast<unsigned long>(skew_rejection_count_),
       age_ms(position_cache_), age_ms(attitude_cache_), age_ms(angular_velocity_cache_),
@@ -320,6 +344,8 @@ private:
   Cache angular_velocity_cache_;
   Clock::time_point timing_report_at_ = Clock::now();
   uint64_t state_publish_count_ = 0;
+  uint64_t timestamp_rejection_count_ = 0;
+  uint64_t timestamp_domain_switch_count_ = 0;
   uint64_t stale_rejection_count_ = 0;
   uint64_t skew_rejection_count_ = 0;
   // PX4 v1.17 publishes this versioned uORB message on the DDS topic

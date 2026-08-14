@@ -1,11 +1,12 @@
 #include "mpc_controller/msg/mpc_translational_output.hpp"
-#include "mpc_controller/msg/m3_control_output.hpp"
+#include "mpc_controller/msg/force_attitude_setpoint.hpp"
 #include "mpc_controller/msg/reference_trajectory.hpp"
 #include "mpc_controller/msg/vehicle_state.hpp"
-#include "mpc_controller/mrs_control_math.hpp"
+#include "mpc_controller/force_attitude_mapping.hpp"
 #include "mpc_controller/translational_mpc.hpp"
 
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/header.hpp>
 
 #include <algorithm>
 #include <array>
@@ -48,6 +49,8 @@ public:
   MpcControllerNode()
   : Node("mpc_controller_node")
   {
+    // Parameters are split into solver/model limits, acceleration validation,
+    // recovery braking, and force-to-attitude mapping.
     declare_parameter("update_rate_hz", update_rate_hz_);
     declare_parameter("reference_timeout_seconds", reference_timeout_seconds_);
     declare_parameter("state_timeout_seconds", state_timeout_seconds_);
@@ -55,38 +58,25 @@ public:
     declare_parameter("output_frame_id", output_frame_id_);
     declare_parameter("dt_first", config_.dt_first);
     declare_parameter("dt_later", config_.dt_later);
+    declare_parameter("solver_deadline_seconds", config_.solver_deadline_seconds);
     declare_parameter("max_iterations", config_.max_iterations);
-    declare_parameter("model_alpha_xyz", std::vector<double>{0.0, 0.0, 0.0});
-    declare_parameter("model_time_constant_xyz", std::vector<double>{0.0, 0.0, 0.0});
     declare_parameter("admm_rho", config_.admm_rho);
     declare_parameter("solver_absolute_tolerance", config_.solver_absolute_tolerance);
     declare_parameter("solver_relative_tolerance", config_.solver_relative_tolerance);
-    declare_parameter("q_xy", std::vector<double>{500.0, 100.0, 100.0});
-    declare_parameter("s_xy", std::vector<double>{1000.0, 300.0, 300.0});
-    declare_parameter("q_z", std::vector<double>{100.0, 30.0, 10.0});
-    declare_parameter("s_z", std::vector<double>{100.0, 30.0, 10.0});
-    declare_parameter("force_feedback_kp_n_per_m", std::vector<double>{0.0, 0.0, 0.0});
-    declare_parameter("force_feedback_kv_n_per_m_s", std::vector<double>{0.0, 0.0, 0.0});
     declare_parameter("max_speed_xy", config_.max_speed_xy);
+    declare_parameter("max_acceleration_xy", config_.max_acceleration_xy);
     declare_parameter("max_control_xy", config_.max_control_xy);
     declare_parameter("max_control_rate_xy", config_.max_control_rate_xy);
     declare_parameter("max_speed_z", config_.max_speed_z);
     declare_parameter("max_acceleration_z", config_.max_acceleration_z);
-    declare_parameter(
-      "max_measured_acceleration_z_m_s2", accel_gate_.max_z);
+    declare_parameter("max_measured_acceleration_z_m_s2", accel_gate_.max_z);
     declare_parameter("max_control_z", config_.max_control_z);
     declare_parameter("max_control_rate_z", config_.max_control_rate_z);
-
-    declare_parameter("vehicle_mass", m3_config_.mass_kg);
-    declare_parameter("gravity", m3_config_.gravity_m_s2);
-    declare_parameter("max_tilt", m3_config_.max_tilt_rad);
-    declare_parameter("hover_thrust_normalized", m3_config_.hover_thrust_normalized);
-    declare_parameter(
-      "max_normalized_collective_thrust", m3_config_.max_normalized_collective_thrust);
-    declare_parameter("enable_thrust_feasibility", m3_config_.enable_thrust_feasibility);
-    declare_parameter(
-      "use_force_norm_for_collective_thrust",
-      m3_config_.use_force_norm_for_collective_thrust);
+    declare_parameter("recovery_velocity_gain", recovery_velocity_gain_);
+    declare_parameter("recovery_position_gain_z", recovery_position_gain_z_);
+    declare_parameter("recovery_max_acceleration_xy", recovery_max_acceleration_xy_);
+    declare_parameter("recovery_max_acceleration_z", recovery_max_acceleration_z_);
+    declare_parameter("max_tilt", mapping_config_.max_tilt_rad);
 
     get_parameter("update_rate_hz", update_rate_hz_);
     get_parameter("reference_timeout_seconds", reference_timeout_seconds_);
@@ -95,50 +85,53 @@ public:
     get_parameter("output_frame_id", output_frame_id_);
     get_parameter("dt_first", config_.dt_first);
     get_parameter("dt_later", config_.dt_later);
+    get_parameter("solver_deadline_seconds", config_.solver_deadline_seconds);
     get_parameter("max_iterations", config_.max_iterations);
-    const bool vector_parameters_valid = getArrayParameter("q_xy", config_.q_xy)
-      && getArrayParameter("s_xy", config_.s_xy)
-      && getArrayParameter("q_z", config_.q_z)
-      && getArrayParameter("s_z", config_.s_z)
-      && getArrayParameter("model_alpha_xyz", config_.model_alpha_xyz)
-      && getArrayParameter("model_time_constant_xyz", config_.model_time_constant_xyz)
-      && getArrayParameter("force_feedback_kp_n_per_m", force_feedback_kp_n_per_m_)
-      && getArrayParameter("force_feedback_kv_n_per_m_s", force_feedback_kv_n_per_m_s_);
     get_parameter("admm_rho", config_.admm_rho);
     get_parameter("solver_absolute_tolerance", config_.solver_absolute_tolerance);
     get_parameter("solver_relative_tolerance", config_.solver_relative_tolerance);
     get_parameter("max_speed_xy", config_.max_speed_xy);
+    get_parameter("max_acceleration_xy", config_.max_acceleration_xy);
     get_parameter("max_control_xy", config_.max_control_xy);
     get_parameter("max_control_rate_xy", config_.max_control_rate_xy);
     get_parameter("max_speed_z", config_.max_speed_z);
     get_parameter("max_acceleration_z", config_.max_acceleration_z);
-    get_parameter(
-      "max_measured_acceleration_z_m_s2", accel_gate_.max_z);
+    get_parameter("max_measured_acceleration_z_m_s2", accel_gate_.max_z);
     get_parameter("max_control_z", config_.max_control_z);
     get_parameter("max_control_rate_z", config_.max_control_rate_z);
+    get_parameter("recovery_velocity_gain", recovery_velocity_gain_);
+    get_parameter("recovery_position_gain_z", recovery_position_gain_z_);
+    get_parameter("recovery_max_acceleration_xy", recovery_max_acceleration_xy_);
+    get_parameter("recovery_max_acceleration_z", recovery_max_acceleration_z_);
+    get_parameter("max_tilt", mapping_config_.max_tilt_rad);
 
-    get_parameter("vehicle_mass", m3_config_.mass_kg);
-    get_parameter("gravity", m3_config_.gravity_m_s2);
-    get_parameter("max_tilt", m3_config_.max_tilt_rad);
-    get_parameter("hover_thrust_normalized", m3_config_.hover_thrust_normalized);
-    get_parameter(
-      "max_normalized_collective_thrust", m3_config_.max_normalized_collective_thrust);
-    get_parameter("enable_thrust_feasibility", m3_config_.enable_thrust_feasibility);
-    get_parameter(
-      "use_force_norm_for_collective_thrust",
-      m3_config_.use_force_norm_for_collective_thrust);
+    // Fixed-size vector parameters use explicit defaults and shape checks.
+    declare_parameter("model_time_constant_xyz", std::vector<double>{0.0, 0.0, 0.0});
+    declare_parameter("q_xy", std::vector<double>{500.0, 100.0, 100.0});
+    declare_parameter("s_xy", std::vector<double>{1000.0, 300.0, 300.0});
+    declare_parameter("q_z", std::vector<double>{100.0, 30.0, 10.0});
+    declare_parameter("s_z", std::vector<double>{100.0, 30.0, 10.0});
+    const bool vector_parameters_valid = getArrayParameter("q_xy", config_.q_xy)
+      && getArrayParameter("s_xy", config_.s_xy)
+      && getArrayParameter("q_z", config_.q_z)
+      && getArrayParameter("s_z", config_.s_z)
+      && getArrayParameter("model_time_constant_xyz", config_.model_time_constant_xyz);
+    const bool update_rate_valid = std::isfinite(update_rate_hz_) && update_rate_hz_ > 0.0;
     config_valid_ = vector_parameters_valid
-      && std::isfinite(update_rate_hz_) && update_rate_hz_ > 0.0
+      && update_rate_valid
       && std::isfinite(reference_timeout_seconds_) && reference_timeout_seconds_ > 0.0
       && std::isfinite(state_timeout_seconds_) && state_timeout_seconds_ > 0.0
       && !output_frame_id_.empty() && mpc_controller::translational::validConfig(config_)
+      && config_.solver_deadline_seconds < 1.0 / update_rate_hz_
       && accel_gate_.valid()
-      && std::all_of(force_feedback_kp_n_per_m_.begin(), force_feedback_kp_n_per_m_.end(),
-        [](double value) {return std::isfinite(value) && value >= 0.0;})
-      && std::all_of(force_feedback_kv_n_per_m_s_.begin(), force_feedback_kv_n_per_m_s_.end(),
-        [](double value) {return std::isfinite(value) && value >= 0.0;});
-    m3_config_valid_ = mpc_controller::mrs_control::validParameters(m3_config_);
+      && std::isfinite(recovery_velocity_gain_) && recovery_velocity_gain_ > 0.0
+      && std::isfinite(recovery_position_gain_z_) && recovery_position_gain_z_ >= 0.0
+      && std::isfinite(recovery_max_acceleration_xy_) && recovery_max_acceleration_xy_ > 0.0
+      && std::isfinite(recovery_max_acceleration_z_) && recovery_max_acceleration_z_ > 0.0;
+    mapping_config_valid_ = mpc_controller::force_attitude::validParameters(mapping_config_);
 
+    // The controller consumes measured state and sampled reference streams,
+    // then publishes solver diagnostics and a compact force/attitude setpoint.
     reference_subscription_ = create_subscription<Reference>(
       "reference_trajectory", 10,
       [this](Reference::SharedPtr message) {referenceCallback(std::move(message));});
@@ -146,13 +139,13 @@ public:
       "vehicle_state", 10,
       [this](State::SharedPtr message) {stateCallback(std::move(message));});
     output_publisher_ = create_publisher<Output>("mpc_translational_output", 10);
-    m3_output_publisher_ = create_publisher<M3Output>("m3_control_output", 10);
+    setpoint_publisher_ = create_publisher<Setpoint>("force_attitude_setpoint", 10);
 
     if (!config_valid_) {
-      RCLCPP_ERROR(get_logger(), "Invalid M2 MPC configuration; controller updates disabled");
+      RCLCPP_ERROR(get_logger(), "Invalid MPC configuration; controller updates disabled");
       return;
     }
-    if (!m3_config_valid_) {
+    if (!mapping_config_valid_) {
       RCLCPP_ERROR(get_logger(), "Invalid force/attitude control configuration; output disabled");
     }
 
@@ -167,7 +160,7 @@ private:
   using Reference = mpc_controller::msg::ReferenceTrajectory;
   using State = mpc_controller::msg::VehicleState;
   using Output = mpc_controller::msg::MpcTranslationalOutput;
-  using M3Output = mpc_controller::msg::M3ControlOutput;
+  using Setpoint = mpc_controller::msg::ForceAttitudeSetpoint;
   using ReferenceData = mpc_controller::translational::ReferenceTrajectoryData;
   using ReferencePoint = mpc_controller::translational::ReferencePoint;
   using MeasuredState = mpc_controller::translational::MeasuredState;
@@ -221,7 +214,7 @@ private:
     if (message->header.frame_id.empty()) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "M2 reference rejected: frame_id is empty");
+        "MPC reference rejected: frame_id is empty");
       return;
     }
     ReferenceData converted;
@@ -229,13 +222,15 @@ private:
       || !convertReference(*message, converted)) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "M2 reference rejected: malformed, empty, zero-timestamp or non-finite trajectory");
+        "MPC reference rejected: malformed, empty, zero-timestamp or non-finite trajectory");
       return;
     }
     std::lock_guard<std::mutex> lock(mutex_);
     const rclcpp::Time stamp(message->header.stamp);
     if (reference_stamp_.nanoseconds() != 0 && stamp < reference_stamp_) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,"M2 reference rejected: timestamp moved backwards");
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "MPC reference rejected: timestamp moved backwards");
       return;
     }
     reference_ = std::move(converted);
@@ -257,7 +252,7 @@ private:
     if (state_stamp_.nanoseconds() != 0 && stamp < state_stamp_) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "M2 measured state rejected: timestamp moved backwards");
+        "MPC measured state rejected: timestamp moved backwards");
       return;
     }
     state_ = std::move(*message);
@@ -267,6 +262,8 @@ private:
 
   void update()
   {
+    // One callback performs admission, horizon sampling, three scalar QPs,
+    // bounded recovery on failure, and the force/attitude conversion.
     std::lock_guard<std::mutex> lock(mutex_);
     if (!config_valid_ || !controller_ || !reference_ || !state_) {
       return;
@@ -278,33 +275,33 @@ private:
       || reference_age > reference_timeout_seconds_
       || !std::isfinite(state_age) || state_age < 0.0 || state_age > state_timeout_seconds_;
     if (stale_input) {
-      if (!m2_stale_active_) {
+      if (!stale_input_active_) {
         // A stale interval breaks the continuity assumed by the warm start and
         // by the first-input rate constraint.  Restart from neutral acceleration
         // when fresh measurements return instead of reusing the pre-gap state.
         controller_->reset();
-        m2_stale_active_ = true;
+        stale_input_active_ = true;
       }
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "M2 update rejected: stale input: reference_age=%.3f s (limit %.3f s), "
+        "MPC update rejected: stale input: reference_age=%.3f s (limit %.3f s), "
         "state_age=%.3f s (limit %.3f s)",
         reference_age, reference_timeout_seconds_, state_age, state_timeout_seconds_);
       return;
     }
-    if (m2_stale_active_) {
+    if (stale_input_active_) {
       RCLCPP_INFO(
         get_logger(),
-        "M2 input recovered; solver warm start and input-rate memory were reset: "
+        "MPC input recovered; solver warm start and input-rate memory were reset: "
         "reference_age=%.3f s, state_age=%.3f s",
         reference_age, state_age);
-      m2_stale_active_ = false;
+      stale_input_active_ = false;
     }
     if (strict_validation_ && (!state_->valid || !state_->position_valid || !state_->velocity_valid
       || !state_->acceleration_valid || state_->header.frame_id.empty())) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "M2 update rejected: measured translational state is invalid");
+        "MPC update rejected: measured translational state is invalid");
       return;
     }
     MeasuredState measured;
@@ -316,14 +313,14 @@ private:
       || !mpc_controller::translational::finite(measured.acceleration)) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "M2 update rejected: measured state contains NaN or Inf");
+        "MPC update rejected: measured state contains NaN or Inf");
       return;
     }
     if (strict_validation_) {
       if (!accel_gate_.accept(measured.acceleration)) {
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 2000,
-          "M2 update rejected: acceleration is non-finite or |az|=%.3f exceeds %.3f m/s^2",
+          "MPC update rejected: acceleration is non-finite or |az|=%.3f exceeds %.3f m/s^2",
           std::abs(measured.acceleration[2]), accel_gate_.max_z);
         return;
       }
@@ -335,18 +332,11 @@ private:
         *reference_, elapsed, config_.dt_first, config_.dt_later, horizon)) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "M2 update rejected: reference cannot be sampled on the solver grid");
+        "MPC update rejected: reference cannot be sampled on the solver grid");
       return;
     }
 
     const auto result = controller_->update(measured, horizon);
-    if (!result.valid) {
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
-        "M2 solver update failed: %s", failureReasonString(result.failure_reason));
-      return;
-    }
-
     Output output;
     output.header.stamp = now;
     output.header.frame_id = output_frame_id_;
@@ -358,15 +348,65 @@ private:
     output.sampled_reference_position = horizon.points.front().position;
     output.sampled_reference_velocity = horizon.points.front().velocity;
     output.sampled_reference_acceleration = horizon.points.front().acceleration;
-    output.control_input = result.control;
     output.first_predicted_acceleration = result.first_predicted_acceleration;
-    output.predicted_states.assign(result.prediction.begin(), result.prediction.end());
     output.solve_time_seconds = result.solve_time_seconds;
-    output.valid = true;
-    output_publisher_->publish(output);
+    output.solver_deadline_missed = result.deadline_missed;
+    output.failure_reason = static_cast<uint8_t>(result.failure_reason);
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+      const auto &axis_result = result.axes[axis];
+      output.solver_iterations[axis] = axis_result.iterations;
+      output.solver_status[axis] = static_cast<uint8_t>(axis_result.status);
+      output.solver_primal_residual[axis] = axis_result.primal_residual;
+      output.solver_dual_residual[axis] = axis_result.dual_residual;
+      output.solver_primal_tolerance[axis] = axis_result.primal_tolerance;
+      output.solver_dual_tolerance[axis] = axis_result.dual_tolerance;
+      output.recovery_constraint_active[axis] = axis_result.recovery_constraint_active;
+    }
     ++solve_count_;
     solve_time_total_seconds_ += result.solve_time_seconds;
     solve_time_max_seconds_ = std::max(solve_time_max_seconds_, result.solve_time_seconds);
+    if (!result.valid) {
+      const auto recovery = recoveryAcceleration(measured, horizon.points.front());
+      output.control_input = recovery;
+      output.recovery_command_active = true;
+      output.valid = false;
+      output_publisher_->publish(output);
+      publishSetpoint(output.header, output.sequence, recovery, state_->yaw, true);
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "MPC failed: %s status=[%u %u %u] iter=[%d %d %d] "
+        "primal=[%.3g %.3g %.3g] dual=[%.3g %.3g %.3g] solve=%.3f ms; "
+        "recovery a=[%.2f %.2f %.2f]",
+        failureReasonString(result.failure_reason),
+        static_cast<unsigned>(result.axes[0].status),
+        static_cast<unsigned>(result.axes[1].status),
+        static_cast<unsigned>(result.axes[2].status),
+        result.axes[0].iterations, result.axes[1].iterations, result.axes[2].iterations,
+        result.axes[0].primal_residual, result.axes[1].primal_residual,
+        result.axes[2].primal_residual,
+        result.axes[0].dual_residual, result.axes[1].dual_residual,
+        result.axes[2].dual_residual,
+        result.solve_time_seconds * 1000.0,
+        recovery[0], recovery[1], recovery[2]);
+      return;
+    }
+
+    output.predicted_states.resize(
+      mpc_controller::translational::kHorizonLength * 9);
+    for (std::size_t step = 0; step < mpc_controller::translational::kHorizonLength; ++step) {
+      for (std::size_t axis = 0; axis < 3; ++axis) {
+        for (std::size_t state = 0; state < 3; ++state) {
+          output.predicted_states[step * 9 + axis * 3 + state] =
+            result.axes[axis].prediction[step](state);
+        }
+      }
+    }
+    output.recovery_command_active = false;
+    output.valid = true;
+
+    const auto &command_reference = horizon.points.front();
+    output.control_input = result.control;
+    output_publisher_->publish(output);
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 2000,
       "MPC update seq=%lu measured_x0=[p %.3f %.3f %.3f v %.3f %.3f %.3f "
@@ -376,86 +416,87 @@ private:
       measured.position[0], measured.position[1], measured.position[2],
       measured.velocity[0], measured.velocity[1], measured.velocity[2],
       measured.acceleration[0], measured.acceleration[1], measured.acceleration[2],
-      output.control_input[0], output.control_input[1], output.control_input[2],
+      result.control[0], result.control[1], result.control[2],
       reference_age * 1.0e3, state_age * 1.0e3,
       output.solve_time_seconds * 1000.0,
       (solve_time_total_seconds_ / static_cast<double>(solve_count_)) * 1000.0,
       solve_time_max_seconds_ * 1000.0);
+    publishSetpoint(
+      output.header, output.sequence, result.control, command_reference.yaw, false);
+  }
 
-    if (!m3_config_valid_) {
-      return;
+  std::array<double, 3> recoveryAcceleration(
+    const MeasuredState &measured, const ReferencePoint &reference) const noexcept
+  {
+    // Bounded fallback: a_xy=-k_v*v_xy and
+    // a_z=k_p(z_ref-z)-k_v*v_z. It brakes rather than holding the last tilt.
+    std::array<double, 3> command{
+      -recovery_velocity_gain_ * measured.velocity[0],
+      -recovery_velocity_gain_ * measured.velocity[1],
+      recovery_position_gain_z_ * (reference.position[2] - measured.position[2])
+        - recovery_velocity_gain_ * measured.velocity[2]};
+    const double horizontal = std::hypot(command[0], command[1]);
+    if (horizontal > recovery_max_acceleration_xy_) {
+      const double scale = recovery_max_acceleration_xy_ / horizontal;
+      command[0] *= scale;
+      command[1] *= scale;
     }
-    ReferencePoint yaw_reference;
-    if (!Sampler::sampleAt(*reference_, elapsed, yaw_reference)) {
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
-        "M3 output rejected: reference yaw cannot be sampled");
-      return;
-    }
+    command[2] = std::clamp(
+      command[2], -recovery_max_acceleration_z_, recovery_max_acceleration_z_);
+    return command;
+  }
 
-    mpc_controller::mrs_control::Input m3_input;
-    // u is the actuator acceleration command. The predicted acceleration
-    // state a[k+1] models the delayed plant response and is diagnostic only.
-    // Sending a[k+1] back to the actuator would feed the measured transient
-    // through the command path and apply the lag twice.
-    Eigen::Vector3d force_acceleration_command(
-      result.control[0], result.control[1], result.control[2]);
-    for (int axis = 0; axis < 3; ++axis) {
-      const double feedback_force_n = force_feedback_kp_n_per_m_[axis]
-        * (yaw_reference.position[axis] - measured.position[axis])
-        + force_feedback_kv_n_per_m_s_[axis]
-        * (yaw_reference.velocity[axis] - measured.velocity[axis]);
-      force_acceleration_command[axis] += feedback_force_n / m3_config_.mass_kg;
-    }
-    m3_input.desired_acceleration_m_s2 = force_acceleration_command;
-    m3_input.measured_body_to_world = Eigen::Quaterniond(
-      state_->attitude[0], state_->attitude[1], state_->attitude[2], state_->attitude[3]);
-    m3_input.desired_yaw_rad = yaw_reference.yaw;
-    m3_input.attitude_valid = strict_validation_ ? state_->attitude_valid : true;
-    m3_input.heading_valid = strict_validation_ ? state_->heading_valid : true;
-    m3_input.control_ready = strict_validation_ ? state_->control_ready : true;
-
-    const auto m3_result = mpc_controller::mrs_control::compute(m3_config_, m3_input);
-    if (!m3_result.valid) {
+  void publishSetpoint(
+    const std_msgs::msg::Header &header, uint64_t sequence,
+    const std::array<double, 3> &acceleration,
+    double yaw, bool recovery)
+  {
+    // Convert desired ENU acceleration and yaw into desired SO(3) attitude
+    // plus mass-normalized collective force for the 250 Hz adapter.
+    if (!mapping_config_valid_ || !state_) return;
+    mpc_controller::force_attitude::Input mapping_input;
+    mapping_input.desired_acceleration_m_s2 = Eigen::Vector3d(
+      acceleration[0], acceleration[1], acceleration[2]);
+    mapping_input.desired_yaw_rad = std::isfinite(yaw) ? yaw : state_->yaw;
+    mapping_input.valid = strict_validation_ ? state_->attitude_valid : true;
+    const auto mapping = mpc_controller::force_attitude::compute(mapping_config_, mapping_input);
+    if (!mapping.valid) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
         "Force/attitude output rejected: %s",
-        mpc_controller::mrs_control::failureReasonName(m3_result.failure_reason));
+        mpc_controller::force_attitude::failureReasonName(mapping.failure_reason));
       return;
     }
 
-    M3Output m3_output;
-    m3_output.header = output.header;
-    m3_output.sequence = output.sequence;
+    Setpoint setpoint;
+    setpoint.header = header;
+    setpoint.sequence = sequence;
     for (int i = 0; i < 3; ++i) {
-      m3_output.desired_acceleration_m_s2[i] = m3_result.desired_acceleration_m_s2[i];
-      m3_output.desired_force_world_n[i] = m3_result.desired_force_world_n[i];
+      setpoint.desired_acceleration_m_s2[i] = mapping.desired_acceleration_m_s2[i];
+      setpoint.desired_specific_force_world_m_s2[i] =
+        mapping.desired_specific_force_world_m_s2[i];
     }
-    m3_output.desired_attitude_wxyz = {
-      m3_result.desired_body_to_world.w(), m3_result.desired_body_to_world.x(),
-      m3_result.desired_body_to_world.y(), m3_result.desired_body_to_world.z()};
-    m3_output.desired_thrust_force_n = m3_result.desired_thrust_force_n;
-    m3_output.raw_force_norm_n = m3_result.raw_force_norm_n;
-    m3_output.feasible_force_norm_n = m3_result.feasible_force_norm_n;
-    m3_output.force_limit_n = m3_result.force_limit_n;
-    m3_output.feasibility_correction_norm_m_s2 = m3_result.feasibility_correction_norm_m_s2;
-    m3_output.feasibility_constraint_active = m3_result.feasibility_constraint_active;
-    m3_output.tilt_angle_rad = m3_result.tilt_angle_rad;
-    m3_output_publisher_->publish(m3_output);
+    setpoint.desired_attitude_wxyz = {
+      mapping.desired_body_to_world.w(), mapping.desired_body_to_world.x(),
+      mapping.desired_body_to_world.y(), mapping.desired_body_to_world.z()};
+    setpoint.desired_collective_specific_force_m_s2 =
+      mapping.desired_collective_specific_force_m_s2;
+    setpoint.tilt_angle_rad = mapping.tilt_angle_rad;
+    setpoint.recovery_active = recovery;
+    setpoint_publisher_->publish(setpoint);
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 2000,
-      "Force/attitude output seq=%lu a_des=[%.3f %.3f %.3f] force=[%.3f %.3f %.3f] "
-      "thrust=%.3f N raw_norm=%.3f feasible_norm=%.3f limit=%.3f constrained=%s "
-      "tilt=%.3f rad active=%s",
-      static_cast<unsigned long>(m3_output.sequence),
-      m3_output.desired_acceleration_m_s2[0], m3_output.desired_acceleration_m_s2[1],
-      m3_output.desired_acceleration_m_s2[2],
-      m3_output.desired_force_world_n[0], m3_output.desired_force_world_n[1],
-      m3_output.desired_force_world_n[2], m3_output.desired_thrust_force_n,
-      m3_output.raw_force_norm_n, m3_output.feasible_force_norm_n, m3_output.force_limit_n,
-      m3_output.feasibility_constraint_active ? "true" : "false",
-      m3_output.tilt_angle_rad,
-      m3_result.active_control_ready ? "true" : "false");
+      "Force/attitude setpoint seq=%lu a_des=[%.3f %.3f %.3f] "
+      "specific_force=[%.3f %.3f %.3f] "
+      "collective=%.3f m/s^2 tilt=%.3f rad mode=%s",
+      static_cast<unsigned long>(setpoint.sequence),
+      setpoint.desired_acceleration_m_s2[0], setpoint.desired_acceleration_m_s2[1],
+      setpoint.desired_acceleration_m_s2[2],
+      setpoint.desired_specific_force_world_m_s2[0],
+      setpoint.desired_specific_force_world_m_s2[1],
+      setpoint.desired_specific_force_world_m_s2[2],
+      setpoint.desired_collective_specific_force_m_s2,
+      setpoint.tilt_angle_rad, recovery ? "recovery" : "tracking");
   }
 
   static const char * failureReasonString(FailureReason reason) noexcept
@@ -473,18 +514,20 @@ private:
 
   std::mutex mutex_;
   bool config_valid_ = true;
-  bool m3_config_valid_ = true;
-  bool m2_stale_active_ = false;
+  bool mapping_config_valid_ = true;
+  bool stale_input_active_ = false;
   bool strict_validation_ = true;
   double update_rate_hz_ = 50.0;
   double reference_timeout_seconds_ = 1.5;
   double state_timeout_seconds_ = 0.25;
+  double recovery_velocity_gain_ = 1.0;
+  double recovery_position_gain_z_ = 0.5;
+  double recovery_max_acceleration_xy_ = 2.5;
+  double recovery_max_acceleration_z_ = 1.5;
   std::string output_frame_id_ = "map";
   mpc_controller::translational::Config config_{};
-  std::array<double, 3> force_feedback_kp_n_per_m_{};
-  std::array<double, 3> force_feedback_kv_n_per_m_s_{};
   AccelGate accel_gate_{};
-  mpc_controller::mrs_control::Parameters m3_config_{};
+  mpc_controller::force_attitude::Parameters mapping_config_{};
   std::optional<Controller> controller_;
   std::optional<ReferenceData> reference_;
   std::optional<State> state_;
@@ -500,7 +543,7 @@ private:
   rclcpp::Subscription<Reference>::SharedPtr reference_subscription_;
   rclcpp::Subscription<State>::SharedPtr state_subscription_;
   rclcpp::Publisher<Output>::SharedPtr output_publisher_;
-  rclcpp::Publisher<M3Output>::SharedPtr m3_output_publisher_;
+  rclcpp::Publisher<Setpoint>::SharedPtr setpoint_publisher_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 

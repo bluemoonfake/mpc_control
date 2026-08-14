@@ -15,12 +15,20 @@ float64[3] feedback_torque_body_flu_normalized
 float64[3] dynamics_torque_body_flu_normalized
 bool desired_kinematics_valid
 bool torque_saturated
+bool mpc_recovery_active
+# Feedback reported by PX4 after control allocation.
+bool allocator_status_fresh
+bool torque_setpoint_achieved
+bool thrust_setpoint_achieved
+bool actuator_saturated
+float32[3] unallocated_torque
+float32[3] unallocated_thrust
 bool valid
 uint8 state
 # Freshness gates used by the adapter.
 bool attitude_fresh
 bool body_rate_fresh
-bool m3_fresh
+bool setpoint_fresh
 bool timesync_fresh
 bool yaw_hold_valid
 float64 yaw_hold_enu_rad
