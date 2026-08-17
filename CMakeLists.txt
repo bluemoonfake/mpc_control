@@ -53,6 +53,7 @@ add_library(mpc_core STATIC src/mpc_solver.cpp)
 target_compile_features(mpc_core PUBLIC cxx_std_17)
 target_include_directories(mpc_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/px4-ros2-interface-lib/px4_ros2_cpp/include>
   $<INSTALL_INTERFACE:include>)
 target_link_libraries(mpc_core PUBLIC Eigen3::Eigen PRIVATE osqpstatic)
 
@@ -60,7 +61,8 @@ function(add_mpc_node target source)
   add_executable(${target} ${source})
   target_compile_features(${target} PRIVATE cxx_std_17)
   target_include_directories(${target} PRIVATE
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/px4-ros2-interface-lib/px4_ros2_cpp/include>)
   ament_target_dependencies(${target} rclcpp ${ARGN})
   rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
   target_link_libraries(${target} "${cpp_typesupport_target}")

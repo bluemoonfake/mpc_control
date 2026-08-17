@@ -77,7 +77,7 @@ bool validConfiguration(const Configuration &config) noexcept
 
 Eigen::Matrix3d transitionMatrix(double dt, double alpha) noexcept
 {
-  // Baca acceleration-response model with b=1-alpha:
+  // acceleration-response model with b=1-alpha:
   // [p+;v+;a+] = [[1,dt,alpha*dt^2/2],[0,1,alpha*dt],[0,0,alpha]] x
   //                + [b*dt^2/2,b*dt,b]' u.
   // alpha+b=1 preserves constant acceleration when a=u.
@@ -611,10 +611,8 @@ bool validConfiguration(const Configuration &config) noexcept
     config.max_acceleration_xy, config.max_acceleration_z, config.max_control_xy,
     config.max_control_z, config.max_control_rate_xy, config.max_control_rate_z,
     config.gravity_m_s2, config.max_tilt_rad,
-    config.min_collective_specific_force_m_s2,
-    config.max_collective_specific_force_m_s2, config.constraint_slack_weight,
-    config.max_constraint_slack, config.admm_rho, config.absolute_tolerance,
-    config.relative_tolerance};
+    config.min_collective_specific_force_m_s2,config.max_collective_specific_force_m_s2, config.constraint_slack_weight,
+    config.max_constraint_slack, config.admm_rho, config.absolute_tolerance,config.relative_tolerance};
   if (!std::all_of(positive_values.begin(), positive_values.end(), [](double value) {
       return std::isfinite(value) && value > 0.0;
     })) {
@@ -640,15 +638,9 @@ bool validConfiguration(const Configuration &config) noexcept
     return false;
   }
   // The inscribed cylindrical force envelope must retain a non-empty vertical range.
-  const double maximum_force_z = std::sqrt(
-    config.max_collective_specific_force_m_s2
-    * config.max_collective_specific_force_m_s2
-    - config.max_control_xy * config.max_control_xy);
-  const double lower_control_z = std::max(
-    -config.max_control_z,
-    config.min_collective_specific_force_m_s2 - config.gravity_m_s2);
-  const double upper_control_z = std::min(
-    config.max_control_z, maximum_force_z - config.gravity_m_s2);
+  const double maximum_force_z = std::sqrt(config.max_collective_specific_force_m_s2 * config.max_collective_specific_force_m_s2- config.max_control_xy * config.max_control_xy);
+  const double lower_control_z = std::max(-config.max_control_z,config.min_collective_specific_force_m_s2 - config.gravity_m_s2);
+  const double upper_control_z = std::min(config.max_control_z, maximum_force_z - config.gravity_m_s2);
   return std::isfinite(maximum_force_z) && lower_control_z <= upper_control_z;
 }
 
@@ -671,8 +663,7 @@ Eigen::Matrix<double, 9, 3> inputMatrix(
 {
   const Eigen::Vector3d response = Eigen::Vector3d::Ones() - alpha;
   Eigen::Matrix<double, 9, 3> matrix = Eigen::Matrix<double, 9, 3>::Zero();
-  matrix.template block<3, 3>(0, 0) =
-    (0.5 * dt * dt * response).asDiagonal();
+  matrix.template block<3, 3>(0, 0) =(0.5 * dt * dt * response).asDiagonal();
   matrix.template block<3, 3>(3, 0) = (dt * response).asDiagonal();
   matrix.template block<3, 3>(6, 0) = response.asDiagonal();
   return matrix;
@@ -727,15 +718,11 @@ public:
     data.free_prediction = state_mapping_ * initial_state;
     const StateTrajectory error = data.free_prediction - reference_vector;
     data.gradient.setZero();
-    data.gradient.head(kControlCount) =
-      (2.0 * control_mapping_.transpose() * weights_.asDiagonal() * error)
-      / objective_scale_;
+    data.gradient.head(kControlCount) = (2.0 * control_mapping_.transpose() * weights_.asDiagonal() * error)/ objective_scale_;
     // The first rate term is r_du ||u_0-u_previous||^2. Its constant part is
     // omitted; the remaining linear term belongs in the OSQP gradient.
     for (std::size_t axis = 0; axis < kInputDimension; ++axis) {
-      data.gradient(static_cast<Eigen::Index>(axis)) -=
-        2.0 * config_.control_rate_weights[axis]
-        * last_control(static_cast<Eigen::Index>(axis)) / objective_scale_;
+      data.gradient(static_cast<Eigen::Index>(axis)) -= 2.0 * config_.control_rate_weights[axis] * last_control(static_cast<Eigen::Index>(axis)) / objective_scale_;
     }
 
     data.lower.setConstant(-OSQP_INFTY);
@@ -745,10 +732,7 @@ public:
     const double acceleration_xy_limit = config_.max_acceleration_xy * polygon_scale;
     const double control_xy_limit = config_.max_control_xy * polygon_scale;
     const double tilt_scale = std::tan(config_.max_tilt_rad) * polygon_scale;
-    const double maximum_force_z = std::sqrt(
-      config_.max_collective_specific_force_m_s2
-      * config_.max_collective_specific_force_m_s2
-      - config_.max_control_xy * config_.max_control_xy);
+    const double maximum_force_z = std::sqrt(config_.max_collective_specific_force_m_s2* config_.max_collective_specific_force_m_s2- config_.max_control_xy * config_.max_control_xy);
 
     for (std::size_t step = 0; step < kHorizonLength; ++step) {
       const double dt = step == 0 ? config_.dt_first : config_.dt_later;
@@ -830,43 +814,29 @@ public:
     }
     for (std::size_t step = 0; step < kHorizonLength; ++step) {
       output.prediction[step] = states.segment<9>(9 * step);
-      output.max_predicted_speed_xy = std::max(
-        output.max_predicted_speed_xy,
-        output.prediction[step].segment<2>(3).norm());
-      output.max_predicted_acceleration_xy = std::max(
-        output.max_predicted_acceleration_xy,
-        output.prediction[step].segment<2>(6).norm());
+      output.max_predicted_speed_xy = std::max(output.max_predicted_speed_xy,output.prediction[step].segment<2>(3).norm());
+      output.max_predicted_acceleration_xy = std::max(output.max_predicted_acceleration_xy,output.prediction[step].segment<2>(6).norm());
       const Input control = decision.segment<3>(3 * step);
-      const Eigen::Vector3d force(
-        control.x(), control.y(), control.z() + config_.gravity_m_s2);
+      const Eigen::Vector3d force(control.x(), control.y(), control.z() + config_.gravity_m_s2);
       const double force_norm = force.norm();
       if (!std::isfinite(force_norm) || force.z() <= 0.0) {
         output.status = Status::non_finite_output;
         return output;
       }
-      output.max_predicted_tilt_rad = std::max(
-        output.max_predicted_tilt_rad,
-        std::atan2(force.head<2>().norm(), force.z()));
-      output.max_predicted_collective_specific_force_m_s2 = std::max(
-        output.max_predicted_collective_specific_force_m_s2, force_norm);
-      output.max_velocity_slack = std::max(
-        output.max_velocity_slack, decision(kVelocitySlackOffset + step));
-      output.max_acceleration_slack = std::max(
-        output.max_acceleration_slack, decision(kAccelerationSlackOffset + step));
+      output.max_predicted_tilt_rad = std::max(output.max_predicted_tilt_rad,std::atan2(force.head<2>().norm(), force.z()));
+      output.max_predicted_collective_specific_force_m_s2 = std::max(output.max_predicted_collective_specific_force_m_s2, force_norm);
+      output.max_velocity_slack = std::max(output.max_velocity_slack, decision(kVelocitySlackOffset + step));
+      output.max_acceleration_slack = std::max(output.max_acceleration_slack, decision(kAccelerationSlackOffset + step));
     }
     output.first_control = decision.head<3>();
-    output.recovery_constraint_active = output.max_velocity_slack > 1.0e-6
-      || output.max_acceleration_slack > 1.0e-6;
+    output.recovery_constraint_active = output.max_velocity_slack > 1.0e-6 || output.max_acceleration_slack > 1.0e-6;
 
     const ConstraintVector value = constraints_ * decision;
     output.max_constraint_violation = 0.0;
     for (Eigen::Index row = 0; row < value.size(); ++row) {
-      output.max_constraint_violation = std::max(
-        output.max_constraint_violation,
-        std::max(data.lower(row) - value(row), value(row) - data.upper(row)));
+      output.max_constraint_violation = std::max(output.max_constraint_violation,std::max(data.lower(row) - value(row), value(row) - data.upper(row)));
     }
-    const double tolerance = kLimitToleranceMultiplier
-      * (absolute_tolerance + relative_tolerance);
+    const double tolerance = kLimitToleranceMultiplier * (absolute_tolerance + relative_tolerance);
     output.valid = output.first_control.allFinite()
       && output.max_constraint_violation <= tolerance
       && output.max_predicted_tilt_rad <= config_.max_tilt_rad + tolerance
@@ -889,9 +859,7 @@ private:
       const double dt = step == 0 ? config_.dt_first : config_.dt_later;
       Eigen::Vector3d alpha;
       for (std::size_t axis = 0; axis < 3; ++axis) {
-        alpha(static_cast<Eigen::Index>(axis)) =
-          config_.model_time_constant_xyz[axis] > 0.0 ?
-          std::exp(-dt / config_.model_time_constant_xyz[axis]) : 0.0;
+        alpha(static_cast<Eigen::Index>(axis)) = config_.model_time_constant_xyz[axis] > 0.0 ?std::exp(-dt / config_.model_time_constant_xyz[axis]) : 0.0;
       }
       const auto a = transitionMatrix(dt, alpha);
       state_transition = a * state_transition;
@@ -900,10 +868,8 @@ private:
       state_mapping_.block<9, 9>(9 * step, 0) = state_transition;
       control_mapping_.block(9 * step, 0, 9, kControlCount) = control_transition;
 
-      const auto &xy = step + 1 == kHorizonLength ?
-        config_.terminal_weights_xy : config_.stage_weights_xy;
-      const auto &z = step + 1 == kHorizonLength ?
-        config_.terminal_weights_z : config_.stage_weights_z;
+      const auto &xy = step + 1 == kHorizonLength ? config_.terminal_weights_xy : config_.stage_weights_xy;
+      const auto &z = step + 1 == kHorizonLength ? config_.terminal_weights_z : config_.stage_weights_z;
       // J = sum(dt_k * e_k'Qe_k) + e_N'Se_N. Parameters are tuned for the
       // regular 200 ms knot, so only the shorter first stage is normalized.
       const bool terminal = step + 1 == kHorizonLength;
@@ -938,10 +904,8 @@ private:
       }
     }
     for (std::size_t step = 0; step < kHorizonLength; ++step) {
-      hessian_(kVelocitySlackOffset + step, kVelocitySlackOffset + step) =
-        2.0 * config_.constraint_slack_weight;
-      hessian_(kAccelerationSlackOffset + step, kAccelerationSlackOffset + step) =
-        2.0 * config_.constraint_slack_weight;
+      hessian_(kVelocitySlackOffset + step, kVelocitySlackOffset + step) = 2.0 * config_.constraint_slack_weight;
+      hessian_(kAccelerationSlackOffset + step, kAccelerationSlackOffset + step) = 2.0 * config_.constraint_slack_weight;
     }
     objective_scale_ = std::max(1.0, hessian_.cwiseAbs().maxCoeff());
     hessian_ /= objective_scale_;

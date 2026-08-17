@@ -1,7 +1,11 @@
 reference_generator_node:
   ros__parameters:
-    # manual_velocity: joystick; trajectory: ReferenceStep/line/circle.
-    reference_input_mode: manual_velocity
+    # manual_velocity: joystick; trajectory: ReferenceStep/line/circle; mission: schema.yaml JSON mission.
+    reference_input_mode: mission
+    mission_file_path: "config/missions/benchmark_square.json"
+    mission_acceptance_radius_m: 2.0
+    mission_speed_override_m_s: 0.0
+    auto_start_mission_on_offboard: true
     frame_id: map
     # Follow measured position/yaw before Offboard and freeze at mode entry.
     auto_capture_current_hold: true

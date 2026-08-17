@@ -3,6 +3,7 @@
 #include "mpc_controller/msg/reference_step.hpp"
 #include "mpc_controller/msg/trajectory_point.hpp"
 #include "mpc_controller/msg/vehicle_state.hpp"
+#include "mpc_controller/mission_parser.hpp"
 #include "mpc_controller/reference_model.hpp"
 
 #include <rclcpp/rclcpp.hpp>
@@ -33,6 +34,10 @@ public:
     // the rolling joystick planner. Mode-specific settings remain dormant.
     declareAndGet("reference_input_mode", reference_input_mode_);
     declareAndGet("frame_id", frame_id_);
+    declareAndGet("mission_file_path", mission_file_path_);
+    declareAndGet("mission_acceptance_radius_m", mission_acceptance_radius_m_);
+    declareAndGet("mission_speed_override_m_s", mission_speed_override_m_s_);
+    declareAndGet("auto_start_mission_on_offboard", auto_start_mission_on_offboard_);
     declareAndGet("line_duration_seconds", parameters_.line_duration_seconds);
     declareAndGet("circle_radius", parameters_.circle_radius);
     declareAndGet("circle_reference_speed_limit_m_s", circle_reference_speed_limit_m_s_);
@@ -119,7 +124,7 @@ public:
       && std::isfinite(visualization_direction_deadband_)
       && visualization_direction_deadband_ >= 0.0
       && std::isfinite(manual_timeout_) && manual_timeout_ > 0.0
-      && (reference_input_mode_ == "trajectory" || reference_input_mode_ == "manual_velocity")
+      && (reference_input_mode_ == "trajectory" || reference_input_mode_ == "manual_velocity" || reference_input_mode_ == "mission")
       && std::isfinite(manual_rate_hz_) && manual_rate_hz_ > 0.0
       && std::isfinite(manual_deadband_) && manual_deadband_ >= 0.0
       && manual_deadband_ < 1.0
@@ -149,11 +154,14 @@ public:
         "~/start_line",std::bind(&ReferenceGeneratorNode::startLine, this, std::placeholders::_1,std::placeholders::_2));
       start_circle_service_ = create_service<Trigger>(
         "~/start_circle",std::bind(&ReferenceGeneratorNode::startCircle, this, std::placeholders::_1,std::placeholders::_2));
+      start_mission_service_ = create_service<Trigger>(
+        "~/start_mission",std::bind(&ReferenceGeneratorNode::startMission, this, std::placeholders::_1,std::placeholders::_2));
+
       RCLCPP_INFO(
         get_logger(), auto_capture_current_hold_
         ? "Current-state hold tracking enabled; freezes on PX4 Offboard entry"
         : "Current-state hold tracking disabled; configured hold is used");
-      if (auto_capture_current_hold_ || manualVelocityMode()) {
+      if (auto_capture_current_hold_ || manualVelocityMode() || missionMode()) {
         const auto sensor_qos = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort();
         control_mode_subscription_ = create_subscription<px4_msgs::msg::VehicleControlMode>("fmu/out/vehicle_control_mode", sensor_qos,
           [this](px4_msgs::msg::VehicleControlMode::SharedPtr message) {
@@ -164,6 +172,19 @@ public:
               if (manualVelocityMode()) {
                 resetManual();
                 publishManual();
+              } else if (missionMode() && auto_start_mission_on_offboard_) {
+                if (loadMissionWaypoints()) {
+                  parameters_.type = "mission";
+                  line_started_at_.reset();
+                  circle_started_at_.reset();
+                  publish();
+                  RCLCPP_INFO(
+                    get_logger(),
+                    "Mission auto-started on Offboard entry: file=%s, waypoints=%zu",
+                    mission_file_path_.c_str(), mission_waypoints_.size());
+                } else {
+                  publish();
+                }
               } else {
                 publish();
               }
@@ -258,6 +279,11 @@ private:
     return reference_input_mode_ == "manual_velocity";
   }
 
+  bool missionMode() const noexcept
+  {
+    return reference_input_mode_ == "mission";
+  }
+
   bool mpcHealthy() const noexcept
   {
     return latest_mpc_output_ && mpc_output_received_at_
@@ -268,13 +294,14 @@ private:
 
   void cancelTrajectoryForMpcFailure()
   {
-    if (!offboard_active_ || (parameters_.type != "line" && parameters_.type != "circle")) {
+    if (!offboard_active_ || (parameters_.type != "line" && parameters_.type != "circle" && parameters_.type != "mission")) {
       return;
     }
     const std::string cancelled = parameters_.type;
     parameters_.type = "hold";
     line_started_at_.reset();
     circle_started_at_.reset();
+    mission_leg_started_at_.reset();
     if (latest_input_ && latest_input_->valid) {
       parameters_.hold_position = latest_input_->position;
       parameters_.hold_yaw_rad = latest_input_->yaw;
@@ -322,9 +349,11 @@ private:
       && std::isfinite(input.position[0]) && std::isfinite(input.position[1])
       && std::isfinite(input.position[2]) && std::isfinite(input.yaw)) {
       const bool first_capture = !hold_reference_captured_;
-      parameters_.type = "hold";
-      line_started_at_.reset();
-      circle_started_at_.reset();
+      if (parameters_.type != "mission" && parameters_.type != "line" && parameters_.type != "circle") {
+        parameters_.type = "hold";
+        line_started_at_.reset();
+        circle_started_at_.reset();
+      }
       parameters_.hold_position = input.position;
       parameters_.hold_yaw_rad = input.yaw;
       hold_reference_captured_ = true;
@@ -456,6 +485,127 @@ private:
       parameters_.circle_radius, parameters_.circle_period_seconds,
       parameters_.circle_ramp_seconds,
       parameters_.circle_direction, parameters_.hold_yaw_rad);
+  }
+
+  struct MissionWaypoint
+  {
+    std::array<double, 3> position{};
+    double horizontal_speed = 4.0;
+    double vertical_speed = 1.5;
+    double hold_duration_s = 0.0;
+    std::string id;
+  };
+
+  double computeLegDuration(
+    const std::array<double, 3> & from, const MissionWaypoint & to) const noexcept
+  {
+    const double dx = to.position[0] - from[0];
+    const double dy = to.position[1] - from[1];
+    const double dz = to.position[2] - from[2];
+    const double d_xy = std::hypot(dx, dy);
+    const double d_z = std::abs(dz);
+    const double t_xy = (d_xy > 1e-3 && to.horizontal_speed > 0.0) ? d_xy / to.horizontal_speed : 0.0;
+    const double t_z = (d_z > 1e-3 && to.vertical_speed > 0.0) ? d_z / to.vertical_speed : 0.0;
+    return std::max({t_xy, t_z, 0.5}) + to.hold_duration_s;
+  }
+
+  bool loadMissionWaypoints()
+  {
+    if (mission_file_path_.empty()) {
+      RCLCPP_ERROR(get_logger(), "Mission file path is empty");
+      return false;
+    }
+
+    const auto mission = mpc_controller::mission::parse(mission_file_path_);
+    if (!mission.valid) {
+      RCLCPP_ERROR(
+        get_logger(), "Failed to parse mission JSON '%s': %s",
+        mission_file_path_.c_str(), mission.error.c_str());
+      return false;
+    }
+
+    mission_waypoints_.clear();
+    const double h_speed = (mission_speed_override_m_s_ > 0.0)
+      ? mission_speed_override_m_s_ : mission.defaults.horizontal_velocity_m_s;
+    const double v_speed = mission.defaults.vertical_velocity_m_s;
+
+    for (const auto & item : mission.items) {
+      if (item.type == mpc_controller::mission::ItemType::Takeoff) {
+        MissionWaypoint wp;
+        wp.id = item.id.empty() ? "takeoff" : item.id;
+        wp.position = parameters_.hold_position;
+        if (std::isfinite(item.waypoint.position_enu[2]) && item.waypoint.position_enu[2] > parameters_.hold_position[2]) {
+          wp.position[2] = item.waypoint.position_enu[2];
+        }
+        wp.horizontal_speed = h_speed;
+        wp.vertical_speed = v_speed;
+        mission_waypoints_.push_back(wp);
+      } else if (item.type == mpc_controller::mission::ItemType::Waypoint) {
+        MissionWaypoint wp;
+        wp.id = item.id;
+        wp.position = item.waypoint.position_enu;
+        wp.horizontal_speed = h_speed;
+        wp.vertical_speed = v_speed;
+        mission_waypoints_.push_back(wp);
+      } else if (item.type == mpc_controller::mission::ItemType::Hold) {
+        if (!mission_waypoints_.empty()) {
+          mission_waypoints_.back().hold_duration_s = item.hold.duration_seconds;
+        }
+      }
+    }
+
+    if (mission_waypoints_.empty()) {
+      RCLCPP_ERROR(get_logger(), "Mission contains no valid waypoints");
+      return false;
+    }
+
+    mission_wp_index_ = 0;
+    mission_leg_start_pos_ = parameters_.hold_position;
+    mission_leg_duration_s_ = computeLegDuration(mission_leg_start_pos_, mission_waypoints_[0]);
+    mission_leg_started_at_ = SteadyClock::now();
+
+    RCLCPP_INFO(
+      get_logger(),
+      "Direct MPC Waypoint Mission loaded: %zu waypoints from '%s', target_speed=%.2f m/s",
+      mission_waypoints_.size(), mission_file_path_.c_str(), h_speed);
+    return true;
+  }
+
+  void startMission(
+    const std::shared_ptr<Trigger::Request>, const std::shared_ptr<Trigger::Response> response)
+  {
+    if (manualVelocityMode()) {
+      if (latest_input_ && latest_input_->valid) {
+        parameters_.hold_position = latest_input_->position;
+        parameters_.hold_yaw_rad = latest_input_->yaw;
+        hold_reference_captured_ = true;
+      }
+      reference_input_mode_ = "mission";
+      manual_ready_ = false;
+      RCLCPP_INFO(get_logger(), "Dynamically switched reference_input_mode from manual_velocity to mission");
+    }
+    if (!valid_config_) {
+      response->success = false;
+      response->message = "mission rejected: invalid node configuration";
+      return;
+    }
+
+    if (!loadMissionWaypoints()) {
+      response->success = false;
+      response->message = "mission rejected: failed to load waypoints from " + mission_file_path_;
+      return;
+    }
+
+    parameters_.type = "mission";
+    line_started_at_.reset();
+    circle_started_at_.reset();
+    publish();
+
+    response->success = true;
+    response->message = "mission started: " + std::to_string(mission_waypoints_.size()) + " waypoints loaded from " + mission_file_path_;
+    RCLCPP_INFO(get_logger(),
+      "Mission initialized and active: %zu waypoints from '%s'",
+      mission_waypoints_.size(), mission_file_path_.c_str());
   }
 
   void getVectorParameter(const std::string &name, std::array<double, 3> &output)
@@ -890,7 +1040,7 @@ private:
     // The high-rate manual timer owns ReferenceTrajectory while Offboard is
     // active. Keep this low-rate timer only for prestream hold publication.
     if (manualVelocityMode() && offboard_active_) return;
-    if (auto_capture_current_hold_ && !hold_reference_captured_) {
+    if (parameters_.type != "mission" && auto_capture_current_hold_ && !hold_reference_captured_) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 5000,
         "Hold reference is waiting for a fresh vehicle state");
@@ -917,6 +1067,40 @@ private:
       parameters_.type = "hold";
       circle_started_at_.reset();
       RCLCPP_INFO(get_logger(), "Circle completed; start point promoted to hold");
+    } else if (parameters_.type == "mission" && mission_leg_started_at_ && !mission_waypoints_.empty()) {
+      const auto & target_wp = mission_waypoints_[mission_wp_index_];
+      const double leg_elapsed = std::chrono::duration<double>(steady_now - *mission_leg_started_at_).count();
+      double dist_to_target = 1000.0;
+      if (latest_input_ && latest_input_->valid) {
+        const double ex = latest_input_->position[0] - target_wp.position[0];
+        const double ey = latest_input_->position[1] - target_wp.position[1];
+        const double ez = latest_input_->position[2] - target_wp.position[2];
+        dist_to_target = std::sqrt(ex * ex + ey * ey + ez * ez);
+      }
+
+      const bool waypoint_reached = (dist_to_target < mission_acceptance_radius_m_
+        && leg_elapsed >= target_wp.hold_duration_s) || leg_elapsed >= mission_leg_duration_s_ * 1.5;
+
+      if (waypoint_reached) {
+        RCLCPP_INFO(
+          get_logger(),
+          "Mission waypoint %zu/%zu reached: id='%s' [%.2f, %.2f, %.2f]",
+          mission_wp_index_ + 1, mission_waypoints_.size(),
+          target_wp.id.c_str(), target_wp.position[0], target_wp.position[1], target_wp.position[2]);
+
+        mission_wp_index_++;
+        if (mission_wp_index_ >= mission_waypoints_.size()) {
+          parameters_.hold_position = target_wp.position;
+          parameters_.type = "hold";
+          mission_leg_started_at_.reset();
+          RCLCPP_INFO(get_logger(), "Mission completed successfully; holding final position [%.2f, %.2f, %.2f]",
+            parameters_.hold_position[0], parameters_.hold_position[1], parameters_.hold_position[2]);
+        } else {
+          mission_leg_start_pos_ = target_wp.position;
+          mission_leg_duration_s_ = computeLegDuration(mission_leg_start_pos_, mission_waypoints_[mission_wp_index_]);
+          mission_leg_started_at_ = steady_now;
+        }
+      }
     }
 
     Reference message;
@@ -935,31 +1119,62 @@ private:
         0.0, std::chrono::duration<double>(steady_now - *circle_started_at_).count());
     }
     for (uint64_t index = 0; index < count; ++index) {
-      const double time = trajectory_elapsed_seconds +
-        static_cast<double>(index * sample_ns) * 1.0e-9;
-      const bool circle_complete = parameters_.type == "circle" &&
-        time >= parameters_.circle_period_seconds;
-      const double model_time = circle_complete ? parameters_.circle_period_seconds : time;
-      mpc_controller::reference::Sample sample;
-      if (!mpc_controller::reference::sample(parameters_, model_time, sample)) {
-        RCLCPP_ERROR(get_logger(), "Reference sample failed at t=%.6f", time);
-        return;
-      }
-      if (parameters_.type == "line" || parameters_.type == "circle") {
-        sample.yaw = parameters_.hold_yaw_rad;
-        sample.yaw_rate = 0.0;
-      }
-      if (circle_complete) {
-        sample.velocity = {0.0, 0.0, 0.0};
-        sample.acceleration = {0.0, 0.0, 0.0};
-      }
       Point point;
       point.time_from_start = durationMessage(index * sample_ns);
-      point.position = sample.position;
-      point.velocity = sample.velocity;
-      point.acceleration = sample.acceleration;
-      point.yaw = sample.yaw;
-      point.yaw_rate = sample.yaw_rate;
+
+      if (parameters_.type == "mission" && mission_leg_started_at_ && mission_wp_index_ < mission_waypoints_.size()) {
+        const auto & target_wp = mission_waypoints_[mission_wp_index_];
+        const double leg_elapsed = std::max(0.0,
+          std::chrono::duration<double>(steady_now - *mission_leg_started_at_).count());
+        const double dt_horizon = static_cast<double>(index * sample_ns) * 1.0e-9;
+        const double t_future = leg_elapsed + dt_horizon;
+        const double alpha = (mission_leg_duration_s_ > 1e-3)
+          ? std::min(1.0, t_future / mission_leg_duration_s_) : 1.0;
+
+        const double dx = target_wp.position[0] - mission_leg_start_pos_[0];
+        const double dy = target_wp.position[1] - mission_leg_start_pos_[1];
+        const double dz = target_wp.position[2] - mission_leg_start_pos_[2];
+
+        point.position[0] = mission_leg_start_pos_[0] + alpha * dx;
+        point.position[1] = mission_leg_start_pos_[1] + alpha * dy;
+        point.position[2] = mission_leg_start_pos_[2] + alpha * dz;
+
+        if (alpha < 1.0 && mission_leg_duration_s_ > 1e-3) {
+          point.velocity[0] = dx / mission_leg_duration_s_;
+          point.velocity[1] = dy / mission_leg_duration_s_;
+          point.velocity[2] = dz / mission_leg_duration_s_;
+          point.yaw = (std::hypot(dy, dx) > 1e-3) ? std::atan2(dy, dx) : parameters_.hold_yaw_rad;
+        } else {
+          point.velocity = {0.0, 0.0, 0.0};
+          point.yaw = parameters_.hold_yaw_rad;
+        }
+        point.acceleration = {0.0, 0.0, 0.0};
+        point.yaw_rate = 0.0;
+      } else {
+        const double time = trajectory_elapsed_seconds +
+          static_cast<double>(index * sample_ns) * 1.0e-9;
+        const bool circle_complete = parameters_.type == "circle" &&
+          time >= parameters_.circle_period_seconds;
+        const double model_time = circle_complete ? parameters_.circle_period_seconds : time;
+        mpc_controller::reference::Sample sample;
+        if (!mpc_controller::reference::sample(parameters_, model_time, sample)) {
+          RCLCPP_ERROR(get_logger(), "Reference sample failed at t=%.6f", time);
+          return;
+        }
+        if (parameters_.type == "line" || parameters_.type == "circle") {
+          sample.yaw = parameters_.hold_yaw_rad;
+          sample.yaw_rate = 0.0;
+        }
+        if (circle_complete) {
+          sample.velocity = {0.0, 0.0, 0.0};
+          sample.acceleration = {0.0, 0.0, 0.0};
+        }
+        point.position = sample.position;
+        point.velocity = sample.velocity;
+        point.acceleration = sample.acceleration;
+        point.yaw = sample.yaw;
+        point.yaw_rate = sample.yaw_rate;
+      }
       message.points.push_back(point);
     }
     last_reference_ = message;
@@ -977,6 +1192,15 @@ private:
 
   mpc_controller::reference::Parameters parameters_{};
   std::string reference_input_mode_ = "trajectory";
+  std::string mission_file_path_{"config/missions/benchmark_square.json"};
+  double mission_acceptance_radius_m_ = 2.0;
+  double mission_speed_override_m_s_ = 0.0;
+  bool auto_start_mission_on_offboard_ = true;
+  std::vector<MissionWaypoint> mission_waypoints_;
+  std::size_t mission_wp_index_ = 0;
+  std::array<double, 3> mission_leg_start_pos_{0.0, 0.0, 1.0};
+  double mission_leg_duration_s_ = 0.0;
+  std::optional<SteadyClock::time_point> mission_leg_started_at_;
   std::array<double, 3> line_relative_delta_{2.0, 0.0, 0.0};
   std::string frame_id_ = "map";
   double horizon_seconds_ = 30.0;
@@ -1030,6 +1254,7 @@ private:
   rclcpp::Subscription<ReferenceStep>::SharedPtr step_subscription_;
   rclcpp::Service<Trigger>::SharedPtr start_line_service_;
   rclcpp::Service<Trigger>::SharedPtr start_circle_service_;
+  rclcpp::Service<Trigger>::SharedPtr start_mission_service_;
   rclcpp::Subscription<State>::SharedPtr state_subscription_;
   rclcpp::Subscription<px4_msgs::msg::VehicleControlMode>::SharedPtr control_mode_subscription_;
   rclcpp::Subscription<ManualControl>::SharedPtr manual_control_subscription_;

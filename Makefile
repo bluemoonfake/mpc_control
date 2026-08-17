@@ -112,6 +112,8 @@ help:
 	@echo "make stop    - stop SITL/HIL processes started by this Makefile"
 	@echo "make status  - show simulator process status"
 	@echo "make logs    - follow PX4, DDS and ROS logs"
+	@echo "make mission-start - trigger mission trajectory execution via ROS 2 service"
+	@echo "make benchmark     - run side-by-side PID vs MPC log comparison script"
 	@echo ""
 	@echo "Overrides: PX4_DIR=... HIL_DEVICE=/dev/ttyACM0 HIL_BAUD=921600 HIL_RATE_HZ=250 HIL_HEADLESS=0|1"
 	@echo "           PX4_MSGS_SETUP=... DDS_PORT=... GZ_GUI_QT_PLATFORM=wayland|xcb ROS_LAUNCH=... ROS_LAUNCH_ARGS=..."
@@ -329,3 +331,52 @@ logs:
 	@mkdir -p "$(SIM_RUNTIME_DIR)"
 	@touch "$(PX4_LOG)" "$(GZ_GUI_LOG)" "$(HIL_LOG)" "$(DDS_LOG)" "$(ROS_LOG)"
 	@tail -F "$(PX4_LOG)" "$(GZ_GUI_LOG)" "$(HIL_LOG)" "$(DDS_LOG)" "$(ROS_LOG)"
+
+PID_LOG ?= $(firstword $(wildcard /home/ubuntu/Dev/PX4_tracker/PX4-Autopilot/build/px4_sitl_default/rootfs/log/*/*_pid*.ulg /tmp/pid_flight.ulg))
+MPC_LOG ?= $(firstword $(wildcard /home/ubuntu/Dev/PX4_tracker/PX4-Autopilot/build/px4_sitl_default/rootfs/log/*/*_mpc*.ulg /tmp/mpc_flight.ulg))
+MISSION_JSON ?= config/missions/benchmark_square.json
+BENCHMARK_OUT ?= mission_benchmark_comparison.png
+
+mission-start:
+	@source "$(ROS_SETUP)"; \
+	if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; \
+	if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; \
+	ros2 service call /reference_generator_node/start_mission std_srvs/srv/Trigger {}
+
+arm:
+	@source "$(ROS_SETUP)"; \
+	if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; \
+	if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; \
+	ros2 topic pub --once /fmu/in/vehicle_command px4_msgs/msg/VehicleCommand "{command: 400, param1: 1.0, param2: 21196.0, target_system: 1, target_component: 1, source_system: 1, source_component: 1, from_external: true}"
+
+disarm:
+	@source "$(ROS_SETUP)"; \
+	if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; \
+	if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; \
+	ros2 topic pub --once /fmu/in/vehicle_command px4_msgs/msg/VehicleCommand "{command: 400, param1: 0.0, param2: 21196.0, target_system: 1, target_component: 1, source_system: 1, source_component: 1, from_external: true}"
+
+offboard:
+	@source "$(ROS_SETUP)"; \
+	if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; \
+	if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; \
+	ros2 topic pub --once /fmu/in/vehicle_command px4_msgs/msg/VehicleCommand "{command: 176, param1: 1.0, param2: 6.0, target_system: 1, target_component: 1, source_system: 1, source_component: 1, from_external: true}"
+
+mission-run: mission-start
+	@sleep 1.0
+	@$(MAKE) --no-print-directory arm
+	@sleep 0.5
+	@$(MAKE) --no-print-directory offboard
+	@echo "Mission initiated: trajectory streaming, vehicle armed, and offboard control active."
+
+pid-mission-run:
+	@python3 scripts/run_px4_pid_mission.py --mission "$(MISSION_JSON)"
+
+pid-plan-gen:
+	@python3 scripts/run_px4_pid_mission.py --mission "$(MISSION_JSON)" --plan-only
+
+benchmark:
+	@test -n "$(PID_LOG)" && test -f "$(PID_LOG)" || { echo "PID_LOG not found. Usage: make benchmark PID_LOG=path/to/pid.ulg MPC_LOG=path/to/mpc.ulg"; exit 1; }
+	@test -n "$(MPC_LOG)" && test -f "$(MPC_LOG)" || { echo "MPC_LOG not found. Usage: make benchmark PID_LOG=path/to/pid.ulg MPC_LOG=path/to/mpc.ulg"; exit 1; }
+	@python3 scripts/compare_mission_logs.py "$(PID_LOG)" "$(MPC_LOG)" --mission "$(MISSION_JSON)" --out "$(BENCHMARK_OUT)"
+
+
