@@ -215,7 +215,13 @@ public:
           if (!message) return;
           latest_mpc_output_ = *message;
           mpc_output_received_at_ = SteadyClock::now();
-          if (!message->valid) cancelTrajectoryForMpcFailure();
+          if (!message->valid) {
+            if (++mpc_consecutive_failures_ >= 15) {
+              cancelTrajectoryForMpcFailure();
+            }
+          } else {
+            mpc_consecutive_failures_ = 0;
+          }
           if (visualization_enabled_) publishVisualization();
         });
       if (visualization_enabled_) {
@@ -1249,6 +1255,7 @@ private:
   std::array<double, 3> reference_direction_enu_{0.0, 0.0, 0.0};
   bool reference_direction_valid_ = false;
   bool valid_config_ = false;
+  int mpc_consecutive_failures_ = 0;
   uint64_t trajectory_id_ = 1;
   rclcpp::Publisher<Reference>::SharedPtr publisher_;
   rclcpp::Subscription<ReferenceStep>::SharedPtr step_subscription_;

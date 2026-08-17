@@ -14,8 +14,8 @@
 namespace mpc_controller::translational
 {
 
-inline constexpr std::size_t kHorizonLength = axis_mpc::kHorizonLength;
-inline constexpr std::size_t kStateSize = axis_mpc::kStateDimension;
+inline constexpr std::size_t kHorizonLength = coupled_mpc::kHorizonLength;
+inline constexpr std::size_t kStateSize = 3;
 inline constexpr std::size_t kAxisCount = 3;
 inline constexpr double kDtFirst = 0.01;
 inline constexpr double kDtLater = 0.20;
@@ -24,8 +24,6 @@ using Vector3 = std::array<double, 3>;
 
 enum class Backend
 {
-  legacy,
-  coupled_shadow,
   coupled
 };
 
@@ -91,7 +89,7 @@ struct Config
   double max_collective_specific_force_m_s2 = 16.0;
   double constraint_slack_weight = 1.0e4;
   double max_constraint_slack = 20.0;
-  Backend backend = Backend::coupled_shadow;
+  Backend backend = Backend::coupled;
 };
 
 enum class FailureReason
@@ -110,10 +108,9 @@ struct UpdateResult
   FailureReason failure_reason = FailureReason::none;
   Vector3 control{};
   Vector3 first_predicted_acceleration{};
-  std::array<axis_mpc::Result, kAxisCount> axes{};
   coupled_mpc::Result coupled{};
-  bool coupled_solver_ran = false;
-  bool coupled_control_active = false;
+  bool coupled_solver_ran = true;
+  bool coupled_control_active = true;
   double shadow_control_difference_norm = 0.0;
   double coupled_solve_time_seconds = 0.0;
   bool deadline_missed = false;
@@ -199,68 +196,81 @@ public:
     const ReferenceTrajectoryData &trajectory, double time_from_start,
     ReferencePoint &output) noexcept
   {
-    if (!validTrajectory(trajectory) || !std::isfinite(time_from_start)
-      || time_from_start < 0.0) {
+    if (!validTrajectory(trajectory)) {
       return false;
     }
     if (time_from_start <= trajectory.points.front().time_from_start) {
       output = trajectory.points.front();
       return true;
     }
-    for (std::size_t index = 1; index < trajectory.points.size(); ++index) {
-      const auto &left = trajectory.points[index - 1];
-      const auto &right = trajectory.points[index];
-      if (time_from_start <= right.time_from_start) {
-        const double alpha = (time_from_start - left.time_from_start)
-          / (right.time_from_start - left.time_from_start);
-        output = interpolate(left, right, alpha);
-        return true;
+    if (time_from_start >= trajectory.points.back().time_from_start) {
+      output = trajectory.points.back();
+      if (trajectory.hold_after_end) {
+        output.velocity = {0.0, 0.0, 0.0};
+        output.acceleration = {0.0, 0.0, 0.0};
+        output.yaw_rate = 0.0;
       }
+      return true;
     }
-    if (!trajectory.hold_after_end) {
-      return false;
+
+    const auto it = std::lower_bound(
+      trajectory.points.begin(), trajectory.points.end(), time_from_start,
+      [](const ReferencePoint &point, double target) {
+        return point.time_from_start < target;
+      });
+    if (it == trajectory.points.begin()) {
+      output = *it;
+      return true;
     }
-    output = trajectory.points.back();
+    const auto &previous = *(it - 1);
+    const auto &next = *it;
+    const double delta_t = next.time_from_start - previous.time_from_start;
+    if (delta_t <= 1.0e-6) {
+      output = next;
+      return true;
+    }
+
+    const double fraction = std::clamp(
+      (time_from_start - previous.time_from_start) / delta_t, 0.0, 1.0);
+    output.time_from_start = time_from_start;
+    for (std::size_t axis = 0; axis < kAxisCount; ++axis) {
+      output.position[axis] = previous.position[axis]
+        + fraction * (next.position[axis] - previous.position[axis]);
+      output.velocity[axis] = previous.velocity[axis]
+        + fraction * (next.velocity[axis] - previous.velocity[axis]);
+      output.acceleration[axis] = previous.acceleration[axis]
+        + fraction * (next.acceleration[axis] - previous.acceleration[axis]);
+    }
+    output.yaw = previous.yaw + fraction * shortestAngle(previous.yaw, next.yaw);
+    output.yaw_rate = previous.yaw_rate
+      + fraction * (next.yaw_rate - previous.yaw_rate);
     return true;
   }
 
-  static bool buildHorizon(
-    const ReferenceTrajectoryData &trajectory, double elapsed_seconds,
-    double dt_first, double dt_later, ReferenceHorizon &output) noexcept
+  static bool sampleHorizon(
+    const ReferenceTrajectoryData &trajectory, double trajectory_age_seconds,
+    double dt_first, double dt_later, ReferenceHorizon &horizon) noexcept
   {
-    if (!validTrajectory(trajectory) || !std::isfinite(elapsed_seconds)
-      || elapsed_seconds < 0.0 || !std::isfinite(dt_first) || dt_first <= 0.0
-      || !std::isfinite(dt_later) || dt_later <= 0.0) {
+    if (trajectory_age_seconds < 0.0 || dt_first <= 0.0 || dt_later <= 0.0
+      || !validTrajectory(trajectory)) {
       return false;
     }
-    for (std::size_t index = 0; index < kHorizonLength; ++index) {
-      const double offset = dt_first + static_cast<double>(index) * dt_later;
-      if (!sampleAt(trajectory, elapsed_seconds + offset, output.points[index])) {
+
+    double stage_time = trajectory_age_seconds;
+    for (std::size_t step = 0; step < kHorizonLength; ++step) {
+      stage_time += (step == 0) ? dt_first : dt_later;
+      if (!sampleAt(trajectory, stage_time, horizon.points[step])) {
         return false;
       }
     }
     return true;
   }
 
-private:
-  static ReferencePoint interpolate(
-    const ReferencePoint &left, const ReferencePoint &right,
-    double alpha) noexcept
+  static bool buildHorizon(
+    const ReferenceTrajectoryData &trajectory, double trajectory_age_seconds,
+    double dt_first, double dt_later, ReferenceHorizon &horizon) noexcept
   {
-    ReferencePoint output;
-    output.time_from_start = left.time_from_start
-      + alpha * (right.time_from_start - left.time_from_start);
-    for (std::size_t axis = 0; axis < kAxisCount; ++axis) {
-      output.position[axis] = left.position[axis]
-        + alpha * (right.position[axis] - left.position[axis]);
-      output.velocity[axis] = left.velocity[axis]
-        + alpha * (right.velocity[axis] - left.velocity[axis]);
-      output.acceleration[axis] = left.acceleration[axis]
-        + alpha * (right.acceleration[axis] - left.acceleration[axis]);
-    }
-    output.yaw = left.yaw + alpha * shortestAngle(left.yaw, right.yaw);
-    output.yaw_rate = left.yaw_rate + alpha * (right.yaw_rate - left.yaw_rate);
-    return output;
+    return sampleHorizon(trajectory, trajectory_age_seconds, dt_first, dt_later, horizon);
   }
 };
 
@@ -270,10 +280,6 @@ public:
   explicit TranslationalMpc(const Config &config)
   : config_(config), coupled_solver_(coupledConfiguration(config))
   {
-    for (std::size_t axis = 0; axis < kAxisCount; ++axis) {
-      solvers_[axis] = std::make_unique<axis_mpc::Solver>(
-        axisConfiguration(config, axis, axis == 2));
-    }
   }
 
   void reset() noexcept {reset({0.0, 0.0, 0.0});}
@@ -281,22 +287,13 @@ public:
   void reset(const Vector3 &input_memory) noexcept
   {
     last_input_ = input_memory;
-    for (const auto &solver : solvers_) {
-      solver->reset();
-    }
     coupled_solver_.reset();
   }
 
   UpdateResult update(const MeasuredState &measured, const ReferenceHorizon &reference)
   {
     UpdateResult output;
-    const bool legacy_required = config_.backend != Backend::coupled;
-    const bool coupled_required = config_.backend != Backend::legacy;
-    const bool legacy_configured = std::all_of(
-      solvers_.begin(), solvers_.end(),
-      [](const auto &solver) {return solver && solver->configured();});
-    if (!validConfig(config_) || (legacy_required && !legacy_configured)
-      || (coupled_required && !coupled_solver_.configured())) {
+    if (!validConfig(config_) || !coupled_solver_.configured()) {
       output.failure_reason = FailureReason::invalid_configuration;
       return output;
     }
@@ -312,64 +309,32 @@ public:
     }
 
     setInputs(measured, reference);
-    const auto start = axis_mpc::Clock::now();
-    const auto solve_budget = std::chrono::duration_cast<axis_mpc::Clock::duration>(
+    const auto start = coupled_mpc::Clock::now();
+    const auto solve_budget = std::chrono::duration_cast<coupled_mpc::Clock::duration>(
       std::chrono::duration<double>(config_.solver_deadline_seconds));
-    const auto legacy_deadline = start + solve_budget;
-    if (legacy_required) {
-      for (std::size_t axis = 0; axis < kAxisCount; ++axis) {
-        output.axes[axis] = solvers_[axis]->solve(
-          initial_[axis], references_[axis], last_input_[axis], legacy_deadline);
-        output.deadline_missed = output.deadline_missed
-          || output.axes[axis].status == axis_mpc::Status::deadline_exceeded;
-      }
-    }
-    if (coupled_required) {
-      output.coupled_solver_ran = true;
-      const auto coupled_start = axis_mpc::Clock::now();
-      // Shadow mode runs after the legacy controller. Give the coupled QP the
-      // same standalone budget it will receive when it becomes the backend;
-      // otherwise admission measures legacy + coupled scheduling time.
-      const auto coupled_deadline = coupled_start + solve_budget;
-      output.coupled = coupled_solver_.solve(
-        coupled_initial_, coupled_reference_,
-        coupled_mpc::Input(last_input_[0], last_input_[1], last_input_[2]),
-        coupled_deadline);
-      output.coupled_solve_time_seconds = std::chrono::duration<double>(
-        axis_mpc::Clock::now() - coupled_start).count();
-      output.deadline_missed = output.deadline_missed
-        || output.coupled.status == coupled_mpc::Status::deadline_exceeded;
-    }
-    output.solve_time_seconds = std::chrono::duration<double>(
-      axis_mpc::Clock::now() - start).count();
-    const bool legacy_valid = legacy_required && std::all_of(
-      output.axes.begin(), output.axes.end(),
-      [](const axis_mpc::Result &result) {return result.valid;});
-    const bool selected_valid = config_.backend == Backend::coupled ?
-      output.coupled.valid : legacy_valid;
-    if (!selected_valid) {
+    const auto coupled_deadline = start + solve_budget;
+
+    output.coupled_solver_ran = true;
+    output.coupled = coupled_solver_.solve(
+      coupled_initial_, coupled_reference_,
+      coupled_mpc::Input(last_input_[0], last_input_[1], last_input_[2]),
+      coupled_deadline);
+    output.coupled_solve_time_seconds = std::chrono::duration<double>(
+      coupled_mpc::Clock::now() - start).count();
+    output.solve_time_seconds = output.coupled_solve_time_seconds;
+    output.deadline_missed = (output.coupled.status == coupled_mpc::Status::deadline_exceeded);
+
+    if (!output.coupled.valid) {
       output.failure_reason = FailureReason::solver_not_converged;
       return output;
     }
 
-    if (config_.backend == Backend::coupled) {
-      output.coupled_control_active = true;
-      for (std::size_t axis = 0; axis < kAxisCount; ++axis) {
-        output.control[axis] = output.coupled.first_control(axis);
-        output.first_predicted_acceleration[axis] = output.coupled.prediction[0](6 + axis);
-      }
-    } else {
-      for (std::size_t axis = 0; axis < kAxisCount; ++axis) {
-        output.control[axis] = output.axes[axis].first_control;
-        output.first_predicted_acceleration[axis] = output.axes[axis].prediction[0](2);
-      }
-      if (output.coupled_solver_ran && output.coupled.valid) {
-        const coupled_mpc::Input legacy(
-          output.control[0], output.control[1], output.control[2]);
-        output.shadow_control_difference_norm =
-          (output.coupled.first_control - legacy).norm();
-      }
+    output.coupled_control_active = true;
+    for (std::size_t axis = 0; axis < kAxisCount; ++axis) {
+      output.control[axis] = output.coupled.first_control(axis);
+      output.first_predicted_acceleration[axis] = output.coupled.prediction[0](6 + axis);
     }
+
     if (!std::isfinite(output.solve_time_seconds) || !finite(output.control)
       || !finite(output.first_predicted_acceleration)) {
       output.failure_reason = FailureReason::non_finite_solver_output;
@@ -383,31 +348,6 @@ public:
   }
 
 private:
-  static axis_mpc::Configuration axisConfiguration(
-    const Config &config, std::size_t axis, bool vertical)
-  {
-    axis_mpc::Configuration output;
-    output.dt_first = config.dt_first;
-    output.dt_later = config.dt_later;
-    output.model_time_constant = config.model_time_constant_xyz[axis];
-    output.stage_weights = vertical ? config.q_z : config.q_xy;
-    output.terminal_weights = vertical ? config.s_z : config.s_xy;
-    output.control_weight = vertical ? config.control_weight_z : config.control_weight_xy;
-    output.control_rate_weight = vertical ?
-      config.control_rate_weight_z : config.control_rate_weight_xy;
-    output.max_speed = vertical ? config.max_speed_z : config.max_speed_xy;
-    output.max_acceleration = vertical ?
-      config.max_acceleration_z : config.max_acceleration_xy;
-    output.max_control = vertical ? config.max_control_z : config.max_control_xy;
-    output.max_control_rate = vertical ?
-      config.max_control_rate_z : config.max_control_rate_xy;
-    output.max_iterations = config.max_iterations;
-    output.admm_rho = config.admm_rho;
-    output.absolute_tolerance = config.solver_absolute_tolerance;
-    output.relative_tolerance = config.solver_relative_tolerance;
-    return output;
-  }
-
   static coupled_mpc::Configuration coupledConfiguration(const Config &config)
   {
     coupled_mpc::Configuration output;
@@ -450,16 +390,6 @@ private:
     const MeasuredState &measured,
     const ReferenceHorizon &reference) noexcept
   {
-    for (std::size_t axis = 0; axis < kAxisCount; ++axis) {
-      initial_[axis] = axis_mpc::State(
-        measured.position[axis], measured.velocity[axis], measured.acceleration[axis]);
-      for (std::size_t step = 0; step < kHorizonLength; ++step) {
-        references_[axis][step] = axis_mpc::State(
-          reference.points[step].position[axis],
-          reference.points[step].velocity[axis],
-          reference.points[step].acceleration[axis]);
-      }
-    }
     coupled_initial_ <<
       measured.position[0], measured.position[1], measured.position[2],
       measured.velocity[0], measured.velocity[1], measured.velocity[2],
@@ -475,10 +405,7 @@ private:
   }
 
   Config config_;
-  std::array<std::unique_ptr<axis_mpc::Solver>, kAxisCount> solvers_{};
   coupled_mpc::Solver coupled_solver_;
-  std::array<axis_mpc::State, 3> initial_{};
-  std::array<axis_mpc::Reference, 3> references_{};
   coupled_mpc::State coupled_initial_ = coupled_mpc::State::Zero();
   coupled_mpc::Reference coupled_reference_{};
   Vector3 last_input_{};

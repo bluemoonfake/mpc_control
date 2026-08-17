@@ -225,21 +225,10 @@ private:
   using FailureReason = mpc_controller::translational::FailureReason;
 
   static bool parseBackend(
-    const std::string &name, mpc_controller::translational::Backend &backend) noexcept
+    const std::string & /*name*/, mpc_controller::translational::Backend &backend) noexcept
   {
-    if (name == "legacy") {
-      backend = mpc_controller::translational::Backend::legacy;
-      return true;
-    }
-    if (name == "coupled_shadow") {
-      backend = mpc_controller::translational::Backend::coupled_shadow;
-      return true;
-    }
-    if (name == "coupled") {
-      backend = mpc_controller::translational::Backend::coupled;
-      return true;
-    }
-    return false;
+    backend = mpc_controller::translational::Backend::coupled;
+    return true;
   }
 
   static double durationSeconds(const builtin_interfaces::msg::Duration &duration) noexcept
@@ -431,14 +420,13 @@ private:
     output.failure_reason = static_cast<uint8_t>(result.failure_reason);
     output.active_backend = static_cast<uint8_t>(config_.backend);
     for (std::size_t axis = 0; axis < 3; ++axis) {
-      const auto &axis_result = result.axes[axis];
-      output.solver_iterations[axis] = axis_result.iterations;
-      output.solver_status[axis] = static_cast<uint8_t>(axis_result.status);
-      output.solver_primal_residual[axis] = axis_result.primal_residual;
-      output.solver_dual_residual[axis] = axis_result.dual_residual;
-      output.solver_primal_tolerance[axis] = axis_result.primal_tolerance;
-      output.solver_dual_tolerance[axis] = axis_result.dual_tolerance;
-      output.recovery_constraint_active[axis] = axis_result.recovery_constraint_active;
+      output.solver_iterations[axis] = result.coupled.iterations;
+      output.solver_status[axis] = static_cast<uint8_t>(result.coupled.status);
+      output.solver_primal_residual[axis] = result.coupled.primal_residual;
+      output.solver_dual_residual[axis] = result.coupled.dual_residual;
+      output.solver_primal_tolerance[axis] = result.coupled.primal_tolerance;
+      output.solver_dual_tolerance[axis] = result.coupled.dual_tolerance;
+      output.recovery_constraint_active[axis] = result.coupled.recovery_constraint_active;
     }
     output.coupled_solver_ran = result.coupled_solver_ran;
     output.coupled_solver_valid = result.coupled.valid;
@@ -475,21 +463,14 @@ private:
       publishSetpoint(output.header, output.sequence, recovery, state_->yaw, true);
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "MPC failed: %s legacy_status=[%u %u %u] coupled_status=%u "
-        "iter=[%d %d %d]/%d "
-        "primal=[%.3g %.3g %.3g] dual=[%.3g %.3g %.3g] solve=%.3f ms; "
+        "MPC failed: %s coupled_status=%u "
+        "iter=%d primal=%.3g dual=%.3g solve=%.3f ms; "
         "recovery a=[%.2f %.2f %.2f]",
         failureReasonString(result.failure_reason),
-        static_cast<unsigned>(result.axes[0].status),
-        static_cast<unsigned>(result.axes[1].status),
-        static_cast<unsigned>(result.axes[2].status),
         static_cast<unsigned>(result.coupled.status),
-        result.axes[0].iterations, result.axes[1].iterations, result.axes[2].iterations,
         result.coupled.iterations,
-        result.axes[0].primal_residual, result.axes[1].primal_residual,
-        result.axes[2].primal_residual,
-        result.axes[0].dual_residual, result.axes[1].dual_residual,
-        result.axes[2].dual_residual,
+        result.coupled.primal_residual,
+        result.coupled.dual_residual,
         result.solve_time_seconds * 1000.0,
         recovery[0], recovery[1], recovery[2]);
       return;
@@ -500,13 +481,8 @@ private:
     for (std::size_t step = 0; step < mpc_controller::translational::kHorizonLength; ++step) {
       for (std::size_t axis = 0; axis < 3; ++axis) {
         for (std::size_t state = 0; state < 3; ++state) {
-          if (result.coupled_control_active) {
-            output.predicted_states[step * 9 + axis * 3 + state] =
-              result.coupled.prediction[step](3 * state + axis);
-          } else {
-            output.predicted_states[step * 9 + axis * 3 + state] =
-              result.axes[axis].prediction[step](state);
-          }
+          output.predicted_states[step * 9 + axis * 3 + state] =
+            result.coupled.prediction[step](3 * state + axis);
         }
       }
     }
@@ -523,7 +499,7 @@ private:
       "a_hat %.3f %.3f %.3f a_raw %.3f %.3f %.3f] "
       "u=[%.3f %.3f %.3f] ref_age=%.1f ms state_age=%.1f ms "
       "solve=%.3f ms mean=%.3f ms max=%.3f ms coupled_valid=%s "
-      "shadow_ready=%s(%u) delta_u=%.3f tilt_max=%.3f thrust_max=%.3f",
+      "tilt_max=%.3f thrust_max=%.3f",
       static_cast<unsigned long>(output.sequence),
       measured.position[0], measured.position[1], measured.position[2],
       measured.velocity[0], measured.velocity[1], measured.velocity[2],
@@ -535,8 +511,7 @@ private:
       (solve_time_total_seconds_ / static_cast<double>(solve_count_)) * 1000.0,
       solve_time_max_seconds_ * 1000.0,
       result.coupled.valid ? "true" : "false",
-      shadow_admission_ready_ ? "true" : "false", shadow_admission_samples_,
-      result.shadow_control_difference_norm, result.coupled.max_predicted_tilt_rad,
+      result.coupled.max_predicted_tilt_rad,
       result.coupled.max_predicted_collective_specific_force_m_s2);
     publishSetpoint(
       output.header, output.sequence, result.control, command_reference.yaw, false);
@@ -566,8 +541,7 @@ private:
   void updateShadowAdmission(
     const mpc_controller::translational::UpdateResult &result) noexcept
   {
-    if (config_.backend == mpc_controller::translational::Backend::legacy
-      || !result.coupled_solver_ran) {
+    if (!result.coupled_solver_ran) {
       shadow_admission_samples_ = 0;
       shadow_admission_ready_ = false;
       return;

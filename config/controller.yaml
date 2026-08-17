@@ -88,9 +88,7 @@ mpc_controller_node:
     solver_relative_tolerance: 0.001
     # legacy: three independent QPs; coupled_shadow: compare while legacy controls;
     # coupled: one 3D QP owns the command. Backend is read only at startup.
-    # Temporary flight-validation profile: isolate the corrected plant model
-    # and XY observer from coupled-shadow scheduling jitter.
-    controller_backend: legacy
+    controller_backend: coupled
     # Stage and terminal weights ordered [position, velocity, acceleration].
     # Prioritize position/velocity tracking. Acceleration remains weighted,
     # but does not dominate fast manual direction changes.
