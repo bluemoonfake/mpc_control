@@ -116,7 +116,7 @@ flowchart TD
 ## 3. Mathematical Formulation
 
 ### 3.1 State-Space Kinematics & Actuator Lag Model
-The 3D translational state vector $\mathbf{x} \in \mathbb{R}^9$ and control input $\mathbf{u} \in \mathbb{R}^3$ (Jerk) are defined as:
+The 3D translational state vector and control input (Jerk) are defined as:
 
 $$
 \mathbf{x} = \begin{bmatrix} \mathbf{p} \\ \mathbf{v} \\ \mathbf{a} \end{bmatrix} = \begin{bmatrix} p_x & p_y & p_z & v_x & v_y & v_z & a_x & a_y & a_z \end{bmatrix}^T, \quad \mathbf{u} = \dot{\mathbf{a}} = \begin{bmatrix} j_x \\ j_y \\ j_z \end{bmatrix}
@@ -143,7 +143,7 @@ $$
 ---
 
 ### 3.2 Quadratic Program (QP) Objective Function
-Over a prediction horizon of $N$ steps, the optimal jerk sequence $\mathbf{U}^* = [\mathbf{u}_0^T, \dots, \mathbf{u}_{N-1}^T]^T$ minimizes the tracking and control effort cost:
+Over a prediction horizon of $N$ steps, the optimal jerk sequence minimizes the tracking and control effort cost:
 
 $$
 \min_{\mathbf{u}_0, \dots, \mathbf{u}_{N-1}} J = \sum_{k=0}^{N-1} \left( \|\mathbf{p}_k - \mathbf{p}_{\text{ref}, k}\|_{\mathbf{Q}_p}^2 + \|\mathbf{v}_k - \mathbf{v}_{\text{ref}, k}\|_{\mathbf{Q}_v}^2 + \|\mathbf{a}_k - \mathbf{a}_{\text{ref}, k}\|_{\mathbf{Q}_a}^2 + \|\mathbf{u}_k\|_{\mathbf{R}}^2 + \|\mathbf{u}_k - \mathbf{u}_{k-1}\|_{\mathbf{R}_\Delta}^2 \right) + \|\mathbf{x}_N - \mathbf{x}_{\text{ref}, N}\|_{\mathbf{S}}^2
@@ -156,34 +156,56 @@ $$
 ### 3.3 Physical Envelope Constraints
 The optimization is subjected to hard linear inequality constraints:
 
-1. **Velocity Bounds**:
-   $|v_x| \le v_{xy, \max}, \quad |v_y| \le v_{xy, \max}, \quad |v_z| \le v_{z, \max}$
-2. **Acceleration Bounds**:
-   $|a_x| \le a_{xy, \max}, \quad |a_y| \le a_{xy, \max}, \quad |a_z| \le a_{z, \max}$
-3. **Jerk & Control Rate Bounds**:
-   $|\mathbf{u}_k| \le u_{\max}, \quad |\mathbf{u}_k - \mathbf{u}_{k-1}| \le \Delta u_{\max}$
-4. **8-Sided Polygonal Tilt Constraint** ($\theta \le \theta_{\max} = 45^\circ$):
-   $\mathbf{n}_i^T \mathbf{a}_{xy, k} \le g \cdot \tan(\theta_{\max}), \quad \forall i = 1, \dots, 8$
-5. **Collective Specific Force**:
-   $T_{\min} \le a_{z, k} + g \le T_{\max}$
+* **Velocity Bounds**:
+$$
+|v_x| \le v_{xy, \max}, \quad |v_y| \le v_{xy, \max}, \quad |v_z| \le v_{z, \max}
+$$
+
+* **Acceleration Bounds**:
+$$
+|a_x| \le a_{xy, \max}, \quad |a_y| \le a_{xy, \max}, \quad |a_z| \le a_{z, \max}
+$$
+
+* **Jerk & Control Rate Bounds**:
+$$
+\|\mathbf{u}_k\| \le u_{\max}, \quad \|\mathbf{u}_k - \mathbf{u}_{k-1}\| \le \Delta u_{\max}
+$$
+
+* **8-Sided Polygonal Tilt Constraint** ($\theta \le 45^\circ$):
+$$
+\mathbf{n}_i^T \mathbf{a}_{xy, k} \le g \cdot \tan(\theta_{\max}), \quad \forall i \in \{1, \dots, 8\}
+$$
+
+* **Collective Specific Force**:
+$$
+T_{\min} \le a_{z, k} + g \le T_{\max}
+$$
 
 ---
 
-### 3.4 $\mathbf{SO}(3)$ Force-to-Attitude & Thrust Mapping
-From the optimal first-knot acceleration $\mathbf{a}_{\text{des}} = \mathbf{a}_0 + \mathbf{u}_0^* \Delta t_0$, the desired specific force vector in ENU is:
+### 3.4 SO(3) Force-to-Attitude & Thrust Mapping
 
+From the optimal first-knot acceleration:
+$$
+\mathbf{a}_{\text{des}} = \mathbf{a}_0 + \mathbf{u}_0^* \cdot \Delta t_0
+$$
+
+The desired specific force vector in ENU frame is:
 $$
 \mathbf{f}_{\text{des}} = \mathbf{a}_{\text{des}} + \begin{bmatrix} 0 \\ 0 \\ g \end{bmatrix}, \quad \mathbf{z}_B = \frac{\mathbf{f}_{\text{des}}}{\|\mathbf{f}_{\text{des}}\|}
 $$
 
-Given the desired yaw angle $\psi_{\text{des}}$, an intermediate heading vector is defined as $\mathbf{x}_C = [\cos(\psi_{\text{des}}), \sin(\psi_{\text{des}}), 0]^T$. The full body orthonormal orientation $\mathbf{R}_{\text{des}} = [\mathbf{x}_B, \mathbf{y}_B, \mathbf{z}_B] \in SO(3)$ is constructed via:
+Given the desired yaw angle $\psi$, the intermediate heading vector is:
+$$
+\mathbf{x}_C = \begin{bmatrix} \cos(\psi) \\ \sin(\psi) \\ 0 \end{bmatrix}
+$$
 
+The body orthonormal orientation matrix $\mathbf{R}_{\text{des}} = [\mathbf{x}_B, \; \mathbf{y}_B, \; \mathbf{z}_B] \in SO(3)$ and target quaternion are constructed via:
 $$
 \mathbf{y}_B = \frac{\mathbf{z}_B \times \mathbf{x}_C}{\|\mathbf{z}_B \times \mathbf{x}_C\|}, \quad \mathbf{x}_B = \mathbf{y}_B \times \mathbf{z}_B \implies \mathbf{q}_{\text{des}} \in \mathbb{H}
 $$
 
-The normalized collective thrust command $T_{\text{norm}} \in [0, 1]$ is computed using the calibrated hover thrust $T_{\text{hover}}$:
-
+The normalized collective thrust command $T_{\text{norm}} \in [0, 1]$ is calibrated with the hover thrust parameter:
 $$
 T_{\text{norm}} = \text{clamp}\left( \frac{\|\mathbf{f}_{\text{des}}\|}{g} \cdot T_{\text{hover}}, \; 0.05, \; 1.0 \right)
 $$
