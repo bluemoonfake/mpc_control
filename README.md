@@ -118,97 +118,107 @@ flowchart TD
 ### 3.1 State-Space Kinematics & Actuator Lag Model
 The 3D translational state vector and control input (Jerk) are defined as:
 
-$$
-\mathbf{x} = \begin{bmatrix} \mathbf{p} \\ \mathbf{v} \\ \mathbf{a} \end{bmatrix} = \begin{bmatrix} p_x & p_y & p_z & v_x & v_y & v_z & a_x & a_y & a_z \end{bmatrix}^T, \quad \mathbf{u} = \dot{\mathbf{a}} = \begin{bmatrix} j_x \\ j_y \\ j_z \end{bmatrix}
-$$
+```math
+\mathbf{x} = \begin{bmatrix} \mathbf{p} \\ \mathbf{v} \\ \mathbf{a} \end{bmatrix} \in \mathbb{R}^9, \quad \mathbf{u} = \dot{\mathbf{a}} = \begin{bmatrix} j_x \\ j_y \\ j_z \end{bmatrix} \in \mathbb{R}^3
+```
 
-The continuous-time system dynamics incorporate a first-order acceleration-response lag $\boldsymbol{\tau} = [\tau_x, \tau_y, \tau_z]^T$ reflecting the physical delay of the inner attitude loop:
+The continuous-time dynamics incorporate a first-order acceleration-response lag reflecting the physical delay of the inner attitude loop:
 
-$$
+```math
 \dot{\mathbf{p}}(t) = \mathbf{v}(t), \quad \dot{\mathbf{v}}(t) = \mathbf{a}(t), \quad \dot{\mathbf{a}}(t) = -\frac{1}{\boldsymbol{\tau}} \mathbf{a}(t) + \frac{1}{\boldsymbol{\tau}} \mathbf{u}(t)
-$$
+```
 
-Discretizing with sampling step $\Delta t_k$ using exact integration ($\alpha_i = e^{-\Delta t_k / \tau_i}$ and $b_i = 1 - \alpha_i$) yields:
+Discretizing with step `dt_k`, using exact integration (`alpha_i = exp(-dt_k / tau_i)`, `b_i = 1 - alpha_i`):
 
-$$
-\mathbf{x}_{k+1} = \mathbf{A}(\Delta t_k) \mathbf{x}_k + \mathbf{B}(\Delta t_k) \mathbf{u}_k
-$$
+```math
+\mathbf{x}_{k+1} = \mathbf{A}(\Delta t_k) \, \mathbf{x}_k + \mathbf{B}(\Delta t_k) \, \mathbf{u}_k
+```
 
-where the discrete transition blocks for each axis $i \in \{x, y, z\}$ are:
+The per-axis discrete transition blocks are:
 
-$$
-\mathbf{A}_i(\Delta t_k) = \begin{bmatrix} 1 & \Delta t_k & \tau_i \Delta t_k - \tau_i^2 b_i \\ 0 & 1 & \tau_i b_i \\ 0 & 0 & \alpha_i \end{bmatrix}, \quad \mathbf{B}_i(\Delta t_k) = \begin{bmatrix} \frac{1}{2}\Delta t_k^2 - \tau_i \Delta t_k + \tau_i^2 b_i \\ \Delta t_k - \tau_i b_i \\ b_i \end{bmatrix}
-$$
+```math
+\mathbf{A}_i = \begin{bmatrix} 1 & \Delta t & \tau_i \Delta t - \tau_i^2 b_i \\ 0 & 1 & \tau_i b_i \\ 0 & 0 & \alpha_i \end{bmatrix}, \quad \mathbf{B}_i = \begin{bmatrix} \tfrac{1}{2}\Delta t^2 - \tau_i \Delta t + \tau_i^2 b_i \\ \Delta t - \tau_i b_i \\ b_i \end{bmatrix}
+```
 
 ---
 
 ### 3.2 Quadratic Program (QP) Objective Function
-Over a prediction horizon of $N$ steps, the optimal jerk sequence minimizes the tracking and control effort cost:
+Over a prediction horizon of N steps, the optimal jerk sequence minimizes tracking error and control effort:
 
-$$
-\min_{\mathbf{u}_0, \dots, \mathbf{u}_{N-1}} J = \sum_{k=0}^{N-1} \left( \|\mathbf{p}_k - \mathbf{p}_{\text{ref}, k}\|_{\mathbf{Q}_p}^2 + \|\mathbf{v}_k - \mathbf{v}_{\text{ref}, k}\|_{\mathbf{Q}_v}^2 + \|\mathbf{a}_k - \mathbf{a}_{\text{ref}, k}\|_{\mathbf{Q}_a}^2 + \|\mathbf{u}_k\|_{\mathbf{R}}^2 + \|\mathbf{u}_k - \mathbf{u}_{k-1}\|_{\mathbf{R}_\Delta}^2 \right) + \|\mathbf{x}_N - \mathbf{x}_{\text{ref}, N}\|_{\mathbf{S}}^2
-$$
+```math
+\min_{\mathbf{u}_0, \dots, \mathbf{u}_{N-1}} J = \sum_{k=0}^{N-1} \left( \|\mathbf{p}_k - \mathbf{p}_{\text{ref},k}\|_{\mathbf{Q}_p}^2 + \|\mathbf{v}_k - \mathbf{v}_{\text{ref},k}\|_{\mathbf{Q}_v}^2 + \|\mathbf{a}_k - \mathbf{a}_{\text{ref},k}\|_{\mathbf{Q}_a}^2 + \|\mathbf{u}_k\|_{\mathbf{R}}^2 + \|\mathbf{u}_k - \mathbf{u}_{k-1}\|_{\mathbf{R}_\Delta}^2 \right) + \|\mathbf{x}_N - \mathbf{x}_{\text{ref},N}\|_{\mathbf{S}}^2
+```
 
-* **Critical Damping**: Weights satisfy $\mathbf{Q}_v \ge 4.5 \cdot \mathbf{Q}_p$, eliminating overshoot and S-weaving oscillations after sharp corners.
+**Critical Damping**: Weights satisfy `Q_v >= 4.5 * Q_p`, eliminating overshoot and S-weaving oscillations after sharp corners.
 
 ---
 
 ### 3.3 Physical Envelope Constraints
-The optimization is subjected to hard linear inequality constraints:
+The optimization is subjected to hard linear inequality constraints.
 
-* **Velocity Bounds**:
-$$
-|v_x| \le v_{xy, \max}, \quad |v_y| \le v_{xy, \max}, \quad |v_z| \le v_{z, \max}
-$$
+**Velocity Bounds:**
 
-* **Acceleration Bounds**:
-$$
-|a_x| \le a_{xy, \max}, \quad |a_y| \le a_{xy, \max}, \quad |a_z| \le a_{z, \max}
-$$
+```math
+|v_x| \le v_{xy,\max}, \quad |v_y| \le v_{xy,\max}, \quad |v_z| \le v_{z,\max}
+```
 
-* **Jerk & Control Rate Bounds**:
-$$
+**Acceleration Bounds:**
+
+```math
+|a_x| \le a_{xy,\max}, \quad |a_y| \le a_{xy,\max}, \quad |a_z| \le a_{z,\max}
+```
+
+**Jerk & Control Rate Bounds:**
+
+```math
 \|\mathbf{u}_k\| \le u_{\max}, \quad \|\mathbf{u}_k - \mathbf{u}_{k-1}\| \le \Delta u_{\max}
-$$
+```
 
-* **8-Sided Polygonal Tilt Constraint** ($\theta \le 45^\circ$):
-$$
-\mathbf{n}_i^T \mathbf{a}_{xy, k} \le g \cdot \tan(\theta_{\max}), \quad \forall i \in \{1, \dots, 8\}
-$$
+**8-Sided Polygonal Tilt Constraint** (max tilt = 45 deg):
 
-* **Collective Specific Force**:
-$$
-T_{\min} \le a_{z, k} + g \le T_{\max}
-$$
+```math
+\mathbf{n}_i^T \, \mathbf{a}_{xy,k} \le g \cdot \tan(\theta_{\max}), \quad \forall\, i \in \{1, \dots, 8\}
+```
+
+**Collective Specific Force:**
+
+```math
+T_{\min} \le a_{z,k} + g \le T_{\max}
+```
 
 ---
 
 ### 3.4 SO(3) Force-to-Attitude & Thrust Mapping
 
 From the optimal first-knot acceleration:
-$$
-\mathbf{a}_{\text{des}} = \mathbf{a}_0 + \mathbf{u}_0^* \cdot \Delta t_0
-$$
 
-The desired specific force vector in ENU frame is:
-$$
+```math
+\mathbf{a}_{\text{des}} = \mathbf{a}_0 + \mathbf{u}_0^{*} \cdot \Delta t_0
+```
+
+The desired specific force vector in ENU frame:
+
+```math
 \mathbf{f}_{\text{des}} = \mathbf{a}_{\text{des}} + \begin{bmatrix} 0 \\ 0 \\ g \end{bmatrix}, \quad \mathbf{z}_B = \frac{\mathbf{f}_{\text{des}}}{\|\mathbf{f}_{\text{des}}\|}
-$$
+```
 
-Given the desired yaw angle $\psi$, the intermediate heading vector is:
-$$
+Given the desired yaw angle `psi`, the intermediate heading vector:
+
+```math
 \mathbf{x}_C = \begin{bmatrix} \cos(\psi) \\ \sin(\psi) \\ 0 \end{bmatrix}
-$$
+```
 
-The body orthonormal orientation matrix $\mathbf{R}_{\text{des}} = [\mathbf{x}_B, \; \mathbf{y}_B, \; \mathbf{z}_B] \in SO(3)$ and target quaternion are constructed via:
-$$
-\mathbf{y}_B = \frac{\mathbf{z}_B \times \mathbf{x}_C}{\|\mathbf{z}_B \times \mathbf{x}_C\|}, \quad \mathbf{x}_B = \mathbf{y}_B \times \mathbf{z}_B \implies \mathbf{q}_{\text{des}} \in \mathbb{H}
-$$
+The body orthonormal orientation and target quaternion:
 
-The normalized collective thrust command $T_{\text{norm}} \in [0, 1]$ is calibrated with the hover thrust parameter:
-$$
-T_{\text{norm}} = \text{clamp}\left( \frac{\|\mathbf{f}_{\text{des}}\|}{g} \cdot T_{\text{hover}}, \; 0.05, \; 1.0 \right)
-$$
+```math
+\mathbf{y}_B = \frac{\mathbf{z}_B \times \mathbf{x}_C}{\|\mathbf{z}_B \times \mathbf{x}_C\|}, \quad \mathbf{x}_B = \mathbf{y}_B \times \mathbf{z}_B \;\implies\; \mathbf{q}_{\text{des}} \in \mathbb{H}
+```
+
+The normalized collective thrust command:
+
+```math
+T_{\text{norm}} = \text{clamp}\!\left( \frac{\|\mathbf{f}_{\text{des}}\|}{g} \cdot T_{\text{hover}},\; 0.05,\; 1.0 \right)
+```
 
 ---
 
