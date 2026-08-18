@@ -157,25 +157,15 @@ $$
 The optimization is subjected to hard linear inequality constraints:
 
 1. **Velocity Bounds**:
-   $$
-   |v_x| \le v_{xy, \max}, \quad |v_y| \le v_{xy, \max}, \quad |v_z| \le v_{z, \max}
-   $$
+   $|v_x| \le v_{xy, \max}, \quad |v_y| \le v_{xy, \max}, \quad |v_z| \le v_{z, \max}$
 2. **Acceleration Bounds**:
-   $$
-   |a_x| \le a_{xy, \max}, \quad |a_y| \le a_{xy, \max}, \quad |a_z| \le a_{z, \max}
-   $$
+   $|a_x| \le a_{xy, \max}, \quad |a_y| \le a_{xy, \max}, \quad |a_z| \le a_{z, \max}$
 3. **Jerk & Control Rate Bounds**:
-   $$
-   |\mathbf{u}_k| \le u_{\max}, \quad |\mathbf{u}_k - \mathbf{u}_{k-1}| \le \Delta u_{\max}
-   $$
+   $|\mathbf{u}_k| \le u_{\max}, \quad |\mathbf{u}_k - \mathbf{u}_{k-1}| \le \Delta u_{\max}$
 4. **8-Sided Polygonal Tilt Constraint** ($\theta \le \theta_{\max} = 45^\circ$):
-   $$
-   n_{i, x} a_{x, k} + n_{i, y} a_{y, k} \le g \cdot \tan(\theta_{\max}), \quad \forall i = 1, \dots, 8
-   $$
+   $\mathbf{n}_i^T \mathbf{a}_{xy, k} \le g \cdot \tan(\theta_{\max}), \quad \forall i = 1, \dots, 8$
 5. **Collective Specific Force**:
-   $$
-   T_{\min} \le a_{z, k} + g \le T_{\max}
-   $$
+   $T_{\min} \le a_{z, k} + g \le T_{\max}$
 
 ---
 
