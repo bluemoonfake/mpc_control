@@ -1,58 +1,22 @@
 reference_generator_node:
   ros__parameters:
-    # manual_velocity: joystick; trajectory: ReferenceStep/line/circle; mission: schema.yaml JSON mission.
-    reference_input_mode: mission
     mission_file_path: "config/missions/benchmark_square.json"
-    mission_acceptance_radius_m: 2.0
+    mission_acceptance_radius_m: 2.5
     mission_speed_override_m_s: 0.0
     auto_start_mission_on_offboard: true
     frame_id: map
     # Follow measured position/yaw before Offboard and freeze at mode entry.
     auto_capture_current_hold: true
-    line_relative_delta: [2.0, 0.0, 0.0]
-    line_duration_seconds: 12.0
-    # Period and ramp are derived from radius, speed and acceleration limits.
-    circle_radius: 30.0
-    # Fast trajectory profile. Small circles may run slower to respect the
-    # centripetal-acceleration limit.
-    circle_reference_speed_limit_m_s: 5.0
-    circle_acceleration_limit_m_s2: 2.5
-    circle_direction: 1
+    hold_yaw_rad: 0.0
     state_timeout_seconds: 0.25
     horizon_seconds: 30.0
     sample_period_seconds: 0.1
-    publish_rate_hz: 1.0
-    # RViz: joystick green, selected reference red, MPC prediction cyan.
+    publish_rate_hz: 50.0
+    # RViz visualization markers.
     visualization_enabled: true
     visualization_publish_rate_hz: 20.0
     visualization_arrow_length_m: 1.0
     visualization_direction_deadband: 0.08
-    manual_input_timeout_seconds: 0.25
-    manual_update_rate_hz: 25.0
-    manual_stick_deadband: 0.05
-    manual_max_horizontal_speed_m_s: 3.0
-    manual_max_vertical_speed_m_s: 1.2
-    manual_max_horizontal_acceleration_m_s2: 2.5
-    manual_max_vertical_acceleration_m_s2: 1.0
-    manual_max_horizontal_jerk_m_s3: 4.0
-    manual_max_vertical_jerk_m_s3: 1.5
-    manual_max_yaw_rate_rad_s: 0.8
-    manual_max_horizontal_position_error_m: 2.0
-    manual_max_vertical_position_error_m: 0.5
-    # Rolling motion primitives. Collision checking is an explicit no-op until
-    # an obstacle representation is connected.
-    planner_horizon_seconds: 5.0
-    planner_sample_period_seconds: 0.1
-    planner_velocity_response_seconds: 0.5
-    planner_heading_offsets_deg: [-45.0, -30.0, -15.0, 0.0, 15.0, 30.0, 45.0]
-    planner_speed_scales: [0.5, 0.75, 1.0]
-    planner_intent_weight: 4.0
-    planner_progress_weight: 1.0
-    planner_acceleration_weight: 0.15
-    planner_jerk_weight: 0.05
-    planner_switch_weight: 0.4
-    planner_hysteresis: 0.1
-    visualization_max_prediction_points: 50
 
 vehicle_state_bridge_node:
   ros__parameters:
@@ -62,8 +26,7 @@ vehicle_state_bridge_node:
 
 mpc_controller_node:
   ros__parameters:
-    # Tuned x500 profile. For another airframe, keep the code unchanged and
-    # identify the model constants, gains, and physical operating limits here.
+    # Tuned x500 profile.
     update_rate_hz: 50.0
     strict_validation: false
     reference_timeout_seconds: 1.5
@@ -74,51 +37,37 @@ mpc_controller_node:
     # Whole X/Y/Z solve must finish before the 20 ms controller period.
     solver_deadline_seconds: 0.018
     max_iterations: 400
-    # Identified acceleration-response lag. XY uses the same constants in its
-    # command-aided acceleration observer; Z keeps direct measured feedback.
-    model_time_constant_xyz: [0.11, 0.11, 0.04]
+    # Identified acceleration-response lag (effective delay of PX4 Attitude cascade).
+    model_time_constant_xyz: [0.25, 0.25, 0.08]
     # ADMM solver settings.
     admm_rho: 0.05
-    # A lower initial rho converges faster when polygon/rate constraints become
-    # active; OSQP still adapts it internally as the active set changes.
     coupled_admm_rho: 0.05
-    # Absolute dual tolerance must remain below the normalized tracking
-    # gradient; 3e-4 preserves the command sign on small position errors.
     solver_absolute_tolerance: 0.0003
     solver_relative_tolerance: 0.001
-    # legacy: three independent QPs; coupled_shadow: compare while legacy controls;
-    # coupled: one 3D QP owns the command. Backend is read only at startup.
+    # coupled: one 3D QP owns the command.
     controller_backend: coupled
     # Stage and terminal weights ordered [position, velocity, acceleration].
-    # Prioritize position/velocity tracking. Acceleration remains weighted,
-    # but does not dominate fast manual direction changes.
-    # Acceleration remains in the prediction model and constraints, but gets a
-    # light tracking weight so estimator acceleration noise cannot dominate hover.
-    q_xy: [1200.0, 1500.0, 5.0]
-    s_xy: [1800.0, 1500.0, 10.0]
-    q_z: [500.0, 500.0, 2.0]
-    s_z: [800.0, 600.0, 5.0]
-    # J also penalizes control effort and input increments. XY regularization
-    # preserves small-step tracking; the lighter Z terms damp vertical command
-    # reversals without masking altitude error.
-    control_weight_xy: 5.0
-    control_rate_weight_xy: 10.0
-    control_weight_z: 3.0
-    control_rate_weight_z: 6.0
-    # Keep 1 m/s margin above the 5 m/s validation reference so the optimum is
-    # not forced onto the velocity constraint.
+    # Near-aperiodic damping: Q_vel/Q_pos ~7 kills lateral velocity before line-crossing.
+    q_xy: [80.0, 550.0, 2.0]
+    s_xy: [100.0, 600.0, 4.0]
+    q_z: [200.0, 350.0, 2.0]
+    s_z: [300.0, 400.0, 4.0]
+    # Penalize control rate (jerk) to damp attitude oscillations and ensure smooth tilting.
+    control_weight_xy: 1.5
+    control_rate_weight_xy: 40.0
+    control_weight_z: 4.0
+    control_rate_weight_z: 10.0
+    # Physical operating envelope for smooth waypoint tracking.
     max_speed_xy: 6.0
-    max_acceleration_xy: 5.0
-    max_control_xy: 5.0
-    max_control_rate_xy: 8.0
+    max_acceleration_xy: 3.5
+    max_control_xy: 3.5
+    max_control_rate_xy: 5.0
     max_speed_z: 2.0
     max_acceleration_z: 2.0
-    # Used only when strict_validation is enabled.
     max_measured_acceleration_z_m_s2: 10.0
     max_control_z: 3.0
     max_control_rate_z: 4.0
-    # Coupled-QP physical envelope. The 8-sided polygon (octagon) is an
-    # implementation choice; only these physical limits are airframe-specific.
+    # Coupled-QP physical envelope.
     min_collective_specific_force_m_s2: 1.0
     max_collective_specific_force_m_s2: 16.0
     constraint_slack_weight: 10000.0
@@ -130,3 +79,10 @@ mpc_controller_node:
     recovery_max_acceleration_z: 1.5
     # Hard translational-force tilt limit: 45 degrees.
     max_tilt: 0.7853981633974483
+
+px4_attitude_mode_node:
+  ros__parameters:
+    # Thrust mapping coefficients: specific force [m/s^2] -> normalized thrust [0..1]
+    # hover_thrust: hover normalized thrust in PX4 (~0.59 for x500)
+    hover_thrust: 0.59
+    gravity_m_s2: 9.80665

@@ -122,8 +122,7 @@ inline std::optional<Vector3> sanitizeDesiredSpecificForce(
   return normalized;
 }
 
-inline std::optional<Matrix3> so3Transform(
-  const Vector3 &body_z_world, double desired_yaw_rad) noexcept
+inline std::optional<Matrix3> so3Transform(const Vector3 &body_z_world, double desired_yaw_rad) noexcept
 {
   if (!finite(body_z_world) || !std::isfinite(desired_yaw_rad)
     || body_z_world.norm() < 1.0e-9) {
@@ -174,8 +173,7 @@ inline Output compute(const Parameters &parameters, const Input &input) noexcept
     return output;
   }
   output.desired_specific_force_world_m_s2 = *force;
-  const auto body_z = sanitizeDesiredSpecificForce(
-    *force, parameters.max_tilt_rad, output.tilt_angle_rad);
+  const auto body_z = sanitizeDesiredSpecificForce(*force, parameters.max_tilt_rad, output.tilt_angle_rad);
   if (!body_z) {
     output.failure_reason = FailureReason::tilt_limit;
     return output;

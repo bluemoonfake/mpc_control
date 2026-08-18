@@ -28,6 +28,7 @@ find_package(ament_cmake REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(px4_msgs REQUIRED)
+find_package(px4_ros2_cpp REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
@@ -37,11 +38,9 @@ find_package(visualization_msgs REQUIRED)
 set(msg_files
   "msg/TrajectoryPoint.msg"
   "msg/ReferenceTrajectory.msg"
-  "msg/ReferenceStep.msg"
   "msg/VehicleState.msg"
   "msg/MpcTranslationalOutput.msg"
   "msg/ForceAttitudeSetpoint.msg"
-  "msg/TorqueThrustSetpointPreview.msg"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -70,12 +69,12 @@ function(add_mpc_node target source)
 endfunction()
 
 add_mpc_node(reference_generator_node src/reference_generator_node.cpp
-  px4_msgs std_srvs visualization_msgs)
+  px4_msgs std_msgs std_srvs visualization_msgs)
 add_mpc_node(mpc_controller_node src/mpc_controller_node.cpp std_msgs)
 target_link_libraries(mpc_controller_node mpc_core)
 add_mpc_node(vehicle_state_bridge_node src/vehicle_state_bridge_node.cpp px4_msgs)
-add_mpc_node(px4_torque_thrust_setpoint_node src/px4_torque_thrust_setpoint_node.cpp px4_msgs)
-target_link_libraries(px4_torque_thrust_setpoint_node Eigen3::Eigen)
+add_mpc_node(px4_attitude_mode_node src/px4_attitude_mode_node.cpp px4_msgs px4_ros2_cpp std_msgs std_srvs)
+target_link_libraries(px4_attitude_mode_node Eigen3::Eigen px4_ros2_cpp::px4_ros2_cpp)
 
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)

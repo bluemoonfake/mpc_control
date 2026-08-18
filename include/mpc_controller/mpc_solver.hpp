@@ -55,7 +55,7 @@ struct Configuration
   double max_control_rate_xy = 0.0;
   double max_control_rate_z = 0.0;
   double gravity_m_s2 = 9.80665;
-  double max_tilt_rad = 0.7853981633974483;
+  double max_tilt_rad = 0.7853981633974483;   //45 degree
   double min_collective_specific_force_m_s2 = 1.0;
   double max_collective_specific_force_m_s2 = 16.0;
   double constraint_slack_weight = 1.0e4;

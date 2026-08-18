@@ -1,18 +1,16 @@
-# MPC Controller for PX4 Offboard
+# MPC Controller for PX4 (Native External Flight Mode)
 
-This ROS 2 package implements a measured-state MPC with geometric SO(3)
-torque/thrust Offboard output:
+This ROS 2 package implements a 3D Coupled MPC with native PX4 External Flight Mode attitude/thrust control:
 
 ```text
-reference_generator_node -> mpc_controller_node -> px4_torque_thrust_setpoint_node -> PX4
+reference_generator_node -> mpc_controller_node -> px4_attitude_mode_node -> PX4
                vehicle_state_bridge_node -------^
 ```
 
-The translational MPC runs at 50 Hz and converts the reference into desired
-specific force and attitude. A 250 Hz geometric SO(3) loop then publishes
-torque and thrust to PX4. `HoverThrustEstimate` calibrates the thrust mapping;
-`hover_thrust_normalized` is used only as a fallback, so vehicle mass is not a
-controller parameter.
+The translational MPC runs at 50 Hz and converts the reference trajectory into desired
+specific force and attitude. The `px4_attitude_mode_node` registers as a native Custom Flight
+Mode with PX4 Flight Mode Manager using `px4_ros2::ModeBase` and streams attitude setpoints
+to PX4 via `px4_ros2::AttitudeSetpointType`. `HoverThrustEstimate` continuously calibrates the thrust mapping.
 
 The torque loop reads PX4 attitude and angular velocity directly. The MPC uses
 the validated `/vehicle_state`; its state bridge rejects invalid, stale,

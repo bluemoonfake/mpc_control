@@ -9,9 +9,6 @@ def generate_launch_description():
     controller_config = PathJoinSubstitution([
         package_share, "config", "controller.yaml"
     ])
-    offboard_config = PathJoinSubstitution([
-        package_share, "config", "offboard.yaml"
-    ])
     return LaunchDescription([
         Node(
             package="mpc_controller",
@@ -36,9 +33,9 @@ def generate_launch_description():
         ),
         Node(
             package="mpc_controller",
-            executable="px4_torque_thrust_setpoint_node",
-            name="px4_torque_thrust_setpoint_node",
-            parameters=[offboard_config],
+            executable="px4_attitude_mode_node",
+            name="px4_attitude_mode_node",
+            parameters=[controller_config],
             output="screen",
         ),
     ])

@@ -179,7 +179,7 @@ inline Mission parse(const std::string & json_path)
 
     } else if (type_str == "hold") {
       item.type = ItemType::Hold;
-      item.hold.duration_seconds = item_json.value("duration", 1.0);
+      item.hold.duration_seconds = item_json.value("duration", 2.0);
 
     } else if (type_str == "changeSettings") {
       item.type = ItemType::ChangeSettings;

@@ -3,7 +3,7 @@
 <package format="3">
   <name>mpc_controller</name>
   <version>0.2.0</version>
-  <description>ROS 2 translational MPC with geometric SO(3) torque/thrust Offboard output.</description>
+  <description>ROS 2 3D Coupled MPC with native PX4 External Flight Mode attitude and thrust control.</description>
   <maintainer email="mpc_controller@example.com">mpc_controller</maintainer>
   <license>Proprietary</license>
 
@@ -13,6 +13,7 @@
   <depend>builtin_interfaces</depend>
   <depend>eigen</depend>
   <depend>px4_msgs</depend>
+  <depend>px4_ros2_cpp</depend>
   <depend>rclcpp</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>

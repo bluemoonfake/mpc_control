@@ -11,6 +11,9 @@ PX4_MSGS_SETUP ?= $(firstword $(wildcard $(CURDIR)/install/px4_msgs/local_setup.
 ROS_WORKSPACE_SETUP ?= $(CURDIR)/install/local_setup.bash
 PX4_TARGET ?= px4_sitl
 PX4_SIM ?= gz_x500
+PX4_SYS_ID ?= 2
+PX4_SIM_MODEL_INSTANCE ?= 0
+ROS_DOMAIN_ID ?= 0
 PX4_BUILD_DIR ?= $(PX4_DIR)/build/px4_sitl_default
 PX4_EXPECTED_COMMIT ?= 0b6e4687defb353a34201951809efd3f0040a9ba
 GZ_EXPECTED_VERSION ?= 8.11.0
@@ -62,6 +65,7 @@ GZ_GUI_VERBOSE ?= 1
 
 define GZ_GUI_START_COMMAND
 source "$(ROS_SETUP)"; \
+export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; \
 gui_bin=$$(command -v gz); \
 gui_ld="$${LD_LIBRARY_PATH:-}"; \
 gui_home="$${HOME:-$(HOME)}"; \
@@ -78,6 +82,7 @@ DISPLAY="$$gui_display" WAYLAND_DISPLAY="$$gui_wayland" \
 XDG_RUNTIME_DIR="$$gui_runtime" XDG_SESSION_TYPE="$$gui_session" \
 XAUTHORITY="$${XAUTHORITY:-}" QT_QPA_PLATFORM="$(GZ_GUI_QT_PLATFORM)" \
 LD_LIBRARY_PATH="$$gui_ld" \
+ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)" \
 "$$gui_bin" sim -g -v "$(GZ_GUI_VERBOSE)"
 endef
 
@@ -96,7 +101,7 @@ if test -n "$$stale_cache"; then \
 	echo "Recreating only the generated PX4 build directory: $(PX4_BUILD_DIR)"; \
 	rm -rf "$(PX4_BUILD_DIR)"; \
 fi; \
-	cd "$(PX4_DIR)" && exec make "$(PX4_TARGET)" "$(PX4_SIM)" < <(exec tail -f /dev/null)
+	cd "$(PX4_DIR)" && exec env PX4_SYS_ID="$(PX4_SYS_ID)" PX4_SIM_MODEL_INSTANCE="$(PX4_SIM_MODEL_INSTANCE)" make "$(PX4_TARGET)" "$(PX4_SIM)" < <(exec tail -f /dev/null)
 endef
 
 help:
@@ -248,7 +253,7 @@ px4: check
 
 dds: check
 	@mkdir -p "$(SIM_RUNTIME_DIR)"
-	@setsid bash -c 'exec "$(DDS_AGENT)" "$(DDS_TRANSPORT)" -p "$(DDS_PORT)"' \
+	@setsid bash -c 'export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; exec "$(DDS_AGENT)" "$(DDS_TRANSPORT)" -p "$(DDS_PORT)"' \
 		>"$(DDS_LOG)" 2>&1 & echo $$! >"$(DDS_PID)"
 	@echo "uXRCE-DDS agent started; log: $(DDS_LOG)"
 
@@ -261,7 +266,7 @@ ros: check build
 		fi; \
 		rm -f "$(ROS_PID)"; \
 	fi
-	@setsid bash -c 'exec 9>"$(ROS_LOCK)"; if ! flock -n 9; then echo "Another MPC ROS 2 pipeline already holds $(ROS_LOCK)"; exit 75; fi; echo $$$$ >"$(ROS_PID)"; source "$(ROS_SETUP)"; if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; exec ros2 launch "$(ROS_PACKAGE)" "$(ROS_LAUNCH)" $(ROS_LAUNCH_ARGS)' \
+	@setsid bash -c 'exec 9>"$(ROS_LOCK)"; if ! flock -n 9; then echo "Another MPC ROS 2 pipeline already holds $(ROS_LOCK)"; exit 75; fi; echo $$$$ >"$(ROS_PID)"; source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; exec ros2 launch "$(ROS_PACKAGE)" "$(ROS_LAUNCH)" $(ROS_LAUNCH_ARGS)' \
 		>"$(ROS_LOG)" 2>&1 &
 	@sleep 0.2; \
 	if ! test -f "$(ROS_PID)"; then \
@@ -297,10 +302,10 @@ sim: check build
 	fi
 	@setsid bash -c '$(PX4_START_COMMAND)' \
 		>"$(PX4_LOG)" 2>&1 & echo $$! >"$(PX4_PID)"
-	@setsid bash -c 'exec "$(DDS_AGENT)" "$(DDS_TRANSPORT)" -p "$(DDS_PORT)"' \
+	@setsid bash -c 'export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; exec "$(DDS_AGENT)" "$(DDS_TRANSPORT)" -p "$(DDS_PORT)"' \
 		>"$(DDS_LOG)" 2>&1 & echo $$! >"$(DDS_PID)"
 	@sleep 2
-	@setsid bash -c 'exec 9>"$(ROS_LOCK)"; if ! flock -n 9; then echo "Another MPC ROS 2 pipeline already holds $(ROS_LOCK)"; exit 75; fi; echo $$$$ >"$(ROS_PID)"; source "$(ROS_SETUP)"; if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; exec ros2 launch "$(ROS_PACKAGE)" "$(ROS_LAUNCH)" $(ROS_LAUNCH_ARGS)' \
+	@setsid bash -c 'exec 9>"$(ROS_LOCK)"; if ! flock -n 9; then echo "Another MPC ROS 2 pipeline already holds $(ROS_LOCK)"; exit 75; fi; echo $$$$ >"$(ROS_PID)"; source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; exec ros2 launch "$(ROS_PACKAGE)" "$(ROS_LAUNCH)" $(ROS_LAUNCH_ARGS)' \
 		>"$(ROS_LOG)" 2>&1 &
 	@echo "Simulation started with Gazebo GUI. No arm/offboard command was sent."
 	@echo "Run 'make status' and inspect logs under $(SIM_RUNTIME_DIR)."
@@ -338,28 +343,28 @@ MISSION_JSON ?= config/missions/benchmark_square.json
 BENCHMARK_OUT ?= mission_benchmark_comparison.png
 
 mission-start:
-	@source "$(ROS_SETUP)"; \
+	@source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; \
 	if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; \
 	if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; \
 	ros2 service call /reference_generator_node/start_mission std_srvs/srv/Trigger {}
 
 arm:
-	@source "$(ROS_SETUP)"; \
+	@source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; \
 	if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; \
 	if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; \
-	ros2 topic pub --once /fmu/in/vehicle_command px4_msgs/msg/VehicleCommand "{command: 400, param1: 1.0, param2: 21196.0, target_system: 1, target_component: 1, source_system: 1, source_component: 1, from_external: true}"
+	ros2 topic pub --once /fmu/in/vehicle_command px4_msgs/msg/VehicleCommand "{command: 400, param1: 1.0, param2: 21196.0, target_system: $(PX4_SYS_ID), target_component: 1, source_system: $(PX4_SYS_ID), source_component: 1, from_external: true}"
 
 disarm:
-	@source "$(ROS_SETUP)"; \
+	@source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; \
 	if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; \
 	if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; \
-	ros2 topic pub --once /fmu/in/vehicle_command px4_msgs/msg/VehicleCommand "{command: 400, param1: 0.0, param2: 21196.0, target_system: 1, target_component: 1, source_system: 1, source_component: 1, from_external: true}"
+	ros2 topic pub --once /fmu/in/vehicle_command px4_msgs/msg/VehicleCommand "{command: 400, param1: 0.0, param2: 21196.0, target_system: $(PX4_SYS_ID), target_component: 1, source_system: $(PX4_SYS_ID), source_component: 1, from_external: true}"
 
 offboard:
-	@source "$(ROS_SETUP)"; \
+	@source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; \
 	if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; \
 	if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; \
-	ros2 topic pub --once /fmu/in/vehicle_command px4_msgs/msg/VehicleCommand "{command: 176, param1: 1.0, param2: 6.0, target_system: 1, target_component: 1, source_system: 1, source_component: 1, from_external: true}"
+	ros2 topic pub --once /fmu/in/vehicle_command px4_msgs/msg/VehicleCommand "{command: 176, param1: 1.0, param2: 6.0, target_system: $(PX4_SYS_ID), target_component: 1, source_system: $(PX4_SYS_ID), source_component: 1, from_external: true}"
 
 mission-run: mission-start
 	@sleep 1.0
