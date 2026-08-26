@@ -1,11 +1,13 @@
 #include "mpc_controller/msg/reference_trajectory.hpp"
 #include "mpc_controller/msg/trajectory_point.hpp"
 #include "mpc_controller/msg/vehicle_state.hpp"
-#include "mpc_controller/mission_parser.hpp"
-#include "mpc_controller/reference_model.hpp"
+#include "mpc_controller/mission/mission_parser.hpp"
+#include "mpc_controller/mission/minimum_time_trajectory.hpp"
+#include "mpc_controller/controller/reference_model.hpp"
 
 #include <rclcpp/rclcpp.hpp>
-#include <px4_msgs/msg/vehicle_control_mode.hpp>
+#include <px4_msgs/msg/vehicle_status.hpp>
+#include <px4_ros2/utils/message_version.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <visualization_msgs/msg/marker.hpp>
@@ -28,29 +30,25 @@ public:
   : Node("reference_generator_node")
   {
     declareAndGet("frame_id", frame_id_);
+    declareAndGet("state_topic", state_topic_);
     declareAndGet("mission_file_path", mission_file_path_);
     declareAndGet("mission_acceptance_radius_m", mission_acceptance_radius_m_);
     declareAndGet("mission_speed_override_m_s", mission_speed_override_m_s_);
-    declareAndGet("auto_start_mission_on_offboard", auto_start_mission_on_offboard_);
     declareAndGet("hold_yaw_rad", parameters_.hold_yaw_rad);
     declareAndGet("auto_capture_current_hold", auto_capture_current_hold_);
-    declareAndGet("state_timeout_seconds", state_timeout_seconds_);
     declareAndGet("horizon_seconds", horizon_seconds_);
     declareAndGet("sample_period_seconds", sample_period_seconds_);
     declareAndGet("publish_rate_hz", publish_rate_hz_);
     declareAndGet("visualization_enabled", visualization_enabled_);
     declareAndGet("visualization_publish_rate_hz", visualization_publish_rate_hz_);
-    declareAndGet("visualization_arrow_length_m", visualization_arrow_length_m_);
-    declareAndGet("visualization_direction_deadband", visualization_direction_deadband_);
 
     declare_parameter("hold_position", std::vector<double>{0.0, 0.0, 1.0});
     getVectorParameter("hold_position", parameters_.hold_position);
 
-    valid_config_ = !frame_id_.empty()
+    valid_config_ = !frame_id_.empty() && !state_topic_.empty()
       && std::isfinite(horizon_seconds_) && horizon_seconds_ > 0.0
       && std::isfinite(sample_period_seconds_) && sample_period_seconds_ > 0.0
-      && std::isfinite(publish_rate_hz_) && publish_rate_hz_ > 0.0
-      && std::isfinite(state_timeout_seconds_) && state_timeout_seconds_ > 0.0;
+      && std::isfinite(publish_rate_hz_) && publish_rate_hz_ > 0.0;
 
     if (!valid_config_) {
       RCLCPP_ERROR(get_logger(), "Invalid reference generator parameters; publishing disabled");
@@ -69,21 +67,22 @@ public:
     // Subscriptions
     const auto qos = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort();
     state_subscription_ = create_subscription<State>(
-      "/vehicle_state_bridge_node/vehicle_state", qos,
+      state_topic_, qos,
       std::bind(&ReferenceGeneratorNode::stateCallback, this, std::placeholders::_1));
 
-    control_mode_subscription_ = create_subscription<px4_msgs::msg::VehicleControlMode>(
-      "/fmu/out/vehicle_control_mode", qos,
-      std::bind(&ReferenceGeneratorNode::controlModeCallback, this, std::placeholders::_1));
+    external_mode_subscription_ = create_subscription<px4_msgs::msg::VehicleStatus>(
+      "fmu/out/vehicle_status" +
+      px4_ros2::getMessageNameVersion<px4_msgs::msg::VehicleStatus>(), qos,
+      std::bind(&ReferenceGeneratorNode::externalModeCallback, this, std::placeholders::_1));
 
     // Services
     start_mission_service_ = create_service<std_srvs::srv::Trigger>(
       "~/start_mission",
       [this](const std_srvs::srv::Trigger::Request::SharedPtr,
              std_srvs::srv::Trigger::Response::SharedPtr response) {
-        startMission();
-        response->success = true;
-        response->message = "Mission started";
+        response->success = startMission();
+        response->message = response->success ? "Mission started" :
+          "Mission trajectory could not be planned";
       });
 
     reset_mission_service_ = create_service<std_srvs::srv::Trigger>(
@@ -114,6 +113,7 @@ private:
   using Point = mpc_controller::msg::TrajectoryPoint;
   using State = mpc_controller::msg::VehicleState;
   using SteadyClock = std::chrono::steady_clock;
+  using TrajectorySegment = mpc_controller::trajectory::QuinticSegment;
 
   struct StateInput
   {
@@ -129,6 +129,10 @@ private:
     std::array<double, 3> position{0.0, 0.0, 1.0};
     double horizontal_speed = 4.0;
     double vertical_speed = 1.5;
+    double maximum_acceleration = 2.5;
+    double maximum_jerk = 5.0;
+    double maximum_heading_rate_rad_s = 1.0471975511965976;
+    double heading_rad = NAN;
     double hold_duration_s = 0.0;
   };
 
@@ -155,16 +159,159 @@ private:
     return duration;
   }
 
-  double computeLegDuration(const std::array<double, 3> & from, const MissionWaypoint & to) const
+  mpc_controller::trajectory::Limits limitsFor(const MissionWaypoint &waypoint) const noexcept
   {
-    const double dx = to.position[0] - from[0];
-    const double dy = to.position[1] - from[1];
-    const double dz = to.position[2] - from[2];
-    const double d_xy = std::hypot(dx, dy);
-    const double d_z = std::abs(dz);
-    const double t_xy = (d_xy > 1e-3 && to.horizontal_speed > 0.0) ? d_xy / to.horizontal_speed : 0.0;
-    const double t_z = (d_z > 1e-3 && to.vertical_speed > 0.0) ? d_z / to.vertical_speed : 0.0;
-    return std::max({t_xy, t_z, 0.5}) + to.hold_duration_s;
+    return {waypoint.horizontal_speed, waypoint.vertical_speed,
+            waypoint.maximum_acceleration, waypoint.maximum_jerk,
+            waypoint.maximum_heading_rate_rad_s};
+  }
+
+  mpc_controller::reference::Sample missionSampleFromState(
+    const StateInput &state) const noexcept
+  {
+    mpc_controller::reference::Sample sample;
+    sample.position = state.position;
+    sample.velocity = state.velocity;
+    sample.yaw = state.yaw;
+    return sample;
+  }
+
+  std::array<double, 3> terminalVelocityForWaypoint(std::size_t waypoint_index) const noexcept
+  {
+    if (waypoint_index == 0 || waypoint_index + 1 >= mission_waypoints_.size() ||
+        mission_waypoints_[waypoint_index].hold_duration_s > 0.0) {
+      return {};
+    }
+    const MissionWaypoint &previous_waypoint = mission_waypoints_[waypoint_index - 1];
+    const MissionWaypoint &waypoint = mission_waypoints_[waypoint_index];
+    const MissionWaypoint &next_waypoint = mission_waypoints_[waypoint_index + 1];
+    const double horizontal_speed = std::min(waypoint.horizontal_speed,
+                                             next_waypoint.horizontal_speed);
+    const double vertical_speed = std::min(waypoint.vertical_speed,
+                                           next_waypoint.vertical_speed);
+    return mpc_controller::trajectory::blendedCornerVelocity(
+      previous_waypoint.position, waypoint.position, next_waypoint.position,
+      horizontal_speed, vertical_speed);
+  }
+
+  double terminalHeadingForWaypoint(
+    const mpc_controller::reference::Sample &start,
+    std::size_t waypoint_index) const noexcept
+  {
+    const MissionWaypoint &target = mission_waypoints_[waypoint_index];
+    if (std::isfinite(target.heading_rad)) {
+      return start.yaw + std::atan2(
+        std::sin(target.heading_rad - start.yaw),
+        std::cos(target.heading_rad - start.yaw));
+    }
+
+    const auto terminal_velocity = terminalVelocityForWaypoint(waypoint_index);
+    if (std::hypot(terminal_velocity[0], terminal_velocity[1]) > 1.0e-3) {
+      const double heading = std::atan2(terminal_velocity[1], terminal_velocity[0]);
+      return start.yaw + std::atan2(
+        std::sin(heading - start.yaw), std::cos(heading - start.yaw));
+    }
+
+    const double dx = target.position[0] - start.position[0];
+    const double dy = target.position[1] - start.position[1];
+    if (std::hypot(dx, dy) <= 1.0e-3) {
+      return start.yaw;
+    }
+    const double heading = std::atan2(dy, dx);
+    return start.yaw + std::atan2(
+      std::sin(heading - start.yaw), std::cos(heading - start.yaw));
+  }
+
+  std::optional<TrajectorySegment> planSegment(
+    const mpc_controller::reference::Sample &start,
+    std::size_t waypoint_index) const noexcept
+  {
+    if (waypoint_index >= mission_waypoints_.size()) {
+      return std::nullopt;
+    }
+    const MissionWaypoint &target = mission_waypoints_[waypoint_index];
+    mpc_controller::trajectory::Boundary initial;
+    initial.sample = start;
+    mpc_controller::trajectory::Boundary finish;
+    finish.sample.position = target.position;
+    finish.sample.velocity = terminalVelocityForWaypoint(waypoint_index);
+    finish.sample.yaw = terminalHeadingForWaypoint(start, waypoint_index);
+    return TrajectorySegment::create(initial, finish, limitsFor(target));
+  }
+
+  bool planMission(const mpc_controller::reference::Sample &start)
+  {
+    mission_segments_.clear();
+    mpc_controller::reference::Sample boundary = start;
+    for (std::size_t index = 0; index < mission_waypoints_.size(); ++index) {
+      const auto segment = planSegment(boundary, index);
+      if (!segment) {
+        RCLCPP_ERROR(get_logger(), "Cannot build a feasible trajectory to waypoint '%s'",
+                     mission_waypoints_[index].id.c_str());
+        mission_segments_.clear();
+        return false;
+      }
+      boundary = segment->sample(segment->durationSeconds());
+      mission_segments_.push_back(*segment);
+    }
+    return true;
+  }
+
+  bool beginMissionLeg()
+  {
+    if (mission_wp_index_ >= mission_segments_.size()) {
+      return false;
+    }
+    const MissionWaypoint &target = mission_waypoints_[mission_wp_index_];
+    active_segment_ = mission_segments_[mission_wp_index_];
+    mission_leg_duration_s_ = active_segment_->durationSeconds() + target.hold_duration_s;
+    RCLCPP_INFO(
+      get_logger(),
+      "Planned trajectory to '%s': duration=%.2fs limits=[v_xy=%.2f v_z=%.2f a=%.2f j=%.2f yaw_rate=%.2f deg/s]",
+      target.id.c_str(), active_segment_->durationSeconds(), target.horizontal_speed,
+      target.vertical_speed, target.maximum_acceleration, target.maximum_jerk,
+      target.maximum_heading_rate_rad_s / mpc_controller::mission::kDegreesToRadians);
+    return true;
+  }
+
+  mpc_controller::reference::Sample activeMissionSample(double elapsed_seconds) const noexcept
+  {
+    if (!active_segment_) {
+      return {};
+    }
+    return active_segment_->sample(std::min(elapsed_seconds, active_segment_->durationSeconds()));
+  }
+
+  static mpc_controller::reference::Sample stationary(
+    mpc_controller::reference::Sample sample) noexcept
+  {
+    sample.velocity = {};
+    sample.acceleration = {};
+    sample.yaw_rate = 0.0;
+    return sample;
+  }
+
+  mpc_controller::reference::Sample missionSampleAt(double elapsed_seconds) const noexcept
+  {
+    std::size_t segment_index = mission_wp_index_;
+    double remaining_seconds = std::max(0.0, elapsed_seconds);
+    while (segment_index < mission_segments_.size()) {
+      const TrajectorySegment &segment = mission_segments_[segment_index];
+      const double segment_duration = segment.durationSeconds();
+      if (remaining_seconds <= segment_duration) {
+        return segment.sample(remaining_seconds);
+      }
+      remaining_seconds -= segment_duration;
+      const auto endpoint = stationary(segment.sample(segment_duration));
+      const double hold_duration = mission_waypoints_[segment_index].hold_duration_s;
+      if (hold_duration > 0.0 && remaining_seconds <= hold_duration) {
+        return endpoint;
+      }
+      remaining_seconds -= hold_duration;
+      ++segment_index;
+    }
+    return mission_segments_.empty() ? mpc_controller::reference::Sample{} :
+      stationary(mission_segments_.back().sample(mission_segments_.back().durationSeconds()));
   }
 
   bool loadMissionWaypoints()
@@ -183,39 +330,70 @@ private:
     }
 
     mission_waypoints_.clear();
-    const double h_speed = (mission_speed_override_m_s_ > 0.0)
-      ? mission_speed_override_m_s_ : mission.defaults.horizontal_velocity_m_s;
-    const double v_speed = mission.defaults.vertical_velocity_m_s;
+    mpc_controller::mission::Defaults settings = mission.defaults;
+    if (mission_speed_override_m_s_ > 0.0) {
+      settings.horizontal_velocity_m_s = mission_speed_override_m_s_;
+    }
+
+    const auto makeWaypoint = [&settings] {
+      MissionWaypoint waypoint;
+      waypoint.horizontal_speed = settings.horizontal_velocity_m_s;
+      waypoint.vertical_speed = settings.vertical_velocity_m_s;
+      waypoint.maximum_acceleration = settings.maximum_acceleration_m_s2;
+      waypoint.maximum_jerk = settings.maximum_jerk_m_s3;
+      waypoint.maximum_heading_rate_rad_s =
+        settings.max_heading_rate_deg_s * mpc_controller::mission::kDegreesToRadians;
+      return waypoint;
+    };
 
     for (const auto & item : mission.items) {
       if (item.type == mpc_controller::mission::ItemType::Takeoff) {
-        MissionWaypoint wp;
+        MissionWaypoint wp = makeWaypoint();
         wp.id = item.id.empty() ? "takeoff" : item.id;
         wp.position = parameters_.hold_position;
         if (std::isfinite(item.waypoint.position_enu[2]) && item.waypoint.position_enu[2] > parameters_.hold_position[2]) {
           wp.position[2] = item.waypoint.position_enu[2];
         }
-        wp.horizontal_speed = 0.0;
-        wp.vertical_speed = std::clamp(v_speed, 0.5, 1.2);
+        wp.vertical_speed = std::clamp(settings.vertical_velocity_m_s, 0.5, 1.2);
         mission_waypoints_.push_back(wp);
       } else if (item.type == mpc_controller::mission::ItemType::Waypoint) {
-        MissionWaypoint wp;
+        MissionWaypoint wp = makeWaypoint();
         wp.id = item.id;
         wp.position = item.waypoint.position_enu;
-        wp.horizontal_speed = h_speed;
-        wp.vertical_speed = v_speed;
+        wp.heading_rad = item.waypoint.heading_rad;
         mission_waypoints_.push_back(wp);
       } else if (item.type == mpc_controller::mission::ItemType::Hold) {
         if (!mission_waypoints_.empty()) {
           mission_waypoints_.back().hold_duration_s = item.hold.duration_seconds;
         }
+      } else if (item.type == mpc_controller::mission::ItemType::ChangeSettings) {
+        if (item.settings.reset_all) {
+          settings = mission.defaults;
+          if (mission_speed_override_m_s_ > 0.0) {
+            settings.horizontal_velocity_m_s = mission_speed_override_m_s_;
+          }
+        }
+        if (std::isfinite(item.settings.horizontal_velocity_m_s)) {
+          settings.horizontal_velocity_m_s = item.settings.horizontal_velocity_m_s;
+        }
+        if (std::isfinite(item.settings.vertical_velocity_m_s)) {
+          settings.vertical_velocity_m_s = item.settings.vertical_velocity_m_s;
+        }
+        if (std::isfinite(item.settings.max_heading_rate_deg_s)) {
+          settings.max_heading_rate_deg_s = item.settings.max_heading_rate_deg_s;
+        }
+        if (std::isfinite(item.settings.maximum_acceleration_m_s2)) {
+          settings.maximum_acceleration_m_s2 = item.settings.maximum_acceleration_m_s2;
+        }
+        if (std::isfinite(item.settings.maximum_jerk_m_s3)) {
+          settings.maximum_jerk_m_s3 = item.settings.maximum_jerk_m_s3;
+        }
       } else if (item.type == mpc_controller::mission::ItemType::Land) {
-        MissionWaypoint wp;
+        MissionWaypoint wp = makeWaypoint();
         wp.id = item.id.empty() ? "landing" : item.id;
         wp.position = mission_waypoints_.empty() ? parameters_.hold_position : mission_waypoints_.back().position;
         wp.position[2] = 0.0;
-        wp.horizontal_speed = 0.0;
-        wp.vertical_speed = std::clamp(v_speed, 0.4, 0.8);
+        wp.vertical_speed = std::clamp(settings.vertical_velocity_m_s, 0.4, 0.8);
         mission_waypoints_.push_back(wp);
       }
     }
@@ -231,22 +409,25 @@ private:
     return true;
   }
 
-  void startMission()
+  bool startMission()
   {
     if (mission_waypoints_.empty() && !loadMissionWaypoints()) {
       RCLCPP_ERROR(get_logger(), "Cannot start mission: no waypoints loaded");
-      return;
+      return false;
     }
 
     mission_wp_index_ = 0;
+    mpc_controller::reference::Sample start;
     if (latest_input_ && latest_input_->valid) {
-      mission_leg_start_pos_ = latest_input_->position;
-      mission_leg_start_yaw_ = latest_input_->yaw;
+      start = missionSampleFromState(*latest_input_);
     } else {
-      mission_leg_start_pos_ = parameters_.hold_position;
-      mission_leg_start_yaw_ = parameters_.hold_yaw_rad;
+      start.position = parameters_.hold_position;
+      start.yaw = parameters_.hold_yaw_rad;
     }
-    mission_leg_duration_s_ = computeLegDuration(mission_leg_start_pos_, mission_waypoints_[0]);
+    if (!planMission(start) || !beginMissionLeg()) {
+      parameters_.type = "hold";
+      return false;
+    }
     mission_leg_started_at_ = SteadyClock::now();
     parameters_.type = "mission";
 
@@ -255,12 +436,15 @@ private:
       mission_waypoints_.size(), mission_waypoints_[0].id.c_str(),
       mission_waypoints_[0].position[0], mission_waypoints_[0].position[1],
       mission_waypoints_[0].position[2]);
+    return true;
   }
 
   void resetMission()
   {
     mission_wp_index_ = 0;
     mission_leg_started_at_.reset();
+    active_segment_.reset();
+    mission_segments_.clear();
     parameters_.type = "hold";
     if (latest_input_ && latest_input_->valid) {
       parameters_.hold_position = latest_input_->position;
@@ -272,41 +456,53 @@ private:
 
   void stateCallback(const State::SharedPtr message)
   {
-    const auto steady_now = SteadyClock::now();
-    last_state_received_at_ = steady_now;
-    last_state_timestamp_ = message->header.stamp.sec * 1000000000ULL + message->header.stamp.nanosec;
-
     StateInput input;
     input.position = {message->position[0], message->position[1], message->position[2]};
     input.velocity = {message->velocity[0], message->velocity[1], message->velocity[2]};
     input.yaw = message->yaw;
-    input.valid = message->control_ready;
+    // Reference timing needs a valid pose/velocity estimate.  PX4's heading
+    // readiness is a control-mode gate and must not prevent the mission from
+    // remembering the actual position at External Mode entry.
+    input.valid = message->valid && message->position_valid &&
+      message->velocity_valid && message->attitude_valid;
     latest_input_ = input;
 
-    if (auto_capture_current_hold_ && !hold_reference_captured_ && input.valid) {
-      parameters_.hold_position = input.position;
-      parameters_.hold_yaw_rad = input.yaw;
-      hold_reference_captured_ = true;
-      RCLCPP_INFO(
-        get_logger(),
-        "Initial hold position captured: [%.3f, %.3f, %.3f] yaw=%.3f rad",
-        parameters_.hold_position[0], parameters_.hold_position[1],
-        parameters_.hold_position[2], parameters_.hold_yaw_rad);
-    }
   }
 
-  void controlModeCallback(const px4_msgs::msg::VehicleControlMode::SharedPtr message)
+  void captureHoldAtExternalModeEntry()
   {
-    const bool is_offboard = message->flag_control_offboard_enabled;
-    if (is_offboard && !offboard_active_) {
-      RCLCPP_INFO(get_logger(), "Offboard mode activated");
-      if (auto_start_mission_on_offboard_) {
-        startMission();
-      }
-    } else if (!is_offboard && offboard_active_) {
-      RCLCPP_INFO(get_logger(), "Offboard mode deactivated");
+    if (!auto_capture_current_hold_) {
+      return;
     }
-    offboard_active_ = is_offboard;
+    if (!latest_input_ || !latest_input_->valid) {
+      RCLCPP_WARN(get_logger(),
+        "External Mode entered before a valid vehicle state; retaining the existing hold reference");
+      return;
+    }
+
+    parameters_.type = "hold";
+    parameters_.hold_position = latest_input_->position;
+    parameters_.hold_yaw_rad = latest_input_->yaw;
+    mission_wp_index_ = 0;
+    mission_leg_started_at_.reset();
+    active_segment_.reset();
+    mission_segments_.clear();
+    RCLCPP_INFO(
+      get_logger(),
+      "External Mode hold captured: [%.3f, %.3f, %.3f] yaw=%.3f rad",
+      parameters_.hold_position[0], parameters_.hold_position[1],
+      parameters_.hold_position[2], parameters_.hold_yaw_rad);
+  }
+
+  void externalModeCallback(const px4_msgs::msg::VehicleStatus::SharedPtr message)
+  {
+    const bool external_mode_active = message && message->executor_in_charge != 0;
+    if (external_mode_active && !external_mode_active_) {
+      captureHoldAtExternalModeEntry();
+    } else if (!external_mode_active && external_mode_active_) {
+      RCLCPP_INFO(get_logger(), "External Mode exited");
+    }
+    external_mode_active_ = external_mode_active;
   }
 
   void publish()
@@ -322,60 +518,55 @@ private:
       return;
     }
 
-    // Waypoint progression check
-    if (parameters_.type == "mission" && mission_leg_started_at_ && !mission_waypoints_.empty()) {
+    // Advance only after the scheduled segment/hold has elapsed and the
+    // vehicle reached the current waypoint. While late, the reference holds
+    // the endpoint rather than progressing through future legs.
+    if (parameters_.type == "mission" && mission_leg_started_at_ && active_segment_ &&
+        mission_wp_index_ < mission_waypoints_.size()) {
       const auto & target_wp = mission_waypoints_[mission_wp_index_];
       const double leg_elapsed = std::chrono::duration<double>(steady_now - *mission_leg_started_at_).count();
       double dist_to_target = 1000.0;
-      bool crossed_finish_plane = false;
 
       if (latest_input_ && latest_input_->valid) {
         const double ex = latest_input_->position[0] - target_wp.position[0];
         const double ey = latest_input_->position[1] - target_wp.position[1];
         const double ez = latest_input_->position[2] - target_wp.position[2];
         dist_to_target = std::sqrt(ex * ex + ey * ey + ez * ez);
-
-        // Cross-track plane test: has the drone passed the waypoint plane along the leg direction?
-        const double leg_dx = target_wp.position[0] - mission_leg_start_pos_[0];
-        const double leg_dy = target_wp.position[1] - mission_leg_start_pos_[1];
-        const double leg_dz = target_wp.position[2] - mission_leg_start_pos_[2];
-        const double leg_len = std::sqrt(leg_dx * leg_dx + leg_dy * leg_dy + leg_dz * leg_dz);
-        if (leg_len > 1e-3) {
-          const double dot = ex * (leg_dx / leg_len) + ey * (leg_dy / leg_len) + ez * (leg_dz / leg_len);
-          crossed_finish_plane = (dot >= 0.0);
-        }
       }
 
       const bool is_landing_wp = (target_wp.id == "landing" || target_wp.position[2] <= 0.1);
       const double acceptance_radius = is_landing_wp ? 0.35 : mission_acceptance_radius_m_;
-
-      // Waypoint reached conditions:
-      // 1. Classic: within acceptance radius and hold duration satisfied
-      // 2. Crossed finish plane: drone has flown past the waypoint plane (at least 50% leg time)
-      // 3. Time elapsed: allocated cruise time for the leg has elapsed and drone is in proximity
-      const bool waypoint_reached =
-        (dist_to_target < acceptance_radius && leg_elapsed >= target_wp.hold_duration_s)
-        || (crossed_finish_plane && !is_landing_wp && leg_elapsed >= 0.5 * mission_leg_duration_s_)
-        || (leg_elapsed >= mission_leg_duration_s_ && !is_landing_wp && dist_to_target < std::max(4.0, acceptance_radius * 2.5));
+      const auto completed_reference = activeMissionSample(active_segment_->durationSeconds());
+      const double terminal_speed = std::sqrt(
+        completed_reference.velocity[0] * completed_reference.velocity[0] +
+        completed_reference.velocity[1] * completed_reference.velocity[1] +
+        completed_reference.velocity[2] * completed_reference.velocity[2]);
+      const bool fly_through = !is_landing_wp && target_wp.hold_duration_s <= 0.0 &&
+        terminal_speed > 1.0e-3;
+      // A fly-through segment was planned with a non-zero terminal velocity
+      // that exactly matches the next segment's initial velocity. Advancing it
+      // on schedule preserves that continuity. Holding its endpoint while
+      // waiting for the acceptance radius would introduce an artificial
+      // zero-velocity reference for one or more controller samples.
+      const bool waypoint_reached = fly_through ?
+        leg_elapsed >= active_segment_->durationSeconds() :
+        leg_elapsed >= mission_leg_duration_s_ && dist_to_target < acceptance_radius;
 
       if (waypoint_reached) {
         RCLCPP_INFO(
           get_logger(),
-          "Mission waypoint %zu/%zu reached: id='%s' [%.2f, %.2f, %.2f] (dist=%.2fm, crossed_plane=%s)",
+          "Mission waypoint %zu/%zu reached: id='%s' [%.2f, %.2f, %.2f] (dist=%.2fm)",
           mission_wp_index_ + 1, mission_waypoints_.size(),
           target_wp.id.c_str(), target_wp.position[0], target_wp.position[1], target_wp.position[2],
-          dist_to_target, crossed_finish_plane ? "yes" : "no");
-
-        const double dx_leg = target_wp.position[0] - mission_leg_start_pos_[0];
-        const double dy_leg = target_wp.position[1] - mission_leg_start_pos_[1];
-        const double completed_leg_yaw = (std::hypot(dy_leg, dx_leg) > 0.5)
-          ? std::atan2(dy_leg, dx_leg) : mission_leg_start_yaw_;
+          dist_to_target);
 
         mission_wp_index_++;
         if (mission_wp_index_ >= mission_waypoints_.size()) {
           parameters_.hold_position = target_wp.position;
+          parameters_.hold_yaw_rad = completed_reference.yaw;
           parameters_.type = "hold";
           mission_leg_started_at_.reset();
+          active_segment_.reset();
           RCLCPP_INFO(get_logger(), "Mission completed successfully; handing off to native landing...");
 
           if (mission_completed_publisher_) {
@@ -384,15 +575,18 @@ private:
             mission_completed_publisher_->publish(msg);
           }
         } else {
-          mission_leg_start_pos_ = target_wp.position;
-          mission_leg_start_yaw_ = completed_leg_yaw;
-          mission_leg_duration_s_ = computeLegDuration(mission_leg_start_pos_, mission_waypoints_[mission_wp_index_]);
-          mission_leg_started_at_ = steady_now;
+          if (beginMissionLeg()) {
+            mission_leg_started_at_ = steady_now;
+          } else {
+            parameters_.type = "hold";
+            active_segment_.reset();
+          }
         }
       }
     }
 
-    // Build Reference message with 30-step Multi-Waypoint Horizon Preview
+    // Preview continuous future legs while the current one is on schedule. If
+    // the vehicle is late, hold the active endpoint until it is reached.
     Reference message;
     message.header.stamp = get_clock()->now();
     message.header.frame_id = frame_id_;
@@ -407,110 +601,24 @@ private:
       point.time_from_start = durationMessage(index * sample_ns);
       const double dt_horizon = static_cast<double>(index * sample_ns) * 1.0e-9;
 
-      if (parameters_.type == "mission" && mission_leg_started_at_ && mission_wp_index_ < mission_waypoints_.size()) {
+      if (parameters_.type == "mission" && mission_leg_started_at_ && active_segment_ &&
+          mission_wp_index_ < mission_waypoints_.size()) {
         const double leg_elapsed = std::max(0.0,
           std::chrono::duration<double>(steady_now - *mission_leg_started_at_).count());
-        const auto & target_wp = mission_waypoints_[mission_wp_index_];
-        const bool is_takeoff_or_landing = (target_wp.id == "takeoff" || target_wp.id == "landing");
-
-        if (is_takeoff_or_landing) {
-          const double t_future = leg_elapsed + dt_horizon;
-          const double alpha = (mission_leg_duration_s_ > 1e-3)
-            ? std::min(1.0, t_future / mission_leg_duration_s_) : 1.0;
-          const double dx = target_wp.position[0] - mission_leg_start_pos_[0];
-          const double dy = target_wp.position[1] - mission_leg_start_pos_[1];
-          const double dz = target_wp.position[2] - mission_leg_start_pos_[2];
-
-          // Slew-rate smoothed interpolation (Smoothstep) for takeoff & landing
-          const double s_pos = (alpha < 1.0) ? (3.0 * alpha * alpha - 2.0 * alpha * alpha * alpha) : 1.0;
-          const double s_vel = (alpha < 1.0 && mission_leg_duration_s_ > 1e-3) ? (6.0 * alpha * (1.0 - alpha)) : 0.0;
-
-          point.position[0] = mission_leg_start_pos_[0] + s_pos * dx;
-          point.position[1] = mission_leg_start_pos_[1] + s_pos * dy;
-          point.position[2] = mission_leg_start_pos_[2] + s_pos * dz;
-
-          if (alpha < 1.0 && mission_leg_duration_s_ > 1e-3) {
-            point.velocity[0] = (s_vel * dx) / mission_leg_duration_s_;
-            point.velocity[1] = (s_vel * dy) / mission_leg_duration_s_;
-            point.velocity[2] = (s_vel * dz) / mission_leg_duration_s_;
-            point.yaw = (std::hypot(dy, dx) > 1e-3) ? std::atan2(dy, dx) : parameters_.hold_yaw_rad;
-          } else {
-            point.velocity = {0.0, 0.0, 0.0};
-            point.yaw = parameters_.hold_yaw_rad;
-          }
-        } else {
-          // Multi-Waypoint Horizon Preview: lookahead seamlessly across current and upcoming legs
-          const double rem_in_curr_leg = std::max(0.0, mission_leg_duration_s_ - leg_elapsed);
-          if (dt_horizon <= rem_in_curr_leg || mission_wp_index_ + 1 >= mission_waypoints_.size()) {
-            const double t_future = leg_elapsed + dt_horizon;
-            const double alpha = (mission_leg_duration_s_ > 1e-3)
-              ? std::min(1.0, t_future / mission_leg_duration_s_) : 1.0;
-            const double dx = target_wp.position[0] - mission_leg_start_pos_[0];
-            const double dy = target_wp.position[1] - mission_leg_start_pos_[1];
-            const double dz = target_wp.position[2] - mission_leg_start_pos_[2];
-
-            point.position[0] = mission_leg_start_pos_[0] + alpha * dx;
-            point.position[1] = mission_leg_start_pos_[1] + alpha * dy;
-            point.position[2] = mission_leg_start_pos_[2] + alpha * dz;
-
-            if (alpha < 1.0 && mission_leg_duration_s_ > 1e-3) {
-              point.velocity[0] = dx / mission_leg_duration_s_;
-              point.velocity[1] = dy / mission_leg_duration_s_;
-              point.velocity[2] = dz / mission_leg_duration_s_;
-              point.yaw = (std::hypot(dy, dx) > 1e-3) ? std::atan2(dy, dx) : parameters_.hold_yaw_rad;
-            } else {
-              point.velocity = {0.0, 0.0, 0.0};
-              point.yaw = parameters_.hold_yaw_rad;
-            }
-          } else {
-            // dt_horizon extends into future waypoints along the mission path
-            double t_rem = dt_horizon - rem_in_curr_leg;
-            std::size_t next_idx = mission_wp_index_ + 1;
-            std::array<double, 3> seg_start = target_wp.position;
-            bool found = false;
-
-            while (next_idx < mission_waypoints_.size()) {
-              const auto & future_wp = mission_waypoints_[next_idx];
-              const double leg_dur = computeLegDuration(seg_start, future_wp);
-              const double dx = future_wp.position[0] - seg_start[0];
-              const double dy = future_wp.position[1] - seg_start[1];
-              const double dz = future_wp.position[2] - seg_start[2];
-
-              if (t_rem <= leg_dur) {
-                const double alpha = (leg_dur > 1e-3) ? (t_rem / leg_dur) : 1.0;
-                point.position[0] = seg_start[0] + alpha * dx;
-                point.position[1] = seg_start[1] + alpha * dy;
-                point.position[2] = seg_start[2] + alpha * dz;
-                point.velocity[0] = (leg_dur > 1e-3) ? (dx / leg_dur) : 0.0;
-                point.velocity[1] = (leg_dur > 1e-3) ? (dy / leg_dur) : 0.0;
-                point.velocity[2] = (leg_dur > 1e-3) ? (dz / leg_dur) : 0.0;
-                point.yaw = (std::hypot(dy, dx) > 1e-3) ? std::atan2(dy, dx) : parameters_.hold_yaw_rad;
-                found = true;
-                break;
-              }
-              t_rem -= leg_dur;
-              seg_start = future_wp.position;
-              next_idx++;
-            }
-
-            if (!found) {
-              const auto & last_wp = mission_waypoints_.back();
-              point.position = last_wp.position;
-              point.velocity = {0.0, 0.0, 0.0};
-              point.yaw = parameters_.hold_yaw_rad;
-            }
-          }
-        }
-        point.acceleration = {0.0, 0.0, 0.0};
-        point.yaw_rate = 0.0;
-      } else {
-        // Hold position fallback
-        point.position = parameters_.hold_position;
-        point.velocity = {0.0, 0.0, 0.0};
-        point.acceleration = {0.0, 0.0, 0.0};
-        point.yaw = parameters_.hold_yaw_rad;
-        point.yaw_rate = 0.0;
+        const bool on_schedule = leg_elapsed <= mission_leg_duration_s_;
+        const auto sample = on_schedule ? missionSampleAt(leg_elapsed + dt_horizon) :
+          stationary(activeMissionSample(active_segment_->durationSeconds()));
+        point.position = sample.position;
+        point.velocity = sample.velocity;
+        point.acceleration = sample.acceleration;
+        point.yaw = sample.yaw;
+        point.yaw_rate = sample.yaw_rate;
+        message.points.push_back(point);
+        continue;
       }
+
+      point.position = parameters_.hold_position;
+      point.yaw = parameters_.hold_yaw_rad;
       message.points.push_back(point);
     }
 
@@ -619,31 +727,25 @@ private:
   std::string mission_file_path_{"config/missions/benchmark_square.json"};
   double mission_acceptance_radius_m_ = 2.5;
   double mission_speed_override_m_s_ = 0.0;
-  bool auto_start_mission_on_offboard_ = true;
   std::vector<MissionWaypoint> mission_waypoints_;
+  std::vector<TrajectorySegment> mission_segments_;
   std::size_t mission_wp_index_ = 0;
-  std::array<double, 3> mission_leg_start_pos_{0.0, 0.0, 1.0};
-  double mission_leg_start_yaw_ = 0.0;
   double mission_leg_duration_s_ = 0.0;
   std::optional<SteadyClock::time_point> mission_leg_started_at_;
+  std::optional<TrajectorySegment> active_segment_;
   std::string frame_id_ = "map";
   double horizon_seconds_ = 30.0;
   double sample_period_seconds_ = 0.1;
   double publish_rate_hz_ = 50.0;
   bool visualization_enabled_ = true;
   double visualization_publish_rate_hz_ = 20.0;
-  double visualization_arrow_length_m_ = 1.0;
-  double visualization_direction_deadband_ = 0.08;
-  double state_timeout_seconds_ = 0.25;
   bool auto_capture_current_hold_ = true;
-  bool offboard_active_ = false;
-  bool hold_reference_captured_ = false;
+  bool external_mode_active_ = false;
   std::optional<StateInput> latest_input_;
-  std::optional<uint64_t> last_state_timestamp_;
-  std::optional<SteadyClock::time_point> last_state_received_at_;
   std::optional<Reference> last_reference_;
   std::optional<SteadyClock::time_point> last_visualization_published_at_;
   uint64_t trajectory_id_ = 1;
+  std::string state_topic_ = "vehicle_state";
   bool valid_config_ = false;
 
   // ROS Handles
@@ -651,7 +753,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr mission_completed_publisher_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr visualization_publisher_;
   rclcpp::Subscription<State>::SharedPtr state_subscription_;
-  rclcpp::Subscription<px4_msgs::msg::VehicleControlMode>::SharedPtr control_mode_subscription_;
+  rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr external_mode_subscription_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr start_mission_service_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_mission_service_;
   rclcpp::TimerBase::SharedPtr timer_;

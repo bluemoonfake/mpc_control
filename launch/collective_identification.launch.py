@@ -1,6 +1,5 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
@@ -10,20 +9,7 @@ def generate_launch_description():
     controller_config = PathJoinSubstitution([
         package_share, "config", "controller.yaml"
     ])
-    mission_file_path = LaunchConfiguration("mission_file_path")
     return LaunchDescription([
-        DeclareLaunchArgument(
-            "mission_file_path",
-            default_value="config/missions/benchmark_urban_canyon.json",
-            description="Mission JSON loaded by the reference generator",
-        ),
-        Node(
-            package="mpc_controller",
-            executable="reference_generator_node",
-            name="reference_generator_node",
-            parameters=[controller_config, {"mission_file_path": mission_file_path}],
-            output="screen",
-        ),
         Node(
             package="mpc_controller",
             executable="vehicle_state_bridge_node",
@@ -33,8 +19,8 @@ def generate_launch_description():
         ),
         Node(
             package="mpc_controller",
-            executable="mpc_controller_node",
-            name="mpc_controller_node",
+            executable="collective_identification_node",
+            name="collective_identification_node",
             parameters=[controller_config],
             output="screen",
         ),

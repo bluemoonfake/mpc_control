@@ -1,22 +1,19 @@
 reference_generator_node:
   ros__parameters:
-    mission_file_path: "config/missions/benchmark_square.json"
+    mission_file_path: "config/missions/benchmark_urban_canyon.json"
     mission_acceptance_radius_m: 2.5
     mission_speed_override_m_s: 0.0
-    auto_start_mission_on_offboard: true
     frame_id: map
-    # Follow measured position/yaw before Offboard and freeze at mode entry.
+    state_topic: vehicle_state
+    # Capture measured position/yaw exactly when PX4 activates External Mode.
     auto_capture_current_hold: true
     hold_yaw_rad: 0.0
-    state_timeout_seconds: 0.25
     horizon_seconds: 30.0
     sample_period_seconds: 0.1
     publish_rate_hz: 50.0
     # RViz visualization markers.
     visualization_enabled: true
     visualization_publish_rate_hz: 20.0
-    visualization_arrow_length_m: 1.0
-    visualization_direction_deadband: 0.08
 
 vehicle_state_bridge_node:
   ros__parameters:
@@ -24,65 +21,92 @@ vehicle_state_bridge_node:
     max_sample_skew_seconds: 0.10
     publish_rate_hz: 50.0
 
-mpc_controller_node:
+collective_identification_node:
   ros__parameters:
-    # Tuned x500 profile.
-    update_rate_hz: 50.0
-    strict_validation: false
-    reference_timeout_seconds: 1.5
-    state_timeout_seconds: 0.25
-    # Short first prediction knot remains independent of the 50 Hz callback.
-    dt_first: 0.01
-    dt_later: 0.20
-    # Whole X/Y/Z solve must finish before the 20 ms controller period.
-    solver_deadline_seconds: 0.018
-    max_iterations: 400
-    # Identified acceleration-response lag (effective delay of PX4 Attitude cascade).
-    model_time_constant_xyz: [0.25, 0.25, 0.08]
-    # ADMM solver settings.
-    admm_rho: 0.05
-    coupled_admm_rho: 0.05
-    solver_absolute_tolerance: 0.0003
-    solver_relative_tolerance: 0.001
-    # coupled: one 3D QP owns the command.
-    controller_backend: coupled
-    # Stage and terminal weights ordered [position, velocity, acceleration].
-    # Near-aperiodic damping: Q_vel/Q_pos ~7 kills lateral velocity before line-crossing.
-    q_xy: [80.0, 550.0, 2.0]
-    s_xy: [100.0, 600.0, 4.0]
-    q_z: [200.0, 350.0, 2.0]
-    s_z: [300.0, 400.0, 4.0]
-    # Penalize control rate (jerk) to damp attitude oscillations and ensure smooth tilting.
-    control_weight_xy: 1.5
-    control_rate_weight_xy: 40.0
-    control_weight_z: 4.0
-    control_rate_weight_z: 10.0
-    # Physical operating envelope for smooth waypoint tracking.
-    max_speed_xy: 6.0
-    max_acceleration_xy: 3.5
-    max_control_xy: 3.5
-    max_control_rate_xy: 5.0
-    max_speed_z: 2.0
-    max_acceleration_z: 2.0
-    max_measured_acceleration_z_m_s2: 10.0
-    max_control_z: 3.0
-    max_control_rate_z: 4.0
-    # Coupled-QP physical envelope.
-    min_collective_specific_force_m_s2: 1.0
-    max_collective_specific_force_m_s2: 16.0
-    constraint_slack_weight: 10000.0
-    max_constraint_slack: 20.0
-    # Bounded command used only while MPC is invalid or misses its deadline.
-    recovery_velocity_gain: 1.0
-    recovery_position_gain_z: 0.5
-    recovery_max_acceleration_xy: 2.5
-    recovery_max_acceleration_z: 1.5
-    # Hard translational-force tilt limit: 45 degrees.
-    max_tilt: 0.7853981633974483
+    output_path: "/tmp/mpc_controller_sim/collective_identification.csv"
+    sample_rate_hz: 50.0
+    settle_seconds: 5.0
+    excitation_amplitude_m_s2: 0.22
+    half_period_seconds: 1.5
+    cycles: 8
+    minimum_collective_m_s2: 8.0
+    maximum_collective_m_s2: 12.0
+    maximum_collective_rate_m_s3: 2.0
+    maximum_altitude_deviation_m: 0.75
+    maximum_vertical_speed_m_s: 1.0
+    maximum_start_vertical_speed_m_s: 0.15
+    altitude_hold_position_gain: 0.8
+    altitude_hold_velocity_gain: 1.2
+    maximum_identification_tilt_rad: 0.08
+    maximum_state_command_skew_seconds: 0.08
+    maximum_px4_telemetry_age_seconds: 0.10
+    maximum_vertical_acceleration_jump_m_s2: 2.5
+    collective_measurement_filter_time_constant_seconds: 0.08
 
 px4_attitude_mode_node:
   ros__parameters:
-    # Thrust mapping coefficients: specific force [m/s^2] -> normalized thrust [0..1]
-    # hover_thrust: hover normalized thrust in PX4 (~0.59 for x500)
-    hover_thrust: 0.59
+    px4_system_id: 2
+    # Includes trajectory time, waypoint acceptance waits, holds and descent.
+    mission_timeout_seconds: 300.0
+    # Shared 45-degree hard envelope; this must match Acados and reference feasibility.
+    command_safety_max_tilt_rad: 0.7853981633974483
+    command_safety_min_collective_specific_force_m_s2: 7.0
+    command_safety_max_collective_specific_force_m_s2: 14.0
+    command_safety_max_collective_rate_m_s3: 25.0
+    command_safety_max_yaw_rate_rad_s: 2.0
+
+mpc_controller_node:
+  ros__parameters:
+    # TMPC baseline from the paper: 10 shooting intervals at 50 Hz.
+    update_rate_hz: 50.0
+    strict_validation: true
+    reference_timeout_seconds: 1.5
+    state_timeout_seconds: 0.25
+    output_frame_id: map
+    sample_time_seconds: 0.05
+    solver_deadline_seconds: 0.018
     gravity_m_s2: 9.80665
+    roll_time_constant_seconds: 0.18
+    pitch_time_constant_seconds: 0.18
+    # Identified with the original PX4 yaw gains after removing the frame
+    # conversion jump and motor saturation.
+    yaw_natural_frequency_rad_s: 3.42
+    yaw_damping_ratio: 0.102
+    # Stabilized collective identification: tau=0.09317 s, delay=0.060 s,
+    # gain=1.003, R²=0.9966. The model represents the resolvable force lag only;
+    # the fixed control period accounts for the transport delay.
+    collective_time_constant_seconds: 0.0932
+    # Best validated SITL hold profile. State order: p(3), v(3), roll, pitch,
+    # yaw, collective force. Keep these defaults synchronized with the acados
+    # generator so regenerated solver code has the same nominal cost.
+    stage_weights: [20.0, 20.0, 80.0, 25.0, 25.0, 60.0, 5.0, 5.0, 20.0, 15.0, 15.0]
+    terminal_weights: [30.0, 30.0, 100.0, 30.0, 30.0, 70.0, 10.0, 10.0, 25.0, 20.0, 20.0]
+    # Input order: roll command, pitch command, yaw command, collective force.
+    # The yaw-command weight tracks the periodic mission yaw reference;
+    # delta-yaw separately penalizes change from the previously applied command.
+    input_weights: [80.0, 80.0, 15.0, 20.0]
+    yaw_command_delta_weight: 25.0
+    # This must match the actuator-side safety envelope below. The controller
+    # optimizes only commands that PX4 can receive without adapter clipping.
+    min_collective_specific_force_m_s2: 7.0
+    max_collective_specific_force_m_s2: 14.0
+    # Keep a bounded level-hover command until the force state is stable.
+    collective_handover_valid_samples: 5
+    # Do not expose the first NLP iterate while PX4 attitude/yaw-rate and the
+    # filtered collective state are still settling after mode transfer.
+    handover_minimum_duration_seconds: 1.0
+    handover_maximum_yaw_rate_rad_s: 0.15
+    collective_measurement_filter_time_constant_seconds: 0.15
+    max_tilt: 0.7853981633974483
+    max_tilt_rate_rad_s: 2.0
+    # Continuous yaw state is allowed to cross ±pi without an artificial bound.
+    max_yaw_command_rad: 1000000.0
+    max_yaw_command_rate_rad_s: 2.0
+    max_yaw_rate_rad_s: 2.0
+    max_collective_rate_m_s3: 25.0
+    command_filter_alpha: 0.50
+    # Bounded command used only while TMPC is invalid or misses its deadline.
+    recovery_velocity_gain: 1.0
+    recovery_position_gain: 0.5
+    recovery_max_acceleration_xy: 2.5
+    recovery_max_acceleration_z: 1.5

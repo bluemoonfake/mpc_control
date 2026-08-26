@@ -1,5 +1,5 @@
 #include "mpc_controller/msg/vehicle_state.hpp"
-#include "mpc_controller/state_bridge.hpp"
+#include "mpc_controller/bridge/state_bridge.hpp"
 
 #include <px4_msgs/msg/vehicle_angular_velocity.hpp>
 #include <px4_msgs/msg/vehicle_attitude.hpp>
@@ -273,6 +273,7 @@ private:
     state.acceleration = converted.acceleration_enu;
     state.attitude = converted.body_flu_to_world_enu;
     state.yaw = converted.yaw_enu;
+    state.yaw_rate = converted.yaw_rate_enu;
     // `valid` means the measured state is usable by the controller
     // processing. Active attitude/thrust control additionally requires
     // PX4's heading readiness, exposed separately below.

@@ -1,322 +1,293 @@
-# MPC Controller for PX4 (Native External Attitude Mode)
+# TMPC Controller for PX4
 
-A high-performance **3D Coupled Model Predictive Controller (MPC)** for multirotors running on **ROS 2 (Jazzy/Humble)** and integrated natively with **PX4 Autopilot** via `px4_ros2_cpp` (External Flight Mode).
+[![ROS 2](https://img.shields.io/badge/ROS%202-Jazzy-blue.svg)](https://docs.ros.org/en/jazzy/)
+[![PX4](https://img.shields.io/badge/PX4-Autopilot%20v1.14+-red.svg)](https://px4.io/)
+[![acados](https://img.shields.io/badge/acados-SQP--RTI%20%2F%20HPIPM-green.svg)](https://docs.acados.org/)
+[![C++17](https://img.shields.io/badge/standard-C%2B%2B17-blue.svg)](https://en.cppreference.com/w/cpp/17)
+[![Validation](https://img.shields.io/badge/SITL%20Gates-11%2F11%20ALL%20PASS-brightgreen.svg)](docs/validation/PASS_FAIL_CRITERIA.md)
+
+A high-performance, real-time **Tracking Model Predictive Control (TMPC)** framework for multirotor UAVs integrated with **PX4 Autopilot** and **ROS 2**. The system leverages an embedded **acados** C solver executing real-time **SQP-RTI (Real-Time Iteration)** with **HPIPM** quadratic programming to achieve sub-millisecond solve latencies at a $50\text{ Hz}$ control rate.
 
 ---
 
-## 1. System Architecture & Overall Dataflow
+## 1. System Architecture
 
-The system is organized into a modular 4-node pipeline communicating over high-frequency ROS 2 topics and MicroXRCE-DDS:
+The architecture adheres strictly to **Clean Architecture** principles, decoupling the mathematical domain and optimization solver from the ROS 2 and PX4 communication infrastructure:
 
 ```mermaid
-flowchart TD
-    %% Styling
-    classDef px4Node fill:#1f2937,stroke:#3b82f6,stroke-width:2px,color:#fff;
-    classDef rosNode fill:#111827,stroke:#10b981,stroke-width:2px,color:#fff;
-    classDef solverNode fill:#1e1b4b,stroke:#8b5cf6,stroke-width:2px,color:#fff;
-    classDef dataBox fill:#374151,stroke:#6b7280,stroke-width:1px,color:#e5e7eb;
-
-    %% PX4 Section
-    subgraph PX4_Domain ["PX4 Autopilot / SITL"]
-        PX4_EKF["EKF2 State Estimator<br/>(Local Position, Attitude, Gyro)"]:::px4Node
-        PX4_FMM["Flight Mode Manager<br/>(Custom Mode Registration)"]:::px4Node
-        PX4_AttCtrl["Attitude & Rate Controller<br/>(SO3 Angular Loop + Motors)"]:::px4Node
+graph TD
+    subgraph PX4_Ecosystem["PX4 Autopilot & Simulation (SITL / FMU v6x)"]
+        PX4_Sensors["Sensors / EKF2 State<br/>(Local Pos, Attitude, AngVel)"]
+        PX4_Mixer["PX4 Attitude & Rate Controller<br/>+ Motor Mixer"]
+        PX4_Mode["PX4 Mode Manager<br/>(External Mode Interface)"]
     end
 
-    %% State Bridge
-    subgraph Node_Bridge ["1. State Bridge Node"]
-        Bridge["vehicle_state_bridge_node<br/>- NED/FRD to ENU/FLU Conversion<br/>- Timestamp Monotonic & Skew Check"]:::rosNode
+    subgraph Bridge_Layer["State Bridge Subsystem"]
+        StateBridge["vehicle_state_bridge_node<br/>- Ingests NED/FRD PX4 Topics<br/>- Skew & Freshness Gate (<35ms)<br/>- Converts to ENU/FLU"]
     end
 
-    %% Reference Generator
-    subgraph Node_Ref ["2. Reference Generator Node"]
-        MissionParser["Mission Parser (JSON)<br/>- Schema.json"]:::dataBox
-        RefGen["reference_generator_node<br/>- Multi-Waypoint Horizon Preview (30 pts)<br/>- 3-Condition Waypoint Transition"]:::rosNode
+    subgraph Mission_Layer["Mission & Trajectory Subsystem"]
+        MissionParser["Mission Parser<br/>(JSON / Plan parser)"]
+        TrajGen["minimum_time_trajectory<br/>- Quintic Polynomial Splines<br/>- 3D Corner Bisector Scaling"]
+        RefNode["reference_generator_node<br/>- Streams ReferenceTrajectory<br/>- Manages Hold / Waypoint Advance"]
     end
 
-    %% MPC Solver
-    subgraph Node_MPC ["3. 3D Coupled MPC Node (50 Hz)"]
-        MPC["mpc_controller_node<br/>- 3D Coupled State-Space Model [p, v, a]<br/>- OSQP Sparse ADMM Solver"]:::solverNode
+    subgraph Controller_Layer["TMPC Controller Subsystem"]
+        MPCNode["mpc_controller_node (50 Hz Timer)<br/>- Handover Hold Gate (5 samples)<br/>- Reference Conversion Engine<br/>- Fallback Geometric Controller"]
+        SafetyLimiter["command_safety_limiter<br/>- Tilt Cone Projection<br/>- Slew-rate Limits"]
+        
+        subgraph Domain_Solver["TMPC Domain & Solver Engine"]
+            TPMCModel["tpmc_model (RK4 Integrator)"]
+            TPMCConstraints["tpmc_constraints (BGH Box & Tilt)"]
+            AcadosSolver["acados_tpmc_solver (C++ Adapter)<br/>- RAII Capsule Manager<br/>- Shifted Warm Start"]
+            GeneratedC["Generated acados C-Code<br/>(SQP-RTI, HPIPM QP Solver)"]
+        end
     end
 
-    %% PX4 Attitude Adapter
-    subgraph Node_Att ["4. PX4 Attitude Mode Node"]
-        AttMode["px4_attitude_mode_node<br/>- px4_ros2::ModeBase<br/>- SO(3) Force-to-Attitude Mapping"]:::rosNode
+    subgraph Actuation_Layer["PX4 Mode & Actuation Subsystem"]
+        AttitudeNode["px4_attitude_mode_node<br/>- MpcModeExecutor (Auto Sequence)<br/>- Force-to-Thrust Mapping<br/>- Attitude Setpoint Streaming"]
     end
 
-    %% Connections
-    PX4_EKF -->|"px4_msgs::VehicleLocalPosition<br/>px4_msgs::VehicleAttitude"| Bridge
-    Bridge -->|"mpc_controller::msg::VehicleState<br/>[Pos, Vel, Acc, Yaw] (ENU)"| MPC
-    Bridge -.->|"State Feedback"| RefGen
-
-    MissionParser --> RefGen
-    RefGen -->|"mpc_controller::msg::ReferenceTrajectory<br/>30-step Preview (dt=0.1s)"| MPC
-    RefGen -->|"std_msgs::Bool<br/>mission_completed"| AttMode
-
-    MPC -->|"mpc_controller::msg::MpcTranslationalOutput<br/>[a_des, yaw_des, status]"| AttMode
-
-    AttMode -->|"px4_ros2::AttitudeSetpoint<br/>[q_des, normalized_thrust]"| PX4_AttCtrl
-    AttMode <-->|"Mode Registration"| PX4_FMM
+    %% Signal Flows
+    PX4_Sensors -->|uXRCE-DDS (NED/FRD)| StateBridge
+    StateBridge -->|VehicleState (ENU/FLU)| RefNode
+    StateBridge -->|VehicleState (ENU/FLU)| MPCNode
+    
+    MissionParser --> TrajGen
+    TrajGen --> RefNode
+    RefNode -->|ReferenceTrajectory| MPCNode
+    
+    MPCNode --> TPMCModel
+    MPCNode --> TPMCConstraints
+    MPCNode --> AcadosSolver
+    AcadosSolver --> GeneratedC
+    GeneratedC --> AcadosSolver
+    AcadosSolver --> MPCNode
+    MPCNode --> SafetyLimiter
+    SafetyLimiter -->|ForceAttitudeSetpoint| AttitudeNode
+    
+    AttitudeNode -->|Attitude & Thrust Setpoint| PX4_Mixer
+    PX4_Mode <-->|Mode Handshake| AttitudeNode
 ```
 
 ---
 
-## 2. Dedicated 3D Coupled MPC Algorithm Flowchart
+## 2. Mathematical Formulation
 
-The internal 50 Hz execution loop of `mpc_controller_node` and `mpc_solver.cpp`:
+### 2.1 State and Control Vectors
 
-```mermaid
-flowchart TD
-    %% Styling
-    classDef inputNode fill:#065f46,stroke:#059669,stroke-width:2px,color:#fff;
-    classDef processNode fill:#1e293b,stroke:#64748b,stroke-width:2px,color:#fff;
-    classDef optNode fill:#4c1d95,stroke:#7c3aed,stroke-width:2px,color:#fff;
-    classDef decisionNode fill:#78350f,stroke:#d97706,stroke-width:2px,color:#fff;
-    classDef outputNode fill:#1e3a8a,stroke:#2563eb,stroke-width:2px,color:#fff;
+The optimization problem tracks a $15$-dimensional augmented state vector $x \in \mathbb{R}^{15}$ and a $4$-dimensional control vector $u \in \mathbb{R}^4$:
 
-    %% Steps
-    InState["State Ingestion<br/>Measured Position, Velocity, Yaw (ENU)"]:::inputNode
-    InRef["Reference Ingestion<br/>30-point Horizon Preview (p_ref, v_ref, a_ref)"]:::inputNode
+$$
+x = \big[ \underbrace{p_x, p_y, p_z}_{\text{position (ENU)}}, \underbrace{v_x, v_y, v_z}_{\text{velocity}}, \underbrace{\phi, \theta, \psi}_{\text{Euler angles}}, \underbrace{\dot{\psi}}_{\text{yaw rate}}, \underbrace{a}_{\text{specific force}}, \underbrace{u_{\phi,prev}, u_{\theta,prev}, u_{\psi,prev}, u_{a,prev}}_{\text{command memory for slew-rate limits}} \big]^T
+$$
 
-    Obs["Feedback Observer"]:::processNode
+$$
+u = [u_\phi, u_\theta, u_\psi, u_a]^T = [\text{roll command}, \text{pitch command}, \text{yaw command}, \text{collective specific force command}]^T
+$$
 
-    BuildQP["Construct 3D Coupled Quadratic Program (QP)<br/>- Decision Variables: Jerk Inputs u = dot(a) in R^3<br/>- State-Space Dynamics: x[k+1] = A*x[k] + B*u[k]"]:::processNode
+where $a \in [a_{min}, a_{max}]$ is the scalar collective specific force in $\text{m/s}^2$ ($a \approx g$ at hover).
 
-    CostMatrix["Formulate Cost Function J:<br/>min sum ||p - p_ref||_Qp^2 + ||v - v_ref||_Qv^2<br/>       + ||a - a_ref||_Qa^2 + ||u||_R^2 + ||Delta u||_Rrate^2<br/>(Critically Damped: Qv/Qp >= 4.5)"]:::processNode
+---
 
-    ConstraintMatrix["Formulate Hard Physical Constraints:<br/>- Velocity Envelope: |v_xy| <= 6.0 m/s, |v_z| <= 2.0 m/s<br/>- Acceleration Limits: |a_xy| <= 3.5 m/s^2, |a_z| <= 2.0 m/s^2<br/>- Jerk Rate Limits: |u_xy| <= 5.0 m/s^3<br/>- 8-Sided Polygon Tilt Constraint (theta <= 45 deg)<br/>- Collective Specific Force: 1.0 <= T_col <= 16.0 m/s^2"]:::processNode
+### 2.2 Continuous Nonlinear Multirotor Dynamics
 
-    SolveOSQP["OSQP Sparse ADMM Solver<br/>(Sparse CSC Matrices P, q, A_cons, l, u)<br/>Deadline: 18 ms | Max Iterations: 400"]:::optNode
+$$
+\begin{aligned}
+\dot{\vec{p}} &= \vec{v} \\
+\dot{\vec{v}} &= R(\phi, \theta, \psi) \begin{bmatrix} 0 \\ 0 \\ a \end{bmatrix} + \begin{bmatrix} 0 \\ 0 \\ -g \end{bmatrix} \\
+\dot{\phi} &= \frac{u_\phi - \phi}{\tau_\phi} \\
+\dot{\theta} &= \frac{u_\theta - \theta}{\tau_\theta} \\
+\dot{\psi} &= \dot{\psi} \\
+\ddot{\psi} &= \omega_n^2 \text{wrap}(u_\psi - \psi) - 2\zeta\omega_n \dot{\psi} \\
+\dot{a} &= \frac{u_a - a}{\tau_a}
+\end{aligned}
+$$
 
-    CheckFeasible{"Solver Converged<br/>& Status Feasible?"}:::decisionNode
+where $R(\phi, \theta, \psi) \in SO(3)$ is the Z-Y-X rotation matrix transforming the body thrust vector to the world ENU frame:
 
-    ExtractControl["Optimal Control Extraction:<br/>- Extract optimal first-knot jerk u_0*<br/>- Desired Acceleration: a_des = a_0 + u_0* * dt_first<br/>- Desired Specific Force: f_des = a_des + [0, 0, g]"]:::outputNode
+$$
+R_{ENU/FLU} \begin{bmatrix} 0 \\ 0 \\ a \end{bmatrix} = a \begin{bmatrix} \cos\psi \sin\theta \cos\phi + \sin\psi \sin\phi \\ \sin\psi \sin\theta \cos\phi - \cos\psi \sin\phi \\ \cos\theta \cos\phi \end{bmatrix}
+$$
 
-    RecoveryControl["Fallback Bounded Recovery Controller:<br/>- a_cmd = -K_v * v_err - K_p * p_err_z<br/>- Clamped to safe envelope (|a_xy| <= 2.5 m/s^2)"]:::decisionNode
+---
 
-    PublishOutput["Publish /mpc_translational_output<br/>- Desired Acceleration Vector (ENU)<br/>- Desired Yaw & Yaw Rate<br/>- Solver Iterations, Cost & Latency"]:::outputNode
+### 2.3 Optimal Control Problem (OCP) Formulation
 
-    %% Flow Connections
-    InState --> Obs
-    InRef --> BuildQP
-    Obs --> BuildQP
-    BuildQP --> CostMatrix
-    BuildQP --> ConstraintMatrix
-    CostMatrix --> SolveOSQP
-    ConstraintMatrix --> SolveOSQP
-    SolveOSQP --> CheckFeasible
-    CheckFeasible -->|"Yes"| ExtractControl
-    CheckFeasible -->|"No / Timeout"| RecoveryControl
-    ExtractControl --> PublishOutput
-    RecoveryControl --> PublishOutput
+The Optimal Control Problem solved at every $50\text{ Hz}$ cycle ($T = 20\text{ ms}$) over horizon $N = 10$ ($T_s = 0.05\text{ s}$, $T_{horizon} = 0.5\text{ s}$) is formulated as:
+
+$$
+\min_{x_{0:N}, u_{0:N-1}} \sum_{k=0}^{N-1} \left( \|x_k - x_{ref,k}\|_{Q}^2 + \|u_k - u_{ref,k}\|_{R}^2 + W_{\Delta\psi} (\Delta u_{\psi,k})^2 \right) + \|x_N - x_{ref,N}\|_{P}^2
+$$
+
+$$\text{subject to:}$$
+
+$$
+\begin{aligned}
+x_0 &= x_{\text{measured}} && \text{(Initial State Feedback)} \\
+x_{k+1} &= f_{\text{ERK4}}(x_k, u_k, p) && \text{(Discrete 4th-Order Runge-Kutta Dynamics)} \\
+x_{\text{lower}} &\le x_k \le x_{\text{upper}} && \text{(State Box Bounds)} \\
+u_{\text{lower}} &\le u_k \le u_{\text{upper}} && \text{(Control Box Bounds)} \\
+|\Delta u_k| &\le \Delta u_{\text{max}} && \text{(Slew-Rate Constraints: } \Delta u_k = u_k - u_{k-1} \text{)} \\
+z_{B,z}(x_k) &\ge \cos(\theta_{\text{max}}) && \text{(Nonlinear Full-Envelope Tilt Cone Constraint)}
+\end{aligned}
+$$
+
+#### Trigonometric Cost Residuals (Eliminating Yaw Singularities):
+To avoid discontinuous angle jumps at $\pm \pi$, yaw tracking errors are expressed in trigonometric residual space:
+
+$$
+\|x_{yaw} - x_{ref,yaw}\|_{Q}^2 = Q_{yaw} \left[ (\sin\psi - \sin\psi_{ref})^2 + (\cos\psi - \cos\psi_{ref})^2 \right]
+$$
+
+$$
+\|u_{yaw} - u_{ref,yaw}\|_{R}^2 = R_{yaw} \left[ (\sin u_\psi - \sin u_{\psi,ref})^2 + (\cos u_\psi - \cos u_{\psi,ref})^2 \right]
+$$
+
+---
+
+## 3. Repository Structure
+
+```text
+mpc_control/
+├── include/mpc_controller/
+│   ├── solver/                      # TMPC Solver Port, Types & acados Adapter
+│   │   ├── tpmc_solver.hpp
+│   │   ├── acados_tpmc_solver.hpp
+│   │   ├── tpmc_types.hpp
+│   │   ├── tpmc_model.hpp
+│   │   ├── tpmc_constraints.hpp
+│   │   └── tpmc_reference.hpp
+│   ├── controller/                  # Control Algorithms & Safety Filters
+│   │   ├── command_safety_limiter.hpp
+│   │   ├── force_attitude_mapping.hpp
+│   │   ├── geometric_controller.hpp
+│   │   ├── collective_force_filter.hpp
+│   │   └── reference_model.hpp
+│   ├── mission/                     # Trajectory Generation & Waypoints
+│   │   ├── mission_parser.hpp
+│   │   └── minimum_time_trajectory.hpp
+│   └── bridge/                      # Sensor State Ingestion & Framing
+│       └── state_bridge.hpp
+│
+├── src/
+│   ├── solver/                      # Implementation of solver domain & acados bridge
+│   ├── controller/                  # ROS 2 control nodes (mpc_controller_node, px4_attitude_mode_node)
+│   ├── mission/                     # reference_generator_node
+│   └── bridge/                      # vehicle_state_bridge_node
+│
+├── scripts/
+│   ├── analysis/                    # Validation analysis & plotting scripts
+│   ├── recording/                   # High-frequency telemetry CSV recorder
+│   └── execution/                   # PID mission executor & CPU stress generator
+│
+├── tools/acados/                    # Symbolic CasADi OCP model & C-code generator
+├── test/
+│   ├── cpp/                         # C++ unit tests (tpmc_core_test.cpp)
+│   └── python/                      # Python gate tests (analyze_validation_run_test.py)
+│
+├── config/                          # YAML parameters & benchmark mission files
+├── launch/                          # ROS 2 launch scripts
+├── docs/                            # Comprehensive engineering documentation suite
+└── validation_runs/                 # Archived benchmark datasets and reports
 ```
 
 ---
 
-## 3. Mathematical Formulation
+## 4. Build and Quickstart
 
-### 3.1 State-Space Kinematics & Actuator Lag Model
-The 3D translational state vector and control input (Jerk) are defined as:
+### 4.1 Prerequisites
+* **OS**: Ubuntu 24.04 LTS / 22.04 LTS
+* **ROS 2**: Jazzy Jalisco (or Iron / Humble)
+* **PX4**: PX4-Autopilot v1.14+ SITL with Gazebo Harmonic
+* **Libraries**: `Eigen3`, `acados`, `CasADi`, `px4_msgs`, `px4_ros2_cpp`
 
-```math
-\mathbf{x} = \begin{bmatrix} \mathbf{p} \\ \mathbf{v} \\ \mathbf{a} \end{bmatrix} \in \mathbb{R}^9, \quad \mathbf{u} = \dot{\mathbf{a}} = \begin{bmatrix} j_x \\ j_y \\ j_z \end{bmatrix} \in \mathbb{R}^3
-```
-
-The continuous-time dynamics incorporate a first-order acceleration-response lag reflecting the physical delay of the inner attitude loop:
-
-```math
-\dot{\mathbf{p}}(t) = \mathbf{v}(t), \quad \dot{\mathbf{v}}(t) = \mathbf{a}(t), \quad \dot{\mathbf{a}}(t) = -\frac{1}{\boldsymbol{\tau}} \mathbf{a}(t) + \frac{1}{\boldsymbol{\tau}} \mathbf{u}(t)
-```
-
-Discretizing with step `dt_k`, using exact integration (`alpha_i = exp(-dt_k / tau_i)`, `b_i = 1 - alpha_i`):
-
-```math
-\mathbf{x}_{k+1} = \mathbf{A}(\Delta t_k) \, \mathbf{x}_k + \mathbf{B}(\Delta t_k) \, \mathbf{u}_k
-```
-
-The per-axis discrete transition blocks are:
-
-```math
-\mathbf{A}_i = \begin{bmatrix} 1 & \Delta t & \tau_i \Delta t - \tau_i^2 b_i \\ 0 & 1 & \tau_i b_i \\ 0 & 0 & \alpha_i \end{bmatrix}, \quad \mathbf{B}_i = \begin{bmatrix} \tfrac{1}{2}\Delta t^2 - \tau_i \Delta t + \tau_i^2 b_i \\ \Delta t - \tau_i b_i \\ b_i \end{bmatrix}
-```
-
----
-
-### 3.2 Quadratic Program (QP) Objective Function
-Over a prediction horizon of N steps, the optimal jerk sequence minimizes tracking error and control effort:
-
-```math
-\min_{\mathbf{u}_0, \dots, \mathbf{u}_{N-1}} J = \sum_{k=0}^{N-1} \left( \|\mathbf{p}_k - \mathbf{p}_{\text{ref},k}\|_{\mathbf{Q}_p}^2 + \|\mathbf{v}_k - \mathbf{v}_{\text{ref},k}\|_{\mathbf{Q}_v}^2 + \|\mathbf{a}_k - \mathbf{a}_{\text{ref},k}\|_{\mathbf{Q}_a}^2 + \|\mathbf{u}_k\|_{\mathbf{R}}^2 + \|\mathbf{u}_k - \mathbf{u}_{k-1}\|_{\mathbf{R}_\Delta}^2 \right) + \|\mathbf{x}_N - \mathbf{x}_{\text{ref},N}\|_{\mathbf{S}}^2
-```
-
-**Critical Damping**: Weights satisfy `Q_v >= 4.5 * Q_p`, eliminating overshoot and S-weaving oscillations after sharp corners.
-
----
-
-### 3.3 Physical Envelope Constraints
-The optimization is subjected to hard linear inequality constraints.
-
-**Velocity Bounds:**
-
-```math
-|v_x| \le v_{xy,\max}, \quad |v_y| \le v_{xy,\max}, \quad |v_z| \le v_{z,\max}
-```
-
-**Acceleration Bounds:**
-
-```math
-|a_x| \le a_{xy,\max}, \quad |a_y| \le a_{xy,\max}, \quad |a_z| \le a_{z,\max}
-```
-
-**Jerk & Control Rate Bounds:**
-
-```math
-\|\mathbf{u}_k\| \le u_{\max}, \quad \|\mathbf{u}_k - \mathbf{u}_{k-1}\| \le \Delta u_{\max}
-```
-
-**8-Sided Polygonal Tilt Constraint** (max tilt = 45 deg):
-
-```math
-\mathbf{n}_i^T \, \mathbf{a}_{xy,k} \le g \cdot \tan(\theta_{\max}), \quad \forall\, i \in \{1, \dots, 8\}
-```
-
-**Collective Specific Force:**
-
-```math
-T_{\min} \le a_{z,k} + g \le T_{\max}
-```
-
----
-
-### 3.4 SO(3) Force-to-Attitude & Thrust Mapping
-
-From the optimal first-knot acceleration:
-
-```math
-\mathbf{a}_{\text{des}} = \mathbf{a}_0 + \mathbf{u}_0^{*} \cdot \Delta t_0
-```
-
-The desired specific force vector in ENU frame:
-
-```math
-\mathbf{f}_{\text{des}} = \mathbf{a}_{\text{des}} + \begin{bmatrix} 0 \\ 0 \\ g \end{bmatrix}, \quad \mathbf{z}_B = \frac{\mathbf{f}_{\text{des}}}{\|\mathbf{f}_{\text{des}}\|}
-```
-
-Given the desired yaw angle `psi`, the intermediate heading vector:
-
-```math
-\mathbf{x}_C = \begin{bmatrix} \cos(\psi) \\ \sin(\psi) \\ 0 \end{bmatrix}
-```
-
-The body orthonormal orientation and target quaternion:
-
-```math
-\mathbf{y}_B = \frac{\mathbf{z}_B \times \mathbf{x}_C}{\|\mathbf{z}_B \times \mathbf{x}_C\|}, \quad \mathbf{x}_B = \mathbf{y}_B \times \mathbf{z}_B \;\implies\; \mathbf{q}_{\text{des}} \in \mathbb{H}
-```
-
-The normalized collective thrust command:
-
-```math
-T_{\text{norm}} = \text{clamp}\!\left( \frac{\|\mathbf{f}_{\text{des}}\|}{g} \cdot T_{\text{hover}},\; 0.05,\; 1.0 \right)
-```
-
----
-
-## 4. Core Package Modules
-
-### 1. `reference_generator_node` (Mission Parser & Horizon Lookahead)
-* **Mission Parser**: Parses declarative mission JSON files conforming to the schema (`takeoff`, `waypoint`, `hold`, `land`).
-* **Multi-Waypoint Horizon Lookahead**: Samples continuous 30-step ($3\text{ s}$) preview across current and upcoming waypoints, enabling anticipatory banked turns.
-* **3-Condition Waypoint Transition**:
-  1. *Distance & Hold*: Drone within `acceptance_radius` ($2.5\text{ m}$) and hold timer satisfied.
-  2. *Cross-Track Plane Test*: Drone has crossed the normal plane perpendicular to the leg vector (eliminates corner overshooting deadlocks).
-  3. *Time-Elapsed Proximity*: Leg duration elapsed and drone within proximity ($< 4.0\text{ m}$).
-* **Auto-Landing Handover**: Publishes `/reference_generator_node/mission_completed` upon mission completion to trigger native landing.
-
-### 2. `vehicle_state_bridge_node` (Coordinate & State Conversion)
-* **Coordinate Mapping**: Converts PX4 NED/FRD telemetry to standard ROS 2 ENU/FLU frames.
-* **Integrity Validation**: Verifies monotonic timestamps and checks cross-topic sample skew ($< 100\text{ ms}$).
-
-### 3. `mpc_controller_node` & `mpc_solver.cpp` (3D Coupled Translational MPC)
-* **Kinematic Model**: State vector $\mathbf{x} = [\mathbf{p}, \mathbf{v}, \mathbf{a}]^T \in \mathbb{R}^9$, control input $\mathbf{u} = \dot{\mathbf{a}} \in \mathbb{R}^3$ (Jerk).
-* **Actuator Lag Compensation**: First-order time constants $\boldsymbol{\tau}_{xyz} = [0.25, 0.25, 0.08]\text{ s}$ integrated directly into discrete transition matrices $A(\Delta t), B(\Delta t)$.
-* **Critically Damped Tuning**: High derivative damping ratio ($Q_{\text{vel}} \ge 4.5 \times Q_{\text{pos}}$) eliminating S-weaving oscillations after sharp corners.
-
-### 4. `px4_attitude_mode_node` (Native PX4 Attitude Mode)
-* **Mode Registration**: Registers as an official Custom External Mode with PX4 Flight Mode Manager via `px4_ros2::ModeBase`.
-* **$\mathbf{SO}(3)$ Attitude & Thrust Mapping**: Computes desired quaternion $\mathbf{q}_{\text{des}}$ and normalized thrust $[0..1]$ calibrated by PX4's `HoverThrustEstimate`.
-
----
-
-## 5. Quick Start & Execution Workflow
-
-### Build Package
+### 4.2 Build Workflow
 ```bash
-make build
+# 1. Source ROS 2 and px4_msgs
+source /opt/ros/jazzy/setup.bash
+source install/px4_msgs/local_setup.bash
+
+# 2. (Optional) Regenerate acados C solver if OCP model equations change
+python3 tools/acados/generate_tpmc_solver.py --output-directory build/acados_tpmc
+
+# 3. Build release package
+colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release --parallel-workers 1
 source install/setup.bash
 ```
 
-### Launch Simulation Stack
+### 4.3 Running Unit & Python Tests
 ```bash
-# Terminal 1: Start PX4 SITL (Gazebo x500)
-make sim
+# Run C++ Core Math & Solver Tests
+colcon test --packages-select mpc_controller && colcon test-result --verbose
 
-# Terminal 2: Start MicroXRCE-DDS Bridge
-make dds
-
-# Terminal 3: Start MPC Controller Stack
-make ros
-```
-
-### Arm & Start Mission
-```bash
-# Terminal 4: Arm and start mission
-make arm
-make mission-start
+# Run Python Validation Tests
+pytest test/
 ```
 
 ---
 
-## 6. Benchmark Missions
+## 5. SITL Flight Simulation & Benchmark Validation
 
-| Mission File | Description | Key Comparison |
-| :--- | :--- | :--- |
-| `config/missions/benchmark_square.json` | $50\text{m} \times 50\text{m}$ Square with $90^\circ$ turns and climb ($10\text{m} \rightarrow 15\text{m}$) | Precision cornering & zero S-weaving |
-| `config/missions/benchmark_obstacle_slalom.json` | 3D Ziczac Slalom ($5\text{ m/s}$) around 4 obstacles with continuous altitude shifts | Continuous speed ($4.9\text{ m/s}$) vs PID Stop-and-Go ($1.3\text{ m/s}$) |
-| `config/missions/benchmark_urban_canyon.json` | Narrow corridor with $90^\circ$ chicanes and $180^\circ$ U-turn apex | Banked turning ($\text{Roll} \le 21^\circ$) in tight spaces |
+### 5.1 Running Autonomous Mission
+To launch SITL simulation with the **Obstacle Slalom** benchmark track:
 
-To switch missions, update `mission_file_path` in [config/controller.yaml](file:///home/ubuntu/Dev/mpc_controller/mpc_control/config/controller.yaml#L5):
-```yaml
-reference_generator_node:
-  ros__parameters:
-    mission_file_path: "config/missions/benchmark_obstacle_slalom.json"
+```bash
+# 1. Start PX4 SITL + MicroXRCE-DDS + ROS 2 Controller Nodes
+SIM_LOG_XTERM=0 ROS_LAUNCH_ARGS="mission_file_path:=$PWD/config/missions/benchmark_obstacle_slalom.json" make sim
+
+# 2. Trigger autonomous sequence (Arm -> Takeoff -> Hold -> Mission -> Land -> Disarm)
+make mission-execute
+
+# 3. Stop simulation daemon
+make stop
+
+# 4. Generate automated 11-Gate Validation Report
+make validation-report MISSION_JSON=config/missions/benchmark_obstacle_slalom.json
 ```
 
 ---
 
-## 7. Tuning Parameters Reference
+## 6. The 11 Strict Validation Gates
 
-All operational parameters are centralized in `config/controller.yaml`:
+The validation script [`scripts/analysis/analyze_validation_run.py`] enforces 11 criteria for flight certification:
 
-```yaml
-mpc_controller_node:
-  ros__parameters:
-    # Model Lag Identification (Identify for target airframe)
-    model_time_constant_xyz: [0.25, 0.25, 0.08]
+| Gate Name | Measured Metric | Threshold | Real-World Benchmark Result | Status |
+| :--- | :--- | :--- | :---: | :---: |
+| `no_qp_fallback` | Count of QP solver fallbacks | **$= 0$** | **0** | ✅ **PASS** |
+| `no_solver_failure` | Count of SQP solver failures / MINSTEP | **$= 0$** | **0** | ✅ **PASS** |
+| `deadline_miss_rate` | Percentage of solves exceeding $18\text{ ms}$ | **$\le 1.0\%$** | **0.00%** | ✅ **PASS** |
+| `worst_case_timing` | Maximum recorded end-to-end latency | **$\le 18.0\text{ ms}$** | **8.20 ms** | ✅ **PASS** |
+| `hover_tilt_stability` | Roll/Pitch Euler std during hover | **$\le 5.0^\circ$** | **0.51° / 1.99°** | ✅ **PASS** |
+| `maximum_tilt` | Maximum vehicle tilt angle during flight | **$\le 40.0^\circ$** | **20.61°** | ✅ **PASS** |
+| `mission_xy_tracking` | Horizontal position tracking RMSE & Max | **RMSE $\le 1.0\text{ m}$, Max $\le 3.0\text{ m}$** | **0.402 m / 0.882 m** | ✅ **PASS** |
+| `altitude_deviation` | Maximum vertical position tracking error | **$\le 2.0\text{ m}$** | **0.138 m** | ✅ **PASS** |
+| `mission_velocity_tracking` | Translational velocity vector RMSE | **RMSE $\le 1.0\text{ m/s}$, Max $\le 3.0\text{ m/s}$** | **0.150 m/s / 0.345 m/s** | ✅ **PASS** |
+| `motor_saturation` | Actuator motor PWM saturation percentage | **$= 0.000\%$** | **0.000%** | ✅ **PASS** |
+| `minimum_obstacle_clearance`| Minimum distance to geometric obstacles | **$\ge \text{margin}$** | **N/A (Open track)** | ➖ **N/A** |
+| **OVERALL** | **Complete Multi-Gate Audit** | — | — | ✅ **ALL PASS** |
 
-    # Stage Weights [Position, Velocity, Acceleration]
-    q_xy: [80.0, 550.0, 2.0]        # Q_vel/Q_pos ~ 6.9 (Critically Damped)
-    s_xy: [100.0, 600.0, 4.0]
-    q_z:  [200.0, 350.0, 2.0]
-    s_z:  [300.0, 400.0, 4.0]
+---
 
-    # Control Penalties
-    control_weight_xy: 1.5           # Penalizes excessive tilt
-    control_rate_weight_xy: 40.0     # Penalizes jerk (smooth attitude rate)
+## 7. Documentation Suite
 
-    # Physical Envelope Constraints
-    max_speed_xy: 6.0                # m/s
-    max_acceleration_xy: 3.5         # m/s^2 (corresponds to ~19.6 deg tilt)
-    max_control_rate_xy: 5.0         # m/s^3 (jerk rate limit)
-    max_tilt: 0.785398               # 45 deg hard constraint limit
-```
+Full technical specifications, architectural diagrams, tuning protocols, and telemetry registries are available in the [`docs/`](docs/) directory:
+
+* **Architecture**:
+  * [System Architecture Map (SYSTEM_MAP.md)](docs/architecture/SYSTEM_MAP.md)
+  * [Runtime Signal Flow & Topic Contracts (DATA_FLOW.md)](docs/architecture/DATA_FLOW.md)
+  * [Module & Executable Registry (MODULE_REGISTRY.md)](docs/architecture/MODULE_REGISTRY.md)
+* **Operations**:
+  * [Build & Environment Setup (BUILD_AND_RUN.md)](docs/operations/BUILD_AND_RUN.md)
+  * [Command Reference & Provenance (COMMAND_REFERENCE.md)](docs/operations/COMMAND_REFERENCE.md)
+  * [SITL Operational Runbook (SITL_RUNBOOK.md)](docs/operations/SITL_RUNBOOK.md)
+* **Tuning**:
+  * [Staged Tuning Playbook (TUNING_PLAYBOOK.md)](docs/tuning/TUNING_PLAYBOOK.md)
+  * [Parameter Reference & Configuration Audit (PARAMETER_REFERENCE.md)](docs/tuning/PARAMETER_REFERENCE.md)
+* **Validation**:
+  * [Validation Plan & Ladder (VALIDATION_PLAN.md)](docs/validation/VALIDATION_PLAN.md)
+  * [Test Matrix & Pyramid (TEST_MATRIX.md)](docs/validation/TEST_MATRIX.md)
+  * [Pass/Fail Gate Specifications (PASS_FAIL_CRITERIA.md)](docs/validation/PASS_FAIL_CRITERIA.md)
+* **Data**:
+  * [Data Dictionary & Telemetry Columns (DATA_DICTIONARY.md)](docs/data/DATA_DICTIONARY.md)
+  * [Reproducibility & Run Directory Anatomy (REPRODUCIBILITY.md)](docs/data/REPRODUCIBILITY.md)

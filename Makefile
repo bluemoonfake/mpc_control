@@ -6,14 +6,15 @@
 SHELL := /bin/bash
 
 ROS_SETUP ?= /opt/ros/jazzy/setup.bash
-PX4_DIR ?= $(firstword $(wildcard $(CURDIR)/third_party/PX4-Autopilot /tmp/mpc_controller_PX4-Autopilot_backup $(HOME)/PX4_17/PX4-Autopilot $(HOME)/Dev/PX4_tracker/PX4-Autopilot))
-PX4_MSGS_SETUP ?= $(firstword $(wildcard $(CURDIR)/install/px4_msgs/local_setup.bash $(CURDIR)/install/ros_px4_msgs/local_setup.bash /tmp/mpc_controller_px4_msgs_install.*/local_setup.bash $(HOME)/Dev/precision-land/install/local_setup.bash))
+PX4_DIR ?= $(firstword $(wildcard $(CURDIR)/third_party/PX4-Autopilot $(HOME)/PX4_17/PX4-Autopilot))
+PX4_MSGS_SETUP ?= $(firstword $(wildcard $(CURDIR)/install/px4_msgs/local_setup.bash $(CURDIR)/install/ros_px4_msgs/local_setup.bash /tmp/mpc_controller_px4_msgs_install.*/local_setup.bash))
 ROS_WORKSPACE_SETUP ?= $(CURDIR)/install/local_setup.bash
 PX4_TARGET ?= px4_sitl
 PX4_SIM ?= gz_x500
 PX4_SYS_ID ?= 2
 PX4_SIM_MODEL_INSTANCE ?= 0
-ROS_DOMAIN_ID ?= 0
+# Keep the ROS 2 and PX4 uXRCE-DDS participants on the requested domain.
+ROS_DOMAIN_ID ?= 42
 PX4_BUILD_DIR ?= $(PX4_DIR)/build/px4_sitl_default
 PX4_EXPECTED_COMMIT ?= 0b6e4687defb353a34201951809efd3f0040a9ba
 GZ_EXPECTED_VERSION ?= 8.11.0
@@ -33,6 +34,7 @@ JMAVSIM_RUNNER := $(PX4_DIR)/Tools/simulation/jmavsim/jmavsim_run.sh
 DDS_AGENT ?= MicroXRCEAgent
 DDS_TRANSPORT ?= udp4
 DDS_PORT ?= 8888
+PX4_UXRCE_DDS_PORT ?= $(DDS_PORT)
 
 ROS_PACKAGE ?= mpc_controller
 ROS_LAUNCH ?= mpc_offboard.launch.py
@@ -43,15 +45,18 @@ ROS_BUILD_ARGS ?= --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 ROS_BUILD_PARALLEL_WORKERS ?= 1
 
 SIM_RUNTIME_DIR ?= /tmp/mpc_controller_sim
+SIM_DDS_DISCOVERY_TIMEOUT_SECONDS ?= 45
 PX4_LOG := $(SIM_RUNTIME_DIR)/px4.log
 DDS_LOG := $(SIM_RUNTIME_DIR)/dds.log
 ROS_LOG := $(SIM_RUNTIME_DIR)/ros.log
+TMPC_METRICS_LOG := $(SIM_RUNTIME_DIR)/tpmc_metrics.log
 GZ_GUI_LOG := $(SIM_RUNTIME_DIR)/gazebo_gui.log
 HIL_LOG := $(SIM_RUNTIME_DIR)/jmavsim_hil.log
 PX4_PID := $(SIM_RUNTIME_DIR)/px4.pid
 DDS_PID := $(SIM_RUNTIME_DIR)/dds.pid
 ROS_PID := $(SIM_RUNTIME_DIR)/ros.pid
 ROS_LOCK := $(SIM_RUNTIME_DIR)/ros.lock
+TMPC_METRICS_PID := $(SIM_RUNTIME_DIR)/tpmc_metrics.pid
 GZ_GUI_PID := $(SIM_RUNTIME_DIR)/gazebo_gui.pid
 HIL_PID := $(SIM_RUNTIME_DIR)/jmavsim_hil.pid
 
@@ -62,6 +67,16 @@ HIL_PID := $(SIM_RUNTIME_DIR)/jmavsim_hil.pid
 # Use GZ_GUI_QT_PLATFORM=wayland only when the local graphics stack supports it.
 GZ_GUI_QT_PLATFORM ?= xcb
 GZ_GUI_VERBOSE ?= 1
+
+# Open live runtime logs in separate xterm windows after `make sim`.  This is
+# intentionally optional so the same target can still run from a headless
+# shell or CI runner.
+SIM_LOG_XTERM ?= 1
+SIM_METRICS ?= 1
+XTERM ?= xterm
+PX4_LOG_XTERM_PID := $(SIM_RUNTIME_DIR)/px4_log_xterm.pid
+DDS_LOG_XTERM_PID := $(SIM_RUNTIME_DIR)/dds_log_xterm.pid
+ROS_LOG_XTERM_PID := $(SIM_RUNTIME_DIR)/ros_log_xterm.pid
 
 define GZ_GUI_START_COMMAND
 source "$(ROS_SETUP)"; \
@@ -89,7 +104,9 @@ endef
 .PHONY: help check check-build check-hil-tools check-hil-firmware-config \
 	check-hil-device hil-check hil-config hil-firmware hil-upload jmavsim \
 	_jmavsim-start hil hil-stop build px4 dds ros \
-	gui sim stop status logs
+	gui sim stop status logs metrics-start metrics-record analyze-tmpc \
+	collective-identification-analysis dynamics-identification-analysis \
+	mission-start mission-reset mission-execute xterm-logs validation-report
 
 define PX4_START_COMMAND
 stale_cache=$$(find "$(PX4_BUILD_DIR)" -type f -name CMakeCache.txt -print 2>/dev/null | while IFS= read -r cache; do \
@@ -101,7 +118,7 @@ if test -n "$$stale_cache"; then \
 	echo "Recreating only the generated PX4 build directory: $(PX4_BUILD_DIR)"; \
 	rm -rf "$(PX4_BUILD_DIR)"; \
 fi; \
-	cd "$(PX4_DIR)" && exec env PX4_SYS_ID="$(PX4_SYS_ID)" PX4_SIM_MODEL_INSTANCE="$(PX4_SIM_MODEL_INSTANCE)" make "$(PX4_TARGET)" "$(PX4_SIM)" < <(exec tail -f /dev/null)
+	cd "$(PX4_DIR)" && exec env PX4_SYS_ID="$(PX4_SYS_ID)" PX4_SIM_MODEL_INSTANCE="$(PX4_SIM_MODEL_INSTANCE)" ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)" PX4_UXRCE_DDS_PORT="$(PX4_UXRCE_DDS_PORT)" make "$(PX4_TARGET)" "$(PX4_SIM)" < <(exec tail -f /dev/null)
 endef
 
 help:
@@ -117,7 +134,16 @@ help:
 	@echo "make stop    - stop SITL/HIL processes started by this Makefile"
 	@echo "make status  - show simulator process status"
 	@echo "make logs    - follow PX4, DDS and ROS logs"
+	@echo "make sim opens xterm log windows by default; use SIM_LOG_XTERM=0 to disable"
+	@echo "make mission-reset - reset the reference to the current hold position"
+	@echo "make metrics-record - record TMPC reference/tracking/solve telemetry to CSV"
+	@echo "make dynamics-identification-analysis - fit drag/thrust from a speed-sweep metrics CSV"
+	@echo "make analyze-tmpc ULOG=... - summarize ULog and optional TMPC CSV"
+	@echo "collective ID: ROS_LAUNCH=collective_identification.launch.py SIM_METRICS=0 make sim"
+	@echo "collective ID: ros2 service call /collective_identification/start std_srvs/srv/Trigger {}"
+	@echo "collective ID: make collective-identification-analysis"
 	@echo "make mission-start - trigger mission trajectory execution via ROS 2 service"
+	@echo "make mission-execute - wait for PX4 readiness, arm/take off, enter External Mode and run mission"
 	@echo "make benchmark     - run side-by-side PID vs MPC log comparison script"
 	@echo ""
 	@echo "Overrides: PX4_DIR=... HIL_DEVICE=/dev/ttyACM0 HIL_BAUD=921600 HIL_RATE_HZ=250 HIL_HEADLESS=0|1"
@@ -238,12 +264,22 @@ hil-stop:
 	else echo "jMAVSim HITL is stopped."; fi
 
 build: check-build
-	@source "$(ROS_SETUP)"; \
+	@avail_mem_kb=$$(awk '/MemAvailable/{print $$2}' /proc/meminfo 2>/dev/null || echo 2000000); \
+	swap_free_kb=$$(awk '/SwapFree/{print $$2}' /proc/meminfo 2>/dev/null || echo 0); \
+	echo "Build memory preflight: $$((avail_mem_kb/1024)) MB RAM available, $$((swap_free_kb/1024)) MB swap free"; \
+	if [ "$$avail_mem_kb" -lt 1200000 ]; then \
+		echo "Warning: Low available RAM ($$((avail_mem_kb/1024)) MB). Throttling build to 1 worker to prevent OOM..."; \
+		workers=1; \
+	else \
+		workers=$(ROS_BUILD_PARALLEL_WORKERS); \
+	fi; \
+	source "$(ROS_SETUP)"; \
 	if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; \
 	if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; \
-	CMAKE_BUILD_PARALLEL_LEVEL=$(ROS_BUILD_PARALLEL_WORKERS) \
+	MAKEFLAGS="-j$$workers" \
+	CMAKE_BUILD_PARALLEL_LEVEL=$$workers \
 	colcon build --base-paths . --packages-select $(ROS_PACKAGE) \
-		--parallel-workers $(ROS_BUILD_PARALLEL_WORKERS) $(ROS_BUILD_ARGS)
+		--parallel-workers $$workers $(ROS_BUILD_ARGS)
 
 px4: check
 	@mkdir -p "$(SIM_RUNTIME_DIR)"
@@ -304,15 +340,25 @@ sim: check build
 		>"$(PX4_LOG)" 2>&1 & echo $$! >"$(PX4_PID)"
 	@setsid bash -c 'export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; exec "$(DDS_AGENT)" "$(DDS_TRANSPORT)" -p "$(DDS_PORT)"' \
 		>"$(DDS_LOG)" 2>&1 & echo $$! >"$(DDS_PID)"
-	@sleep 2
+	deadline=$$((SECONDS + $(SIM_DDS_DISCOVERY_TIMEOUT_SECONDS))); \
+	while ! grep -q 'successfully created rt/fmu/out/vehicle_status_v1 data writer' "$(PX4_LOG)" 2>/dev/null || \
+		! grep -q 'successfully created rt/fmu/out/arming_check_request_v1 data writer' "$(PX4_LOG)" 2>/dev/null; do \
+		if test "$$SECONDS" -ge "$$deadline"; then \
+			echo "Timed out waiting for PX4 uXRCE-DDS discovery; inspect $(PX4_LOG) and $(DDS_LOG)"; exit 1; \
+		fi; \
+		sleep 1; \
+	done; \
+	sleep 2
 	@setsid bash -c 'exec 9>"$(ROS_LOCK)"; if ! flock -n 9; then echo "Another MPC ROS 2 pipeline already holds $(ROS_LOCK)"; exit 75; fi; echo $$$$ >"$(ROS_PID)"; source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; exec ros2 launch "$(ROS_PACKAGE)" "$(ROS_LAUNCH)" $(ROS_LAUNCH_ARGS)' \
 		>"$(ROS_LOG)" 2>&1 &
+	@if test "$(SIM_METRICS)" = "1"; then $(MAKE) --no-print-directory metrics-start; fi
+	@$(MAKE) --no-print-directory xterm-logs
 	@echo "Simulation started with Gazebo GUI. No arm/offboard command was sent."
 	@echo "Run 'make status' and inspect logs under $(SIM_RUNTIME_DIR)."
 
 stop:
 	@set -u; \
-	for pid_file in "$(HIL_PID)" "$(GZ_GUI_PID)" "$(ROS_PID)" "$(DDS_PID)" "$(PX4_PID)"; do \
+	for pid_file in "$(PX4_LOG_XTERM_PID)" "$(DDS_LOG_XTERM_PID)" "$(ROS_LOG_XTERM_PID)" "$(TMPC_METRICS_PID)" "$(HIL_PID)" "$(GZ_GUI_PID)" "$(ROS_PID)" "$(DDS_PID)" "$(PX4_PID)"; do \
 		if test -f "$$pid_file"; then \
 			pid=$$(cat "$$pid_file"); \
 			if kill -0 "$$pid" 2>/dev/null; then \
@@ -324,7 +370,7 @@ stop:
 	@echo "Simulator processes stopped."
 
 status:
-	@for entry in "PX4:$(PX4_PID)" "Gazebo GUI:$(GZ_GUI_PID)" "jMAVSim HIL:$(HIL_PID)" "DDS:$(DDS_PID)" "ROS:$(ROS_PID)"; do \
+	@for entry in "PX4:$(PX4_PID)" "Gazebo GUI:$(GZ_GUI_PID)" "jMAVSim HIL:$(HIL_PID)" "DDS:$(DDS_PID)" "ROS:$(ROS_PID)" "TMPC metrics:$(TMPC_METRICS_PID)" "PX4 log xterm:$(PX4_LOG_XTERM_PID)" "DDS log xterm:$(DDS_LOG_XTERM_PID)" "ROS log xterm:$(ROS_LOG_XTERM_PID)"; do \
 		name=$${entry%%:*}; pid_file=$${entry#*:}; \
 		if test -f "$$pid_file"; then \
 			pid=$$(cat "$$pid_file"); \
@@ -337,8 +383,77 @@ logs:
 	@touch "$(PX4_LOG)" "$(GZ_GUI_LOG)" "$(HIL_LOG)" "$(DDS_LOG)" "$(ROS_LOG)"
 	@tail -F "$(PX4_LOG)" "$(GZ_GUI_LOG)" "$(HIL_LOG)" "$(DDS_LOG)" "$(ROS_LOG)"
 
-PID_LOG ?= $(firstword $(wildcard /home/ubuntu/Dev/PX4_tracker/PX4-Autopilot/build/px4_sitl_default/rootfs/log/*/*_pid*.ulg /tmp/pid_flight.ulg))
-MPC_LOG ?= $(firstword $(wildcard /home/ubuntu/Dev/PX4_tracker/PX4-Autopilot/build/px4_sitl_default/rootfs/log/*/*_mpc*.ulg /tmp/mpc_flight.ulg))
+xterm-logs:
+	@if test "$(SIM_LOG_XTERM)" != "1"; then \
+		echo "xterm runtime logs disabled (SIM_LOG_XTERM=$(SIM_LOG_XTERM))."; \
+		exit 0; \
+	fi; \
+	if ! command -v "$(XTERM)" >/dev/null 2>&1; then \
+		echo "xterm is unavailable; logs remain in $(SIM_RUNTIME_DIR)."; \
+		exit 0; \
+	fi; \
+	if test -z "$${DISPLAY:-}"; then \
+		echo "DISPLAY is not set; cannot open xterm log windows."; \
+		exit 0; \
+	fi; \
+	mkdir -p "$(SIM_RUNTIME_DIR)"; \
+	start_window() { \
+		local title="$$1" log_file="$$2" pid_file="$$3" geometry="$$4"; \
+		if test -f "$$pid_file" && kill -0 "$$(cat "$$pid_file")" 2>/dev/null; then \
+			echo "$$title log xterm already running."; return; \
+		fi; \
+		rm -f "$$pid_file"; touch "$$log_file"; \
+		setsid "$(XTERM)" -T "$$title" -geometry "$$geometry" \
+			-e bash -lc "exec tail -n 100 -F '$$log_file'" >/dev/null 2>&1 & \
+		echo $$! > "$$pid_file"; \
+		echo "$$title log xterm started."; \
+	}; \
+	start_window "ROS TMPC log" "$(ROS_LOG)" "$(ROS_LOG_XTERM_PID)" "130x34+40+80"
+
+TMPC_METRICS ?= $(SIM_RUNTIME_DIR)/tpmc_metrics.csv
+ULOG ?=
+TMPC_ANALYSIS ?= $(SIM_RUNTIME_DIR)/tpmc_analysis.json
+
+metrics-start: check-build
+	@mkdir -p "$(SIM_RUNTIME_DIR)"
+	@if test -f "$(TMPC_METRICS_PID)" && kill -0 "$$(cat "$(TMPC_METRICS_PID)")" 2>/dev/null; then \
+		echo "TMPC metrics recorder already running."; \
+	else \
+		rm -f "$(TMPC_METRICS_PID)"; \
+		setsid bash -c 'source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; exec python3 scripts/recording/record_tpmc_metrics.py --output "$(TMPC_METRICS)"' \
+			>"$(TMPC_METRICS_LOG)" 2>&1 & echo $$! >"$(TMPC_METRICS_PID)"; \
+		echo "TMPC metrics recorder started: $(TMPC_METRICS)"; \
+	fi
+
+metrics-record: check-build
+	@source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; \
+	if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; \
+	if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; \
+	python3 scripts/recording/record_tpmc_metrics.py --output "$(TMPC_METRICS)"
+
+analyze-tmpc:
+	@test -n "$(ULOG)" && test -f "$(ULOG)" || { echo "Set ULOG=/path/to/run.ulg"; exit 1; }
+	@args=("$(ULOG)" --output "$(TMPC_ANALYSIS)"); \
+	if test -f "$(TMPC_METRICS)"; then args+=(--metrics "$(TMPC_METRICS)"); fi; \
+	python3 scripts/analysis/analyze_tpmc_sitl.py "$${args[@]}"
+
+COLLECTIVE_IDENTIFICATION_INPUT ?= $(SIM_RUNTIME_DIR)/collective_identification.csv
+COLLECTIVE_IDENTIFICATION_OUTPUT ?= $(SIM_RUNTIME_DIR)/collective_identification.json
+DYNAMICS_IDENTIFICATION_INPUT ?= $(TMPC_METRICS)
+DYNAMICS_IDENTIFICATION_OUTPUT ?= $(SIM_RUNTIME_DIR)/speed_sweep_identification.json
+
+collective-identification-analysis:
+	@test -f "$(COLLECTIVE_IDENTIFICATION_INPUT)" || { echo "Missing $(COLLECTIVE_IDENTIFICATION_INPUT)"; exit 1; }
+	@python3 scripts/analysis/analyze_collective_identification.py \
+		"$(COLLECTIVE_IDENTIFICATION_INPUT)" --output "$(COLLECTIVE_IDENTIFICATION_OUTPUT)"
+
+dynamics-identification-analysis:
+	@test -f "$(DYNAMICS_IDENTIFICATION_INPUT)" || { echo "Missing $(DYNAMICS_IDENTIFICATION_INPUT)"; exit 1; }
+	@python3 scripts/analysis/analyze_speed_sweep_identification.py \
+		"$(DYNAMICS_IDENTIFICATION_INPUT)" --output "$(DYNAMICS_IDENTIFICATION_OUTPUT)"
+
+PID_LOG ?=
+MPC_LOG ?=
 MISSION_JSON ?= config/missions/benchmark_square.json
 BENCHMARK_OUT ?= mission_benchmark_comparison.png
 
@@ -347,6 +462,47 @@ mission-start:
 	if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; \
 	if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; \
 	ros2 service call /reference_generator_node/start_mission std_srvs/srv/Trigger {}
+
+mission-reset:
+	@source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; \
+	if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; \
+	if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; \
+	ros2 service call /reference_generator_node/reset_mission std_srvs/srv/Trigger {}
+
+MISSION_READY_TIMEOUT_SECONDS ?= 120
+MISSION_EXTERNAL_TIMEOUT_SECONDS ?= 60
+MISSION_EXECUTION_TIMEOUT_SECONDS ?= 360
+
+mission-execute:
+	@test -f "$(PX4_PID)" && kill -0 "$$(cat "$(PX4_PID)")" 2>/dev/null || { echo "PX4 SITL is not running; start it with make sim."; exit 1; }
+	@deadline=$$((SECONDS + $(MISSION_READY_TIMEOUT_SECONDS))); \
+	while ! grep -q 'Ready for takeoff' "$(PX4_LOG)" 2>/dev/null; do \
+		if test "$$SECONDS" -ge "$$deadline"; then \
+			echo "PX4 did not become ready for takeoff; refusing to force-arm."; \
+			tail -n 30 "$(PX4_LOG)"; exit 1; \
+		fi; \
+		sleep 1; \
+	done; \
+	source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; \
+	if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; \
+	if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; \
+	ros2 service call /mpc_mode_executor/start std_srvs/srv/Trigger {}; \
+	deadline=$$((SECONDS + $(MISSION_EXTERNAL_TIMEOUT_SECONDS))); \
+	while ! grep -q 'External Mode selected by PX4' "$(ROS_LOG)" 2>/dev/null; do \
+		if grep -q 'Sequence failed during' "$(ROS_LOG)" 2>/dev/null || test "$$SECONDS" -ge "$$deadline"; then \
+			echo "External Mode entry failed; inspect $(ROS_LOG)."; exit 1; \
+		fi; \
+		sleep 1; \
+	done; \
+	ros2 service call /reference_generator_node/start_mission std_srvs/srv/Trigger {}; \
+	deadline=$$((SECONDS + $(MISSION_EXECUTION_TIMEOUT_SECONDS))); \
+	while ! grep -q 'Autonomous sequence complete' "$(ROS_LOG)" 2>/dev/null; do \
+		if grep -q 'Sequence failed during mission wait' "$(ROS_LOG)" 2>/dev/null || test "$$SECONDS" -ge "$$deadline"; then \
+			echo "Mission execution did not complete; request landing before stopping SITL."; exit 1; \
+		fi; \
+		sleep 2; \
+	done; \
+	echo "Mission and native landing completed successfully."
 
 arm:
 	@source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; \
@@ -374,14 +530,20 @@ mission-run: mission-start
 	@echo "Mission initiated: trajectory streaming, vehicle armed, and offboard control active."
 
 pid-mission-run:
-	@python3 scripts/run_px4_pid_mission.py --mission "$(MISSION_JSON)"
+	@python3 scripts/execution/run_px4_pid_mission.py --mission "$(MISSION_JSON)"
 
 pid-plan-gen:
-	@python3 scripts/run_px4_pid_mission.py --mission "$(MISSION_JSON)" --plan-only
+	@python3 scripts/execution/run_px4_pid_mission.py --mission "$(MISSION_JSON)" --plan-only
 
 benchmark:
 	@test -n "$(PID_LOG)" && test -f "$(PID_LOG)" || { echo "PID_LOG not found. Usage: make benchmark PID_LOG=path/to/pid.ulg MPC_LOG=path/to/mpc.ulg"; exit 1; }
 	@test -n "$(MPC_LOG)" && test -f "$(MPC_LOG)" || { echo "MPC_LOG not found. Usage: make benchmark PID_LOG=path/to/pid.ulg MPC_LOG=path/to/mpc.ulg"; exit 1; }
-	@python3 scripts/compare_mission_logs.py "$(PID_LOG)" "$(MPC_LOG)" --mission "$(MISSION_JSON)" --out "$(BENCHMARK_OUT)"
+	@python3 scripts/analysis/compare_mission_logs.py "$(PID_LOG)" "$(MPC_LOG)" --mission "$(MISSION_JSON)" --out "$(BENCHMARK_OUT)"
 
+VALIDATION_REPORT ?= $(SIM_RUNTIME_DIR)/validation_report.json
 
+validation-report:
+	@test -f "$(TMPC_METRICS)" || { echo "Missing $(TMPC_METRICS); run a SITL validation flight first."; exit 1; }
+	@test -n "$(MISSION_JSON)" && test -f "$(MISSION_JSON)" || { echo "MISSION_JSON must name the validated mission JSON."; exit 1; }
+	@python3 scripts/analysis/analyze_validation_run.py \
+		"$(TMPC_METRICS)" --mission "$(MISSION_JSON)" --output "$(VALIDATION_REPORT)"

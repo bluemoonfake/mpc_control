@@ -4,6 +4,7 @@ float64[3] velocity
 float64[3] acceleration
 float64[4] attitude
 float64 yaw
+float64 yaw_rate
 bool valid
 bool position_valid
 bool velocity_valid

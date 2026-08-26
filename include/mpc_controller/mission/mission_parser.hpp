@@ -19,6 +19,8 @@
 namespace mpc_controller::mission
 {
 
+inline constexpr double kDegreesToRadians = 0.017453292519943295;
+
 // --------------------------------------------------------------------------
 // Data model
 // --------------------------------------------------------------------------
@@ -39,6 +41,8 @@ struct Defaults
   double horizontal_velocity_m_s = 4.0;
   double vertical_velocity_m_s = 1.5;
   double max_heading_rate_deg_s = 60.0;
+  double maximum_acceleration_m_s2 = 2.5;
+  double maximum_jerk_m_s3 = 5.0;
 };
 
 struct WaypointData
@@ -58,6 +62,8 @@ struct ChangeSettingsData
   double horizontal_velocity_m_s = NAN;
   double vertical_velocity_m_s = NAN;
   double max_heading_rate_deg_s = NAN;
+  double maximum_acceleration_m_s2 = NAN;
+  double maximum_jerk_m_s3 = NAN;
 };
 
 struct MissionItem
@@ -126,6 +132,17 @@ inline Mission parse(const std::string & json_path)
     if (d.contains("maxHeadingRate")) {
       mission.defaults.max_heading_rate_deg_s = d["maxHeadingRate"].get<double>();
     }
+    if (d.contains("tpmc") && d["tpmc"].is_object()) {
+      const auto & trajectory = d["tpmc"];
+      if (trajectory.contains("maximumAcceleration")) {
+        mission.defaults.maximum_acceleration_m_s2 =
+          trajectory["maximumAcceleration"].get<double>();
+      }
+      if (trajectory.contains("maximumJerk")) {
+        mission.defaults.maximum_jerk_m_s3 =
+          trajectory["maximumJerk"].get<double>();
+      }
+    }
   }
 
   // Items
@@ -173,6 +190,13 @@ inline Mission parse(const std::string & json_path)
         if (item_json.contains("heading")) {
           item.waypoint.heading_rad = item_json["heading"].get<double>();
         }
+        if (item_json.contains("tpmc") && item_json["tpmc"].is_object()) {
+          const auto & trajectory = item_json["tpmc"];
+          if (trajectory.contains("headingDeg")) {
+            item.waypoint.heading_rad =
+              trajectory["headingDeg"].get<double>() * kDegreesToRadians;
+          }
+        }
       } else {
         item.type = ItemType::Unknown;
       }
@@ -193,6 +217,16 @@ inline Mission parse(const std::string & json_path)
       if (item_json.contains("maxHeadingRate")) {
         item.settings.max_heading_rate_deg_s = item_json["maxHeadingRate"].get<double>();
       }
+      if (item_json.contains("tpmc") && item_json["tpmc"].is_object()) {
+        const auto & trajectory = item_json["tpmc"];
+        if (trajectory.contains("maximumAcceleration")) {
+          item.settings.maximum_acceleration_m_s2 =
+            trajectory["maximumAcceleration"].get<double>();
+        }
+        if (trajectory.contains("maximumJerk")) {
+          item.settings.maximum_jerk_m_s3 = trajectory["maximumJerk"].get<double>();
+        }
+      }
 
     } else if (type_str == "land") {
       item.type = ItemType::Land;
@@ -207,6 +241,18 @@ inline Mission parse(const std::string & json_path)
 
   if (mission.items.empty()) {
     mission.error = "mission has no items";
+    return mission;
+  }
+
+  const auto finitePositive = [](double value) {
+    return std::isfinite(value) && value > 0.0;
+  };
+  if (!finitePositive(mission.defaults.horizontal_velocity_m_s) ||
+      !finitePositive(mission.defaults.vertical_velocity_m_s) ||
+      !finitePositive(mission.defaults.max_heading_rate_deg_s) ||
+      !finitePositive(mission.defaults.maximum_acceleration_m_s2) ||
+      !finitePositive(mission.defaults.maximum_jerk_m_s3)) {
+    mission.error = "mission defaults must be finite and positive";
     return mission;
   }
 

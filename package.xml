@@ -3,7 +3,7 @@
 <package format="3">
   <name>mpc_controller</name>
   <version>0.2.0</version>
-  <description>ROS 2 3D Coupled MPC with native PX4 External Flight Mode attitude and thrust control.</description>
+  <description>ROS 2 nonlinear TMPC with an acados solver boundary and native PX4 attitude/thrust control.</description>
   <maintainer email="mpc_controller@example.com">mpc_controller</maintainer>
   <license>Proprietary</license>
 

@@ -2,9 +2,13 @@
   "version": 1,
   "mission": {
     "defaults": {
-      "horizontalVelocity": 4.0,
-      "verticalVelocity": 1.5,
-      "maxHeadingRate": 60
+      "horizontalVelocity": 10.0,
+      "verticalVelocity": 2.0,
+      "maxHeadingRate": 60,
+      "tpmc": {
+        "maximumAcceleration": 4.0,
+        "maximumJerk": 8.0
+      }
     },
     "items": [
       {

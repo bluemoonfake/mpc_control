@@ -44,6 +44,7 @@ struct VehicleStateData
   Vector3 acceleration_enu{};
   Quaternion body_flu_to_world_enu{1.0, 0.0, 0.0, 0.0};
   double yaw_enu = 0.0;
+  double yaw_rate_enu = 0.0;
   bool position_valid = false;
   bool velocity_valid = false;
   bool acceleration_valid = false;
@@ -179,7 +180,20 @@ inline bool convert(
   output.acceleration_enu = nedToEnu(local_position.acceleration_ned);
   output.body_flu_to_world_enu = matrixToQuaternion(r_enu_flu);
   output.yaw_enu = std::atan2(r_enu_flu[1][0], r_enu_flu[0][0]);
-  const bool finite_output = std::isfinite(output.yaw_enu) && finite(output.position_enu)
+  const double roll_enu = std::atan2(r_enu_flu[2][1], r_enu_flu[2][2]);
+  const double pitch_enu = std::asin(std::clamp(-r_enu_flu[2][0], -1.0, 1.0));
+  const double cos_pitch = std::cos(pitch_enu);
+  if (!std::isfinite(cos_pitch) || std::abs(cos_pitch) < 1.0e-6) {
+    output.body_rate_valid = false;
+    return false;
+  }
+  const double pitch_rate_flu = -angular_velocity.body_rate_frd[1];
+  const double yaw_rate_flu = -angular_velocity.body_rate_frd[2];
+  output.yaw_rate_enu =
+    (std::sin(roll_enu) * pitch_rate_flu +
+    std::cos(roll_enu) * yaw_rate_flu) / cos_pitch;
+  const bool finite_output = std::isfinite(output.yaw_enu)
+    && std::isfinite(output.yaw_rate_enu) && finite(output.position_enu)
     && finite(output.velocity_enu) && finite(output.acceleration_enu)
     && finite(output.body_flu_to_world_enu);
   if (!finite_output) {

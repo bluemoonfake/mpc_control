@@ -1,69 +1,68 @@
+# TMPC state order:
+# [px, py, pz, vx, vy, vz, roll, pitch, yaw, yaw_rate,
+#  collective_specific_force]
 std_msgs/Header header
 uint64 trajectory_id
 uint64 sequence
+float64[11] measured_state
+float64[11] first_reference_state
 
-# Current feedback state used as x0=[p,v,a] by the selected backend.
-# XY acceleration is the model-consistent observer estimate; Z is measured.
-float64[3] measured_position
-float64[3] measured_velocity
-float64[3] measured_acceleration
-# First reference point on the solver grid.
-float64[3] sampled_reference_position
-float64[3] sampled_reference_velocity
-float64[3] sampled_reference_acceleration
+# TMPC input order:
+# [roll_command, pitch_command, yaw_command, collective_specific_force_command]
+float64[4] first_reference_input
+# Command directly produced by the solver or recovery law before the local
+# roll/pitch low-pass filter.
+float64[4] raw_control_input
+# Command published to the attitude adapter after the local low-pass filter.
+# `control_input` is kept as this value for compatibility with existing tools.
+float64[4] filtered_control_input
+float64[4] control_input
+# Latest command confirmed by the attitude adapter after its safety limiter.
+# It can belong to the preceding controller cycle; consult the availability and
+# age fields before using it for analysis.
+float64[4] applied_control_input
+float64 applied_command_age_seconds
+bool applied_command_available
 
-# Optimizer input u0 for X/Y/Z.
-float64[3] control_input
-# First predicted physical acceleration state a[k+1]. Diagnostic only.
-float64[3] first_predicted_acceleration
-# QP prediction:
-# [step][axis][p,v,a], 26 * 3 * 3 values.
+# Flattened predictions: state stages (N+1)*11 and input stages N*4.
 float64[] predicted_states
-# Legacy per-axis diagnostics ordered X/Y/Z; retained for shadow comparison.
-int32[3] solver_iterations
-uint8[3] solver_status
-float64[3] solver_primal_residual
-float64[3] solver_dual_residual
-float64[3] solver_primal_tolerance
-float64[3] solver_dual_tolerance
-bool[3] recovery_constraint_active
-# Coupled 3D QP diagnostics. In shadow mode the legacy command remains active.
-bool coupled_solver_ran
-bool coupled_solver_valid
-bool coupled_control_active
-int32 coupled_solver_iterations
-uint8 coupled_solver_status
-float64 coupled_primal_residual
-float64 coupled_dual_residual
-float64 coupled_primal_tolerance
-float64 coupled_dual_tolerance
-float64 coupled_velocity_slack
-float64 coupled_acceleration_slack
-float64 coupled_max_constraint_violation
-float64 coupled_max_speed_xy
-float64 coupled_max_acceleration_xy
-float64 coupled_max_tilt_rad
-float64 coupled_max_collective_specific_force_m_s2
-float64 coupled_solve_time_seconds
-float64 shadow_control_difference_norm
-uint32 shadow_admission_samples
-bool shadow_admission_ready
-uint8 active_backend
+float64[] predicted_inputs
+
+uint8 solver_status
+int32 solver_iterations
+# Acados-reported solve time. The remaining values are wall-clock timings for
+# the controller-side preparation, Acados call, diagnostics/output validation,
+# and total solve() call respectively.
 float64 solve_time_seconds
-bool solver_deadline_missed
-bool recovery_command_active
-uint8 failure_reason
+float64 preparation_time_seconds
+float64 acados_wall_time_seconds
+float64 postprocessing_time_seconds
+float64 acados_metadata_time_seconds
+float64 diagnostics_time_seconds
+float64 sqp_statistics_time_seconds
+float64 prediction_read_time_seconds
+float64 constraint_validation_time_seconds
+float64 result_finalization_time_seconds
+float64 postprocessing_unattributed_time_seconds
+float64 end_to_end_time_seconds
+# Age of the state measurement at the moment the output is published.
+# Measures total sensor-to-output latency including DDS transport and solve.
+float64 setpoint_age_seconds
+# Age of the reference trajectory at the moment the output is published.
+float64 reference_age_seconds
+float64 max_constraint_violation
+bool solver_available
 bool valid
+bool deadline_missed
+bool recovery_active
+string failure_reason
 
 uint8 SOLVER_SUCCESS=0
 uint8 SOLVER_INVALID_INPUT=1
-uint8 SOLVER_INFEASIBLE_BOUNDS=2
-uint8 SOLVER_FACTORIZATION_FAILURE=3
-uint8 SOLVER_DEADLINE_EXCEEDED=4
-uint8 SOLVER_MAX_ITERATIONS=5
-uint8 SOLVER_NON_FINITE_OUTPUT=6
-uint8 SOLVER_OUTPUT_LIMIT=7
-
-uint8 BACKEND_LEGACY=0
-uint8 BACKEND_COUPLED_SHADOW=1
-uint8 BACKEND_COUPLED=2
+uint8 SOLVER_DEPENDENCY_UNAVAILABLE=2
+uint8 SOLVER_NOT_INITIALIZED=3
+uint8 SOLVER_INFEASIBLE=4
+uint8 SOLVER_DEADLINE_EXCEEDED=5
+uint8 SOLVER_NUMERICAL_FAILURE=6
+uint8 SOLVER_MAXIMUM_ITERATIONS=7
+uint8 SOLVER_MINIMUM_STEP=8
