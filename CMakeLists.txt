@@ -93,7 +93,8 @@ function(add_mpc_node target source)
   add_executable(${target} ${source})
   target_compile_features(${target} PRIVATE cxx_std_17)
   target_include_directories(${target} PRIVATE
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  target_include_directories(${target} SYSTEM PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/px4-ros2-interface-lib/px4_ros2_cpp/include>)
   ament_target_dependencies(${target} rclcpp ${ARGN})
   rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")

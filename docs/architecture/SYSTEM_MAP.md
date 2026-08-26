@@ -23,17 +23,17 @@ The architecture strictly separates the **Domain & Application layers** (pure ma
 
 ```mermaid
 graph TD
-    subgraph PX4_Ecosystem["PX4 Autopilot & Simulation (SITL / FMU v6x)"]
+    subgraph PX4_Ecosystem["PX4 Autopilot and Simulation (SITL / FMU v6x)"]
         PX4_Sensors["Sensors / EKF2 State<br/>(Local Pos, Attitude, AngVel)"]
-        PX4_Mixer["PX4 Attitude & Rate Controller<br/>+ Motor Mixer"]
+        PX4_Mixer["PX4 Attitude and Rate Controller<br/>+ Motor Mixer"]
         PX4_Mode["PX4 Mode Manager<br/>(External Mode Interface)"]
     end
 
     subgraph Bridge_Layer["State Bridge Subsystem"]
-        StateBridge["vehicle_state_bridge_node<br/>- Ingests NED/FRD PX4 Topics<br/>- Skew & Freshness Gate (<35ms)<br/>- Converts to ENU/FLU"]
+        StateBridge["vehicle_state_bridge_node<br/>- Ingests NED/FRD PX4 Topics<br/>- Skew and Freshness Gate (under 35ms)<br/>- Converts to ENU/FLU"]
     end
 
-    subgraph Mission_Layer["Mission & Trajectory Subsystem"]
+    subgraph Mission_Layer["Mission and Trajectory Subsystem"]
         MissionParser["Mission Parser<br/>(JSON / Plan parser)"]
         TrajGen["minimum_time_trajectory<br/>- Quintic Polynomial Splines<br/>- 3D Corner Bisector Scaling"]
         RefNode["reference_generator_node<br/>- Streams ReferenceTrajectory<br/>- Manages Hold / Waypoint Advance"]
@@ -43,26 +43,26 @@ graph TD
         MPCNode["mpc_controller_node (50 Hz Timer)<br/>- Handover Hold Gate (5 samples)<br/>- Reference Conversion Engine<br/>- Fallback Geometric Controller"]
         SafetyLimiter["command_safety_limiter<br/>- Tilt Cone Projection<br/>- Slew-rate Limits"]
         
-        subgraph Domain_Solver["TMPC Domain & Solver Engine"]
+        subgraph Domain_Solver["TMPC Domain and Solver Engine"]
             TPMCModel["tpmc_model (RK4 Integrator)"]
-            TPMCConstraints["tpmc_constraints (BGH Box & Tilt)"]
+            TPMCConstraints["tpmc_constraints (BGH Box and Tilt)"]
             AcadosSolver["acados_tpmc_solver (C++ Adapter)<br/>- RAII Capsule Manager<br/>- Shifted Warm Start"]
             GeneratedC["Generated acados C-Code<br/>(SQP-RTI, HPIPM QP Solver)"]
         end
     end
 
-    subgraph Actuation_Layer["PX4 Mode & Actuation Subsystem"]
+    subgraph Actuation_Layer["PX4 Mode and Actuation Subsystem"]
         AttitudeNode["px4_attitude_mode_node<br/>- MpcModeExecutor (Auto Sequence)<br/>- Force-to-Thrust Mapping<br/>- Attitude Setpoint Streaming"]
     end
 
     %% Signal Flows
-    PX4_Sensors -->|uXRCE-DDS (NED/FRD)| StateBridge
-    StateBridge -->|VehicleState (ENU/FLU)| RefNode
-    StateBridge -->|VehicleState (ENU/FLU)| MPCNode
+    PX4_Sensors -->|"uXRCE-DDS (NED/FRD)"| StateBridge
+    StateBridge -->|"VehicleState (ENU/FLU)"| RefNode
+    StateBridge -->|"VehicleState (ENU/FLU)"| MPCNode
     
     MissionParser --> TrajGen
     TrajGen --> RefNode
-    RefNode -->|ReferenceTrajectory| MPCNode
+    RefNode -->|"ReferenceTrajectory"| MPCNode
     
     MPCNode --> TPMCModel
     MPCNode --> TPMCConstraints
@@ -71,10 +71,10 @@ graph TD
     GeneratedC --> AcadosSolver
     AcadosSolver --> MPCNode
     MPCNode --> SafetyLimiter
-    SafetyLimiter -->|ForceAttitudeSetpoint| AttitudeNode
+    SafetyLimiter -->|"ForceAttitudeSetpoint"| AttitudeNode
     
-    AttitudeNode -->|Attitude & Thrust Setpoint| PX4_Mixer
-    PX4_Mode <-->|Mode Handshake| AttitudeNode
+    AttitudeNode -->|"Attitude and Thrust Setpoint"| PX4_Mixer
+    PX4_Mode <-->|"Mode Handshake"| AttitudeNode
 ```
 
 ---

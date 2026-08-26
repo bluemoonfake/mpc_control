@@ -8,15 +8,15 @@ This playbook establishes a rigorous, 14-stage experimental tuning methodology f
 
 ```mermaid
 graph TD
-    A[Stage 1: System Identification<br/>Hover Thrust & Time Constants] --> B[Stage 2: Model Prediction Validation<br/>tau_phi, tau_theta, tau_psi, tau_a]
-    B --> C[Stage 3: Physical Boundary & Constraint Setting<br/>max_tilt, a_min, a_max, rate limits]
-    C --> D[Stage 4: Bryson Baseline Weight Initialization<br/>Q_ii = 1 / max_error^2]
-    D --> E[Stage 5: Altitude & Vertical Specific Force Tuning<br/>Q_z, Q_vz, R_a]
-    E --> F[Stage 6: Horizontal Position & Velocity Tracking<br/>Q_xy, Q_vxy, R_phi, R_theta]
-    F --> G[Stage 7: Heading & Yaw Dynamics Tuning<br/>Q_psi, Q_psidot, R_psi, W_delta_psi]
-    G --> H[Stage 8: Terminal Stability Cost Tuning<br/>P = 1.2 * Q .. 2.0 * Q]
-    H --> I[Stage 9: Trajectory Aggressiveness Sweep<br/>Corner Bisector & Speed Scaling]
-    I --> J[Stage 10: Real-Time Solver Deadline Stress Test<br/>CPU Contention & Margin Validation]
+    A["Stage 1: System Identification<br/>Hover Thrust and Time Constants"] --> B["Stage 2: Model Prediction Validation<br/>tau_phi, tau_theta, tau_psi, tau_a"]
+    B --> C["Stage 3: Physical Boundary and Constraint Setting<br/>max_tilt, a_min, a_max, rate limits"]
+    C --> D["Stage 4: Bryson Baseline Weight Initialization<br/>Q_ii = 1 / max_error^2"]
+    D --> E["Stage 5: Altitude and Vertical Specific Force Tuning<br/>Q_z, Q_vz, R_a"]
+    E --> F["Stage 6: Horizontal Position and Velocity Tracking<br/>Q_xy, Q_vxy, R_phi, R_theta"]
+    F --> G["Stage 7: Heading and Yaw Dynamics Tuning<br/>Q_psi, Q_psidot, R_psi, W_delta_psi"]
+    G --> H["Stage 8: Terminal Stability Cost Tuning<br/>P = 1.2 * Q to 2.0 * Q"]
+    H --> I["Stage 9: Trajectory Aggressiveness Sweep<br/>Corner Bisector and Speed Scaling"]
+    I --> J["Stage 10: Real-Time Solver Deadline Stress Test<br/>CPU Contention and Margin Validation"]
 ```
 
 ---

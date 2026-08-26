@@ -24,17 +24,17 @@ sequenceDiagram
     PX4-->>Bridge: /fmu/out/vehicle_attitude (FRD, 100 Hz)
     PX4-->>Bridge: /fmu/out/vehicle_angular_velocity (FRD, 100 Hz)
     
-    Note over Bridge: Timestamp Check & Frame Transform (NED/FRD -> ENU/FLU)
+    Note over Bridge: Timestamp Check and Frame Transform (NED/FRD to ENU/FLU)
     Bridge->>RefGen: /vehicle_state_bridge_node/vehicle_state (ENU/FLU, 50 Hz)
     Bridge->>MPC: /vehicle_state_bridge_node/vehicle_state (ENU/FLU, 50 Hz)
 
-    Note over RefGen: Autonomous Sequence Start -> External Mode Handshake
+    Note over RefGen: Autonomous Sequence Start to External Mode Handshake
     RefGen->>MPC: /reference_generator_node/external_mode_active = True
     RefGen->>MPC: /reference_generator_node/reference_trajectory (10-step horizon preview)
     
     Note over MPC: 50 Hz Timer Callback (controlLoop)
     MPC->>Acados: solve(SolveRequest: x0 [15], ref [10x15])
-    Note over Acados: SQP-RTI Linearization + HPIPM QP Solve (<2 ms)
+    Note over Acados: SQP-RTI Linearization + HPIPM QP Solve (under 2 ms)
     Acados-->>MPC: SolveResult (u0 [4], x_pred [11x15], diagnostics)
     
     MPC->>Safety: applyLimits(u0: roll, pitch, yaw, force)

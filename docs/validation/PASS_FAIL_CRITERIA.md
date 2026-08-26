@@ -10,16 +10,16 @@ This document formalizes the 11 strict validation gates enforced by [`scripts/an
 graph TD
     subgraph Gate_Pipeline["TMPC SITL Validation Gate Pipeline"]
         G1["Gate 1: no_qp_fallback (0 occurrences)"]
-        G2["Gate 2: no_solver_failure (0 errors / MINSTEP)"]
-        G3["Gate 3: deadline_miss_rate (0.0% > 18ms)"]
-        G4["Gate 4: worst_case_timing (Max E2E <= 18ms)"]
-        G5["Gate 5: hover_tilt_stability (Roll/Pitch std <= 5.0 deg)"]
-        G6["Gate 6: maximum_tilt (Max tilt <= 40.0 deg)"]
-        G7["Gate 7: mission_xy_tracking (RMSE <= 1.0m, Max <= 3.0m)"]
-        G8["Gate 8: altitude_deviation (Max Z err <= 2.0m)"]
-        G9["Gate 9: mission_velocity_tracking (RMSE <= 1.0m/s, Max <= 3.0m/s)"]
-        G10["Gate 10: motor_saturation (Rate == 0.0%)"]
-        G11["Gate 11: minimum_obstacle_clearance (Distance >= Margin)"]
+        G2["Gate 2: no_solver_failure (0 errors)"]
+        G3["Gate 3: deadline_miss_rate (0.0% over 18ms)"]
+        G4["Gate 4: worst_case_timing (Max E2E under 18ms)"]
+        G5["Gate 5: hover_tilt_stability (Roll/Pitch std under 5 deg)"]
+        G6["Gate 6: maximum_tilt (Max tilt under 40 deg)"]
+        G7["Gate 7: mission_xy_tracking (RMSE under 1.0m)"]
+        G8["Gate 8: altitude_deviation (Max Z err under 2.0m)"]
+        G9["Gate 9: mission_velocity_tracking (RMSE under 1.0m/s)"]
+        G10["Gate 10: motor_saturation (Rate 0.0%)"]
+        G11["Gate 11: minimum_obstacle_clearance (Safe Distance)"]
     end
     
     G1 --> G2 --> G3 --> G4 --> G5 --> G6 --> G7 --> G8 --> G9 --> G10 --> G11
