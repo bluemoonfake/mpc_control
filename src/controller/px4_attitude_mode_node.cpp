@@ -103,8 +103,7 @@ public:
         if (msg && msg->valid && std::isfinite(msg->hover_thrust) && msg->hover_thrust > 0.05f) {
           std::lock_guard<std::mutex> lock(mutex_);
           hover_thrust_ = std::clamp(
-            static_cast<double>(msg->hover_thrust), kMinimumHoverThrust,
-            kMaximumHoverThrust);
+            static_cast<double>(msg->hover_thrust), kMinimumHoverThrust, kMaximumHoverThrust);
         }
       });
 

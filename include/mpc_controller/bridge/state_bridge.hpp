@@ -151,11 +151,12 @@ inline bool convert(
     return false;
   }
 
+  //Q_norm validation, oke if between 0.999 - 1.001
   const auto &q_px4 = attitude.body_frd_to_world_ned;
   const double q_norm = std::sqrt(
     q_px4[0] * q_px4[0] + q_px4[1] * q_px4[1]
     + q_px4[2] * q_px4[2] + q_px4[3] * q_px4[3]);
-  if (!std::isfinite(q_norm) || q_norm < 1.0e-9) {
+  if (q_norm < 1.0e-9) {
     output.attitude_valid = false;
     return false;
   }
@@ -189,12 +190,9 @@ inline bool convert(
   }
   const double pitch_rate_flu = -angular_velocity.body_rate_frd[1];
   const double yaw_rate_flu = -angular_velocity.body_rate_frd[2];
-  output.yaw_rate_enu =
-    (std::sin(roll_enu) * pitch_rate_flu +
-    std::cos(roll_enu) * yaw_rate_flu) / cos_pitch;
-  const bool finite_output = std::isfinite(output.yaw_enu)
-    && std::isfinite(output.yaw_rate_enu) && finite(output.position_enu)
-    && finite(output.velocity_enu) && finite(output.acceleration_enu)
+  output.yaw_rate_enu = (std::sin(roll_enu) * pitch_rate_flu + std::cos(roll_enu) * yaw_rate_flu) / cos_pitch;
+  const bool finite_output = std::isfinite(output.yaw_enu) && std::isfinite(output.yaw_rate_enu)
+    && finite(output.position_enu) && finite(output.velocity_enu) && finite(output.acceleration_enu)
     && finite(output.body_flu_to_world_enu);
   if (!finite_output) {
     output.position_valid = false;
