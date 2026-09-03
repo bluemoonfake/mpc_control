@@ -8,3 +8,5 @@ __pycache__/
 /config/missions/
 /agent/
 /validation_runs/
+tuning.md
+symlink_install_manifest.txt
