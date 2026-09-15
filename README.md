@@ -1,322 +1,436 @@
 # MPC Controller for PX4 (Native External Attitude Mode)
 
-A high-performance **3D Coupled Model Predictive Controller (MPC)** for multirotors running on **ROS 2 (Jazzy/Humble)** and integrated natively with **PX4 Autopilot** via `px4_ros2_cpp` (External Flight Mode).
+A ROS 2 translational MPC for PX4 External Flight Mode. The current backend solves
+one coupled, convex 3D quadratic program with OSQP 1.0.0. The control input is
+**acceleration command in ENU, not jerk**. PX4 owns the attitude/rate loops and
+motor allocation.
 
----
+This document describes the checked-in implementation and the profile in
+[controller.yaml](config/controller.yaml). Launch/parameter overrides can change
+runtime values. The Makefile defaults to ROS 2 Jazzy and Gazebo gz_x500; this is
+not a statement of validation on every ROS distribution or airframe.
 
-## 1. System Architecture & Overall Dataflow
+## 1. System Architecture
 
-The system is organized into a modular 4-node pipeline communicating over high-frequency ROS 2 topics and MicroXRCE-DDS:
-
-```mermaid
-flowchart TD
-    %% Styling
-    classDef px4Node fill:#1f2937,stroke:#3b82f6,stroke-width:2px,color:#fff;
-    classDef rosNode fill:#111827,stroke:#10b981,stroke-width:2px,color:#fff;
-    classDef solverNode fill:#1e1b4b,stroke:#8b5cf6,stroke-width:2px,color:#fff;
-    classDef dataBox fill:#374151,stroke:#6b7280,stroke-width:1px,color:#e5e7eb;
-
-    %% PX4 Section
-    subgraph PX4_Domain ["PX4 Autopilot / SITL"]
-        PX4_EKF["EKF2 State Estimator<br/>(Local Position, Attitude, Gyro)"]:::px4Node
-        PX4_FMM["Flight Mode Manager<br/>(Custom Mode Registration)"]:::px4Node
-        PX4_AttCtrl["Attitude & Rate Controller<br/>(SO3 Angular Loop + Motors)"]:::px4Node
-    end
-
-    %% State Bridge
-    subgraph Node_Bridge ["1. State Bridge Node"]
-        Bridge["vehicle_state_bridge_node<br/>- NED/FRD to ENU/FLU Conversion<br/>- Timestamp Monotonic & Skew Check"]:::rosNode
-    end
-
-    %% Reference Generator
-    subgraph Node_Ref ["2. Reference Generator Node"]
-        MissionParser["Mission Parser (JSON)<br/>- Schema.json"]:::dataBox
-        RefGen["reference_generator_node<br/>- Multi-Waypoint Horizon Preview (30 pts)<br/>- 3-Condition Waypoint Transition"]:::rosNode
-    end
-
-    %% MPC Solver
-    subgraph Node_MPC ["3. 3D Coupled MPC Node (50 Hz)"]
-        MPC["mpc_controller_node<br/>- 3D Coupled State-Space Model [p, v, a]<br/>- OSQP Sparse ADMM Solver"]:::solverNode
-    end
-
-    %% PX4 Attitude Adapter
-    subgraph Node_Att ["4. PX4 Attitude Mode Node"]
-        AttMode["px4_attitude_mode_node<br/>- px4_ros2::ModeBase<br/>- SO(3) Force-to-Attitude Mapping"]:::rosNode
-    end
-
-    %% Connections
-    PX4_EKF -->|"px4_msgs::VehicleLocalPosition<br/>px4_msgs::VehicleAttitude"| Bridge
-    Bridge -->|"mpc_controller::msg::VehicleState<br/>[Pos, Vel, Acc, Yaw] (ENU)"| MPC
-    Bridge -.->|"State Feedback"| RefGen
-
-    MissionParser --> RefGen
-    RefGen -->|"mpc_controller::msg::ReferenceTrajectory<br/>30-step Preview (dt=0.1s)"| MPC
-    RefGen -->|"std_msgs::Bool<br/>mission_completed"| AttMode
-
-    MPC -->|"mpc_controller::msg::MpcTranslationalOutput<br/>[a_des, yaw_des, status]"| AttMode
-
-    AttMode -->|"px4_ros2::AttitudeSetpoint<br/>[q_des, normalized_thrust]"| PX4_AttCtrl
-    AttMode <-->|"Mode Registration"| PX4_FMM
-```
-
----
-
-## 2. Dedicated 3D Coupled MPC Algorithm Flowchart
-
-The internal 50 Hz execution loop of `mpc_controller_node` and `mpc_solver.cpp`:
+The MPC profile launches four nodes. The force-to-attitude mapping runs inside
+the controller node; the PX4 adapter converts frames and normalizes thrust.
 
 ```mermaid
-flowchart TD
-    %% Styling
-    classDef inputNode fill:#065f46,stroke:#059669,stroke-width:2px,color:#fff;
-    classDef processNode fill:#1e293b,stroke:#64748b,stroke-width:2px,color:#fff;
-    classDef optNode fill:#4c1d95,stroke:#7c3aed,stroke-width:2px,color:#fff;
-    classDef decisionNode fill:#78350f,stroke:#d97706,stroke-width:2px,color:#fff;
-    classDef outputNode fill:#1e3a8a,stroke:#2563eb,stroke-width:2px,color:#fff;
-
-    %% Steps
-    InState["State Ingestion<br/>Measured Position, Velocity, Yaw (ENU)"]:::inputNode
-    InRef["Reference Ingestion<br/>30-point Horizon Preview (p_ref, v_ref, a_ref)"]:::inputNode
-
-    Obs["Feedback Observer"]:::processNode
-
-    BuildQP["Construct 3D Coupled Quadratic Program (QP)<br/>- Decision Variables: Jerk Inputs u = dot(a) in R^3<br/>- State-Space Dynamics: x[k+1] = A*x[k] + B*u[k]"]:::processNode
-
-    CostMatrix["Formulate Cost Function J:<br/>min sum ||p - p_ref||_Qp^2 + ||v - v_ref||_Qv^2<br/>       + ||a - a_ref||_Qa^2 + ||u||_R^2 + ||Delta u||_Rrate^2<br/>(Critically Damped: Qv/Qp >= 4.5)"]:::processNode
-
-    ConstraintMatrix["Formulate Hard Physical Constraints:<br/>- Velocity Envelope: |v_xy| <= 6.0 m/s, |v_z| <= 2.0 m/s<br/>- Acceleration Limits: |a_xy| <= 3.5 m/s^2, |a_z| <= 2.0 m/s^2<br/>- Jerk Rate Limits: |u_xy| <= 5.0 m/s^3<br/>- 8-Sided Polygon Tilt Constraint (theta <= 45 deg)<br/>- Collective Specific Force: 1.0 <= T_col <= 16.0 m/s^2"]:::processNode
-
-    SolveOSQP["OSQP Sparse ADMM Solver<br/>(Sparse CSC Matrices P, q, A_cons, l, u)<br/>Deadline: 18 ms | Max Iterations: 400"]:::optNode
-
-    CheckFeasible{"Solver Converged<br/>& Status Feasible?"}:::decisionNode
-
-    ExtractControl["Optimal Control Extraction:<br/>- Extract optimal first-knot jerk u_0*<br/>- Desired Acceleration: a_des = a_0 + u_0* * dt_first<br/>- Desired Specific Force: f_des = a_des + [0, 0, g]"]:::outputNode
-
-    RecoveryControl["Fallback Bounded Recovery Controller:<br/>- a_cmd = -K_v * v_err - K_p * p_err_z<br/>- Clamped to safe envelope (|a_xy| <= 2.5 m/s^2)"]:::decisionNode
-
-    PublishOutput["Publish /mpc_translational_output<br/>- Desired Acceleration Vector (ENU)<br/>- Desired Yaw & Yaw Rate<br/>- Solver Iterations, Cost & Latency"]:::outputNode
-
-    %% Flow Connections
-    InState --> Obs
-    InRef --> BuildQP
-    Obs --> BuildQP
-    BuildQP --> CostMatrix
-    BuildQP --> ConstraintMatrix
-    CostMatrix --> SolveOSQP
-    ConstraintMatrix --> SolveOSQP
-    SolveOSQP --> CheckFeasible
-    CheckFeasible -->|"Yes"| ExtractControl
-    CheckFeasible -->|"No / Timeout"| RecoveryControl
-    ExtractControl --> PublishOutput
-    RecoveryControl --> PublishOutput
+%%{init: {"flowchart": {"curve": "linear", "htmlLabels": false}}}%%
+flowchart LR
+    Telemetry["PX4 telemetry"] --> Bridge["Vehicle state bridge"]
+    Bridge -->|vehicle_state| MPC["MPC controller"]
+    Bridge -->|vehicle_state| Ref["Reference generator"]
+    Mission["Mission JSON"] --> Ref
+    Ref -->|reference_trajectory| MPC
+    MPC -->|force_attitude_setpoint| Adapter["PX4 attitude mode"]
+    MPC -->|mpc_translational_output| Diagnostics["Diagnostics"]
+    Ref -->|mission_completed| Adapter
+    Adapter -->|AttitudeSetpointType| PX4["PX4 attitude and rate loops"]
+    Adapter <-->|Mode registration| Manager["PX4 mode manager"]
 ```
 
----
+| Interface | Message / purpose |
+| --- | --- |
+| PX4 → bridge | VehicleLocalPosition, VehicleAttitude, VehicleAngularVelocity |
+| vehicle_state | VehicleState: ENU position, velocity, acceleration; orientation, rates and validity |
+| reference_trajectory | ReferenceTrajectory: timed position, velocity, acceleration, yaw and yaw rate |
+| force_attitude_setpoint | ForceAttitudeSetpoint: desired FLU→ENU quaternion, collective specific force and yaw rate |
+| mpc_translational_output | MpcTranslationalOutput: commands, prediction and solver diagnostics; not the adapter input |
+| /reference_generator_node/mission_completed | Bool; the MPC adapter reports External Mode completion, not an explicit landing command |
+
+Default bridge input topics are /fmu/out/vehicle_local_position_v1,
+/fmu/out/vehicle_attitude and /fmu/out/vehicle_angular_velocity.
+
+## 2. Controller Execution
+
+The controller callback runs at 50 Hz. Compact labels keep the diagram readable;
+equations and limits are detailed below.
+
+```mermaid
+%%{init: {"flowchart": {"curve": "linear", "htmlLabels": false}}}%%
+flowchart TD
+    Input["State and reference"] --> Gate{"Inputs usable?"}
+    Gate -->|No| Skip["Skip update"]
+    Gate -->|Yes| Prepare["Observe XY acceleration; sample horizon"]
+    Prepare --> QP["Update coupled QP"]
+    QP --> Solve["Solve with OSQP"]
+    Solve --> Check{"Result valid and in time?"}
+    Check -->|Yes| Command["Use first acceleration command"]
+    Check -->|No| Recovery["Bounded recovery command"]
+    Command --> Map["Map force to attitude"]
+    Recovery --> Map
+    Map --> Publish["Publish setpoint and diagnostics"]
+```
+
+- Stale state/reference inputs skip the update and reset solver/observer memory
+  when entering a stale interval. Finite-value checks remain active; the
+  additional strict state-validity/acceleration gate is disabled by the YAML
+  setting strict_validation: false.
+- The XY acceleration observer blends the previous-command response model with
+  measured acceleration. Z acceleration remains measured.
+- The reference generator publishes a 30 s horizon at 0.1 s spacing (301 samples).
+  The solver independently samples **26 prediction stages**: first step 0.01 s,
+  remaining 25 steps 0.20 s, for a **5.01 s** prediction span.
+- Solver budget: 18 ms; maximum iterations: 400. These are configured limits,
+  not measured timing guarantees.
+- Recovery brakes horizontal velocity and corrects height:
+  u_xy = -k_v v_xy; u_z = k_p(z_ref-z) - k_v v_z.
+  The command is bounded to 2.5 m/s² horizontally and ±1.5 m/s² vertically.
+  Recovery is for failed solves with usable inputs, not all invalid-input cases.
+
+Sources: [controller node](src/controller/mpc_controller_node.cpp),
+[controller and sampler](include/mpc_controller/controller/translational_mpc.hpp),
+[solver](src/solver/osqp_solver.cpp).
 
 ## 3. Mathematical Formulation
 
-### 3.1 State-Space Kinematics & Actuator Lag Model
-The 3D translational state vector and control input (Jerk) are defined as:
+### 3.1 State and acceleration-response model
 
 ```math
-\mathbf{x} = \begin{bmatrix} \mathbf{p} \\ \mathbf{v} \\ \mathbf{a} \end{bmatrix} \in \mathbb{R}^9, \quad \mathbf{u} = \dot{\mathbf{a}} = \begin{bmatrix} j_x \\ j_y \\ j_z \end{bmatrix} \in \mathbb{R}^3
+\mathbf{x}=[\mathbf{p}^\top,\mathbf{v}^\top,\mathbf{a}^\top]^\top\in\mathbb{R}^9,
+\qquad \mathbf{u}=[u_x,u_y,u_z]^\top\in\mathbb{R}^3
 ```
 
-The continuous-time dynamics incorporate a first-order acceleration-response lag reflecting the physical delay of the inner attitude loop:
+Both a and u have units m/s²: a is the response state, u is the requested
+acceleration. The continuous model motivating the response lag, per axis, is:
 
 ```math
-\dot{\mathbf{p}}(t) = \mathbf{v}(t), \quad \dot{\mathbf{v}}(t) = \mathbf{a}(t), \quad \dot{\mathbf{a}}(t) = -\frac{1}{\boldsymbol{\tau}} \mathbf{a}(t) + \frac{1}{\boldsymbol{\tau}} \mathbf{u}(t)
+\dot p=v,\qquad \dot v=a,\qquad \dot a=(u-a)/\tau
 ```
 
-Discretizing with step `dt_k`, using exact integration (`alpha_i = exp(-dt_k / tau_i)`, `b_i = 1 - alpha_i`):
+The configured time constants are [0.25, 0.25, 0.08] s. They are model parameters
+to verify against the target system's response, not the controller period.
+
+**The discrete model actually implemented** uses the next acceleration for the
+position/velocity update:
 
 ```math
-\mathbf{x}_{k+1} = \mathbf{A}(\Delta t_k) \, \mathbf{x}_k + \mathbf{B}(\Delta t_k) \, \mathbf{u}_k
+\alpha_i=e^{-\Delta t/\tau_i},\quad b_i=1-\alpha_i
+```
+```math
+a_{i,k+1}=\alpha_i a_{i,k}+b_i u_{i,k},\qquad
+v_{i,k+1}=v_{i,k}+\Delta t\,a_{i,k+1},\qquad
+p_{i,k+1}=p_{i,k}+\Delta t\,v_{i,k}+\tfrac12\Delta t^2a_{i,k+1}
+```
+```math
+A_i=
+\begin{bmatrix}
+1&\Delta t&\tfrac12\Delta t^2\alpha_i\\
+0&1&\Delta t\alpha_i\\
+0&0&\alpha_i
+\end{bmatrix},
+\qquad
+B_i=
+\begin{bmatrix}
+\tfrac12\Delta t^2b_i\\ \Delta t b_i\\ b_i
+\end{bmatrix}
 ```
 
-The per-axis discrete transition blocks are:
+For tau_i = 0 the code sets alpha_i = 0. The acceleration update is the exact
+constant-input first-order response; the position/velocity updates above are
+not the exact integration of the full continuous model.
+
+The per-axis dynamics are independent. XY command limits and XYZ tilt
+constraints couple their optimization in one QP.
+
+### 3.2 Decision variables and objective
+
+The solver eliminates predicted states using X = F x_0 + G U. Its decision
+vector contains 78 acceleration-command components and 52 slack variables:
 
 ```math
-\mathbf{A}_i = \begin{bmatrix} 1 & \Delta t & \tau_i \Delta t - \tau_i^2 b_i \\ 0 & 1 & \tau_i b_i \\ 0 & 0 & \alpha_i \end{bmatrix}, \quad \mathbf{B}_i = \begin{bmatrix} \tfrac{1}{2}\Delta t^2 - \tau_i \Delta t + \tau_i^2 b_i \\ \Delta t - \tau_i b_i \\ b_i \end{bmatrix}
+z=[u_0^\top,\ldots,u_{N-1}^\top,s_v^\top,s_a^\top]^\top
+\in\mathbb{R}^{130},\qquad N=26
 ```
 
----
-
-### 3.2 Quadratic Program (QP) Objective Function
-Over a prediction horizon of N steps, the optimal jerk sequence minimizes tracking error and control effort:
+There is one velocity slack and one acceleration slack per prediction stage,
+shared across that stage's corresponding axis constraints. Let
+e_(k+1) = x_(k+1) - x_ref,(k+1). The objective, before positive numerical scaling, is:
 
 ```math
-\min_{\mathbf{u}_0, \dots, \mathbf{u}_{N-1}} J = \sum_{k=0}^{N-1} \left( \|\mathbf{p}_k - \mathbf{p}_{\text{ref},k}\|_{\mathbf{Q}_p}^2 + \|\mathbf{v}_k - \mathbf{v}_{\text{ref},k}\|_{\mathbf{Q}_v}^2 + \|\mathbf{a}_k - \mathbf{a}_{\text{ref},k}\|_{\mathbf{Q}_a}^2 + \|\mathbf{u}_k\|_{\mathbf{R}}^2 + \|\mathbf{u}_k - \mathbf{u}_{k-1}\|_{\mathbf{R}_\Delta}^2 \right) + \|\mathbf{x}_N - \mathbf{x}_{\text{ref},N}\|_{\mathbf{S}}^2
+J=
+\sum_{k=0}^{N-2}\frac{\Delta t_k}{\Delta t_{\mathrm{later}}}
+\|e_{k+1}\|_Q^2
++\|e_N\|_S^2
++\sum_{k=0}^{N-1}
+\left(\|u_k\|_R^2+\|u_k-u_{k-1}\|_{R_\Delta}^2
++\rho s_{v,k}^2+\rho s_{a,k}^2\right)
 ```
 
-**Critical Damping**: Weights satisfy `Q_v >= 4.5 * Q_p`, eliminating overshoot and S-weaving oscillations after sharp corners.
+For k = 0, u_-1 is the controller's stored previous input. Q and S weight
+position, velocity and acceleration, with separate XY/Z settings. The last
+prediction stage uses terminal weights instead of an additional stage cost.
 
----
-
-### 3.3 Physical Envelope Constraints
-The optimization is subjected to hard linear inequality constraints.
-
-**Velocity Bounds:**
+OSQP solves the resulting convex QP:
 
 ```math
-|v_x| \le v_{xy,\max}, \quad |v_y| \le v_{xy,\max}, \quad |v_z| \le v_{z,\max}
+\min_z \tfrac12 z^\top Pz+q^\top z,\qquad l\le Cz\le h
 ```
 
-**Acceleration Bounds:**
+C denotes the constraint matrix, distinct from the dynamics matrix A.
+The implementation builds dense Eigen matrices, then supplies sparse CSC
+matrices to OSQP. Condensing can make the Hessian less sparse.
+
+Weight ratios alone do not establish critical damping, zero overshoot or
+closed-loop stability; those claims require analysis and measured validation.
+
+### 3.3 Hard command limits and soft state limits
+
+Define n_i = [cos(2 pi i/8), sin(2 pi i/8)] for i = 0,...,7 and
+c_8 = cos(pi/8). Every polygon inequality below applies for all eight normals.
+
+**Hard acceleration-command and command-rate bounds:**
 
 ```math
-|a_x| \le a_{xy,\max}, \quad |a_y| \le a_{xy,\max}, \quad |a_z| \le a_{z,\max}
+n_i^\top u_{xy,k}\le c_8 u_{xy,\max},\qquad
+|u_{z,k}|\le u_{z,\max}
+```
+```math
+n_i^\top(u_{xy,k}-u_{xy,k-1})
+\le c_8\dot u_{xy,\max}\Delta t_k,\qquad
+|u_{z,k}-u_{z,k-1}|\le\dot u_{z,\max}\Delta t_k
 ```
 
-**Jerk & Control Rate Bounds:**
+The rate limits have units m/s³. They bound changes of acceleration commands;
+u itself is not jerk.
+
+**Soft predicted-state bounds** (v and a here are at stage k+1):
 
 ```math
-\|\mathbf{u}_k\| \le u_{\max}, \quad \|\mathbf{u}_k - \mathbf{u}_{k-1}\| \le \Delta u_{\max}
+n_i^\top v_{xy}\le c_8v_{xy,\max}+s_{v,k},\qquad
+|v_z|\le v_{z,\max}+s_{v,k}
+```
+```math
+n_i^\top a_{xy}\le c_8a_{xy,\max}+s_{a,k},\qquad
+|a_z|\le a_{z,\max}+s_{a,k}
 ```
 
-**8-Sided Polygonal Tilt Constraint** (max tilt = 45 deg):
+Both slacks are nonnegative, penalized quadratically, and bounded by
+max_constraint_slack (20.0 numerically, in the respective units).
+Consequently the nominal velocity/acceleration limits are not hard guarantees.
+
+**Hard total-tilt limit:**
 
 ```math
-\mathbf{n}_i^T \, \mathbf{a}_{xy,k} \le g \cdot \tan(\theta_{\max}), \quad \forall\, i \in \{1, \dots, 8\}
+n_i^\top u_{xy,k}
+\le c_8\tan(\theta_{\max})(u_{z,k}+g)
 ```
 
-**Collective Specific Force:**
+This is an inscribed polygon approximation of the tilt cone. The configured
+35° limit is total thrust-axis tilt, not separate ±45° roll and pitch limits.
+
+**Hard collective-specific-force envelope:**
+
+The desired specific force is f = u + [0,0,g]ᵀ, with units N/kg = m/s².
+The solver uses a conservative vertical bound with reserved horizontal force:
 
 ```math
-T_{\min} \le a_{z,k} + g \le T_{\max}
+f_{\min}\le u_{z,k}+g
+\le\sqrt{f_{\max}^2-u_{xy,\max}^2}
 ```
 
----
+Together with the horizontal command bound, this ensures ||f|| ≤ f_max.
+It is more restrictive than the full spherical force envelope. It also
+intersects the separate ±u_z,max bound. The solver checks the resulting force
+norm and tilt when validating its output.
 
-### 3.4 SO(3) Force-to-Attitude & Thrust Mapping
+### 3.4 Acceleration to attitude and PX4 thrust
 
-From the optimal first-knot acceleration:
+The first optimal command is applied directly:
 
 ```math
-\mathbf{a}_{\text{des}} = \mathbf{a}_0 + \mathbf{u}_0^{*} \cdot \Delta t_0
+a_{\mathrm{des}}=u_0^\star,\qquad
+f_{\mathrm{des}}=u_0^\star+[0,0,g]^\top,\qquad
+b_3=f_{\mathrm{des}}/\|f_{\mathrm{des}}\|
 ```
 
-The desired specific force vector in ENU frame:
+There is no a_0 + u_0*dt integration in the command extraction.
+For the requested yaw psi:
 
 ```math
-\mathbf{f}_{\text{des}} = \mathbf{a}_{\text{des}} + \begin{bmatrix} 0 \\ 0 \\ g \end{bmatrix}, \quad \mathbf{z}_B = \frac{\mathbf{f}_{\text{des}}}{\|\mathbf{f}_{\text{des}}\|}
+x_C=[\cos\psi,\sin\psi,0]^\top,\qquad
+b_2=\frac{b_3\times x_C}{\|b_3\times x_C\|},\qquad
+b_1=b_2\times b_3,\qquad R_{\mathrm{des}}=[b_1\ b_2\ b_3]
 ```
 
-Given the desired yaw angle `psi`, the intermediate heading vector:
+[force_attitude_mapper.hpp](include/mpc_controller/px4/force_attitude_mapper.hpp)
+checks the force and tilt and constructs the quaternion in the controller node.
+
+The active [PX4 adapter](src/px4/px4_attitude_mode_node.cpp) converts FLU/ENU
+to FRD/NED and uses:
 
 ```math
-\mathbf{x}_C = \begin{bmatrix} \cos(\psi) \\ \sin(\psi) \\ 0 \end{bmatrix}
+T_{\mathrm{norm}}=
+\operatorname{clamp}\left(h\,\|f_{\mathrm{des}}\|/9.80665,\;0.05,\;0.95\right),
+\qquad \mathbf{T}_{\mathrm{FRD}}=[0,0,-T_{\mathrm{norm}}]^\top
 ```
 
-The body orthonormal orientation and target quaternion:
+Here h starts at the source default 0.60 and is updated from accepted PX4
+HoverThrustEstimate messages. The adapter currently does not read the
+hover_thrust: 0.59 or gravity_m_s2 entries in YAML. Its active path clamps
+thrust rather than using the rejecting specificForceToBodyFrdZ helper.
 
-```math
-\mathbf{y}_B = \frac{\mathbf{z}_B \times \mathbf{x}_C}{\|\mathbf{z}_B \times \mathbf{x}_C\|}, \quad \mathbf{x}_B = \mathbf{y}_B \times \mathbf{z}_B \;\implies\; \mathbf{q}_{\text{des}} \in \mathbb{H}
+ENU yaw rate is negated for NED. Before receiving a setpoint, or when its
+receipt age exceeds 0.5 s, the adapter sends identity attitude and hover thrust.
+That is the implemented fallback, not a position-hold guarantee.
+
+## 4. Reference Generation and State Feedback
+
+- Mission JSON is parsed by [mission_json_parser.cpp](src/mission/mission_json_parser.cpp).
+  The generator supports takeoff, navigation waypoints, hold and land references.
+- The current reference horizon follows the active leg and holds its endpoint.
+  It does **not** preview unaccepted successor waypoints.
+- Advancement requires measured distance within the acceptance radius and
+  elapsed leg time at least the target hold duration. The general radius is
+  2.5 m; targets classified as landing use 0.35 m. Finish-plane crossing is
+  diagnostic and does not independently advance a waypoint.
+- /reference_generator_node/start_mission starts reference execution;
+  /reference_generator_node/reset_mission resets the generator.
+  Starting the reference does not arm or switch PX4 modes.
+- The state bridge converts NED/FRD telemetry to ENU/FLU and publishes validity
+  information, with 0.25 s freshness and 0.10 s cross-topic skew settings.
+  Consumers must honor the appropriate validity checks.
+
+See [mission_trajectory.cpp](src/mission/mission_trajectory.cpp) and
+[reference_generator_node.cpp](src/mission/reference_generator_node.cpp).
+
+## 5. Source and Build Architecture
+
+```text
+include/mpc_controller/
+  mission/       mission models and trajectory interfaces
+  controller/    translational MPC and reference sampler
+  solver/        coupled QP solver contract
+  px4/           state, force/attitude and PID-reference mapping
+src/
+  mission/       mission parsing and reference node
+  controller/    MPC node, observer, recovery and setpoint mapping
+  solver/        OSQP implementation
+  px4/           state bridge and External Attitude Mode
+  PID_validation/ PX4 PID External Mode
 ```
 
-The normalized collective thrust command:
+CMake builds mpc_mission and mpc_solver, plus the four MPC-profile executables
+and pid_mode_node. It fetches pinned OSQP 1.0.0 sources. Required dependencies
+include ROS 2, px4_msgs, px4_ros2_cpp, Eigen3 and nlohmann_json; see
+[CMakeLists.txt](CMakeLists.txt) and [package.xml](package.xml).
 
-```math
-T_{\text{norm}} = \text{clamp}\!\left( \frac{\|\mathbf{f}_{\text{des}}\|}{g} \cdot T_{\text{hover}},\; 0.05,\; 1.0 \right)
-```
+## 6. Build and Run
 
----
+Run from the package root with the ROS and PX4 dependencies available.
+The Makefile supports ROS_SETUP, PX4_DIR and PX4_MSGS_SETUP overrides, and checks
+its configured PX4 revision and Gazebo version before starting SITL.
 
-## 4. Core Package Modules
-
-### 1. `reference_generator_node` (Mission Parser & Horizon Lookahead)
-* **Mission Parser**: Parses declarative mission JSON files conforming to the schema (`takeoff`, `waypoint`, `hold`, `land`).
-* **Multi-Waypoint Horizon Lookahead**: Samples continuous 30-step ($3\text{ s}$) preview across current and upcoming waypoints, enabling anticipatory banked turns.
-* **3-Condition Waypoint Transition**:
-  1. *Distance & Hold*: Drone within `acceptance_radius` ($2.5\text{ m}$) and hold timer satisfied.
-  2. *Cross-Track Plane Test*: Drone has crossed the normal plane perpendicular to the leg vector (eliminates corner overshooting deadlocks).
-  3. *Time-Elapsed Proximity*: Leg duration elapsed and drone within proximity ($< 4.0\text{ m}$).
-* **Auto-Landing Handover**: Publishes `/reference_generator_node/mission_completed` upon mission completion to trigger native landing.
-
-### 2. `vehicle_state_bridge_node` (Coordinate & State Conversion)
-* **Coordinate Mapping**: Converts PX4 NED/FRD telemetry to standard ROS 2 ENU/FLU frames.
-* **Integrity Validation**: Verifies monotonic timestamps and checks cross-topic sample skew ($< 100\text{ ms}$).
-
-### 3. `mpc_controller_node` & `mpc_solver.cpp` (3D Coupled Translational MPC)
-* **Kinematic Model**: State vector $\mathbf{x} = [\mathbf{p}, \mathbf{v}, \mathbf{a}]^T \in \mathbb{R}^9$, control input $\mathbf{u} = \dot{\mathbf{a}} \in \mathbb{R}^3$ (Jerk).
-* **Actuator Lag Compensation**: First-order time constants $\boldsymbol{\tau}_{xyz} = [0.25, 0.25, 0.08]\text{ s}$ integrated directly into discrete transition matrices $A(\Delta t), B(\Delta t)$.
-* **Critically Damped Tuning**: High derivative damping ratio ($Q_{\text{vel}} \ge 4.5 \times Q_{\text{pos}}$) eliminating S-weaving oscillations after sharp corners.
-
-### 4. `px4_attitude_mode_node` (Native PX4 Attitude Mode)
-* **Mode Registration**: Registers as an official Custom External Mode with PX4 Flight Mode Manager via `px4_ros2::ModeBase`.
-* **$\mathbf{SO}(3)$ Attitude & Thrust Mapping**: Computes desired quaternion $\mathbf{q}_{\text{des}}$ and normalized thrust $[0..1]$ calibrated by PX4's `HoverThrustEstimate`.
-
----
-
-## 5. Quick Start & Execution Workflow
-
-### Build Package
 ```bash
 make build
 source install/setup.bash
+
+# Start PX4 SITL, Gazebo GUI, DDS and the MPC ROS nodes
+make sim CONTROLLER=mpc MISSION_JSON=config/missions/benchmark_square.json
 ```
 
-### Launch Simulation Stack
+Arm and take off manually in a stock PX4 mode, then select the registered
+MPC Controller External Mode in QGroundControl. Start reference execution
+separately:
+
 ```bash
-# Terminal 1: Start PX4 SITL (Gazebo x500)
-make sim
-
-# Terminal 2: Start MicroXRCE-DDS Bridge
-make dds
-
-# Terminal 3: Start MPC Controller Stack
-make ros
-```
-
-### Arm & Start Mission
-```bash
-# Terminal 4: Arm and start mission
-make arm
 make mission-start
 ```
 
----
+make mission-run only prints instructions; it does not start the mission.
+The Makefile also contains explicit arm/disarm targets, but these are not part
+of the workflow above. Mode selection, arming and landing are not automated by
+the reference start service.
 
-## 6. Benchmark Missions
+For an already prepared ROS/PX4 environment, launch the nodes directly with:
 
-| Mission File | Description | Key Comparison |
-| :--- | :--- | :--- |
-| `config/missions/benchmark_square.json` | $50\text{m} \times 50\text{m}$ Square with $90^\circ$ turns and climb ($10\text{m} \rightarrow 15\text{m}$) | Precision cornering & zero S-weaving |
-| `config/missions/benchmark_obstacle_slalom.json` | 3D Ziczac Slalom ($5\text{ m/s}$) around 4 obstacles with continuous altitude shifts | Continuous speed ($4.9\text{ m/s}$) vs PID Stop-and-Go ($1.3\text{ m/s}$) |
-| `config/missions/benchmark_urban_canyon.json` | Narrow corridor with $90^\circ$ chicanes and $180^\circ$ U-turn apex | Banked turning ($\text{Roll} \le 21^\circ$) in tight spaces |
+```bash
+ros2 launch mpc_controller mpc_external_mode.launch.py \
+  controller:=mpc \
+  mission_file_path:=/absolute/path/to/mission.json
 
-To switch missions, update `mission_file_path` in [config/controller.yaml](file:///home/ubuntu/Dev/mpc_controller/mpc_control/config/controller.yaml#L5):
-```yaml
-reference_generator_node:
-  ros__parameters:
-    mission_file_path: "config/missions/benchmark_obstacle_slalom.json"
+make status
+make logs
+make stop
 ```
 
----
+Existing running sessions are not replaced merely by rebuilding; restart the
+relevant processes to apply changes.
 
-## 7. Tuning Parameters Reference
+## 7. PX4 PID Comparison and Missions
 
-All operational parameters are centralized in `config/controller.yaml`:
+The px4_pid launch profile replaces the MPC/controller-adapter pair with
+[pid_mode_node](src/PID_validation/pid_mode_node.cpp). It shares the reference
+generator and state bridge, samples the reference at the current time, and
+publishes position, velocity, acceleration, yaw and yaw rate at 50 Hz through
+TrajectorySetpointType. PX4 owns the feedback loops in this profile.
 
-```yaml
-mpc_controller_node:
-  ros__parameters:
-    # Model Lag Identification (Identify for target airframe)
-    model_time_constant_xyz: [0.25, 0.25, 0.08]
-
-    # Stage Weights [Position, Velocity, Acceleration]
-    q_xy: [80.0, 550.0, 2.0]        # Q_vel/Q_pos ~ 6.9 (Critically Damped)
-    s_xy: [100.0, 600.0, 4.0]
-    q_z:  [200.0, 350.0, 2.0]
-    s_z:  [300.0, 400.0, 4.0]
-
-    # Control Penalties
-    control_weight_xy: 1.5           # Penalizes excessive tilt
-    control_rate_weight_xy: 40.0     # Penalizes jerk (smooth attitude rate)
-
-    # Physical Envelope Constraints
-    max_speed_xy: 6.0                # m/s
-    max_acceleration_xy: 3.5         # m/s^2 (corresponds to ~19.6 deg tilt)
-    max_control_rate_xy: 5.0         # m/s^3 (jerk rate limit)
-    max_tilt: 0.785398               # 45 deg hard constraint limit
+```bash
+make sim CONTROLLER=px4_pid MISSION_JSON=config/missions/test_hover_step.json
+# After manual takeoff and selection of PX4 PID:
+make mission-start
 ```
+
+The PID adapter validates frame, timestamps, reference contents and freshness.
+Invalid references prevent readiness; loss during operation reports mode failure
+and stops new trajectory publication. Its fallback behavior differs from the
+MPC attitude adapter and must be considered when comparing logs.
+
+| Mission file under config/missions/ | Requested default XY speed | Scenario |
+| --- | --- | --- |
+| benchmark_square.json | 4 m/s | 50 × 50 m square, altitude 10–15 m |
+| benchmark_obstacle_slalom.json | 18 m/s | Alternating lateral waypoints and altitude changes |
+| benchmark_urban_canyon.json | 12 m/s | Chicanes, return legs and altitude changes |
+
+These are mission inputs, not achieved speeds or measured MPC-versus-PID
+results. The current generator waits for waypoint acceptance; no continuous
+cornering, zero-overshoot or obstacle-clearance guarantee follows from these
+files. The QP has no obstacle-avoidance constraints. The 18 m/s profile is a SITL
+experiment, not a validated hardware flight envelope.
+
+## 8. Current Configuration and Validation
+
+Values below come from [controller.yaml](config/controller.yaml), not the C++
+fallback defaults.
+
+| Parameter | Configured value |
+| --- | --- |
+| update_rate_hz | 50 |
+| dt_first / dt_later | 0.01 / 0.20 s |
+| model_time_constant_xyz | [0.25, 0.25, 0.08] s |
+| q_xy / s_xy | [80, 550, 2] / [100, 600, 4] |
+| q_z / s_z | [200, 350, 2] / [300, 400, 4] |
+| control_weight_xy / control_weight_z | 1.5 / 4.0 |
+| control_rate_weight_xy / control_rate_weight_z | 40 / 10 |
+| max_speed_xy / max_speed_z | 18 / 2 m/s (soft) |
+| max_acceleration_xy / max_acceleration_z | 6 / 2 m/s² (soft) |
+| max_control_xy / max_control_z | 6 / 3 m/s² (hard) |
+| max_control_rate_xy / max_control_rate_z | 8 / 4 m/s³ |
+| max_tilt | 0.6108652381980153 rad = 35° total tilt |
+| min_collective_specific_force_m_s2 / max_collective_specific_force_m_s2 | 1 / 13 m/s² |
+| constraint_slack_weight / max_constraint_slack | 10000 / 20 |
+| solver_deadline_seconds / max_iterations | 0.018 / 400 |
+| coupled_admm_rho | 0.05 |
+| solver_absolute_tolerance / solver_relative_tolerance | 0.0003 / 0.001 |
+| strict_validation | false |
+
+XY limits use the polygon construction described above, not independent
+componentwise boxes. Parameters do not by themselves prove stability or
+physical feasibility of every requested maneuver.
+
+Run the CMake-registered tests through colcon:
+
+```bash
+colcon test --packages-select mpc_controller
+colcon test-result --verbose
+
+# Focused PID reference test after building with tests enabled
+ctest --test-dir build/mpc_controller -R pid_reference_test --output-on-failure
+```
+
+The registered tests cover PID reference handling, force-to-attitude mapping,
+mission trajectory generation and JSON parsing. Passing them does not establish
+solver deadline compliance or flight performance. Compare repeated SITL runs
+using tracking error, constraint/slack usage, actuator saturation, solver
+latency and fallback counts.
