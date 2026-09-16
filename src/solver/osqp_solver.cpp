@@ -1,4 +1,4 @@
-#include "mpc_controller/mpc_solver.hpp"
+#include "mpc_controller/solver/mpc_solver.hpp"
 
 #include <osqp.h>
 
@@ -322,15 +322,25 @@ public:
 private:
   void buildPrediction()
   {
-    Eigen::Matrix<double, 9, 9> state_transition =
-      Eigen::Matrix<double, 9, 9>::Identity();
-    Eigen::Matrix<double, 9, Eigen::Dynamic> control_transition =
-      Eigen::Matrix<double, 9, Eigen::Dynamic>::Zero(9, kControlCount);
+    Eigen::Matrix<double, 9, 9> state_transition = Eigen::Matrix<double, 9, 9>::Identity();
+    Eigen::Matrix<double, 9, Eigen::Dynamic> control_transition = Eigen::Matrix<double, 9, Eigen::Dynamic>::Zero(9, kControlCount);
     for (std::size_t step = 0; step < kHorizonLength; ++step) {
-      const double dt = step == 0 ? config_.dt_first : config_.dt_later;
+      double dt;
+      if (step == 0){
+        dt = config_.dt_first;
+      }
+      else {
+        dt = config_.dt_later;
+      }
       Eigen::Vector3d alpha;
       for (std::size_t axis = 0; axis < 3; ++axis) {
-        alpha(static_cast<Eigen::Index>(axis)) = config_.model_time_constant_xyz[axis] > 0.0 ?std::exp(-dt / config_.model_time_constant_xyz[axis]) : 0.0;
+        //if time constant is zero, set alpha to zero
+        if (config_.model_time_constant_xyz[axis] == 0.0){
+          alpha(static_cast<Eigen::Index>(axis)) = 0.0;
+        }
+        else {
+          alpha(static_cast<Eigen::Index>(axis)) = std::exp(-dt / config_.model_time_constant_xyz[axis]);
+        }
       }
       const auto a = transitionMatrix(dt, alpha);
       state_transition = a * state_transition;
@@ -342,9 +352,10 @@ private:
       const auto &xy = step + 1 == kHorizonLength ? config_.terminal_weights_xy : config_.stage_weights_xy;
       const auto &z = step + 1 == kHorizonLength ? config_.terminal_weights_z : config_.stage_weights_z;
       // J = sum(dt_k * e_k'Qe_k) + e_N'Se_N. Parameters are tuned for the
-      // regular 200 ms knot, so only the shorter first stage is normalized.
+      // Final phase, dt = 0.2s.
+      // Initial phase dt = 0.1s.
       const bool terminal = step + 1 == kHorizonLength;
-      const double stage_scale = terminal ? 1.0 : dt / config_.dt_later;
+      const double stage_scale = terminal ? 1.0 : dt / config_.dt_later;  // if stage_scale = terminal -> 1.0
       for (std::size_t derivative = 0; derivative < 3; ++derivative) {
         weights_(9 * step + 3 * derivative) = stage_scale * xy[derivative];
         weights_(9 * step + 3 * derivative + 1) = stage_scale * xy[derivative];
@@ -355,18 +366,15 @@ private:
 
   void buildObjective()
   {
-    hessian_.topLeftCorner(kControlCount, kControlCount) =
-      2.0 * control_mapping_.transpose() * weights_.asDiagonal() * control_mapping_;
+    hessian_.topLeftCorner(kControlCount, kControlCount) = 2.0 * control_mapping_.transpose() * weights_.asDiagonal() * control_mapping_;
     // Add r_u ||U||^2 and r_du ||DU||^2 directly to the condensed Hessian.
-    // The rate block couples adjacent 3-D inputs but keeps X/Y/Z weights
-    // independently tunable.
     for (std::size_t step = 0; step < kHorizonLength; ++step) {
       for (std::size_t axis = 0; axis < kInputDimension; ++axis) {
         const auto current = static_cast<Eigen::Index>(controlIndex(step, axis));
         const double control_weight = config_.control_weights[axis];
         const double rate_weight = config_.control_rate_weights[axis];
         hessian_(current, current) += 2.0 * (control_weight + rate_weight);
-        if (step > 0) {
+        if (step > 0) {  // r_du ||DU||^2 = 1/2*(2ru1^2-2ru(k-1)u(k)-2rukuk-1+2ruk^2)
           const auto previous = static_cast<Eigen::Index>(controlIndex(step - 1, axis));
           hessian_(previous, previous) += 2.0 * rate_weight;
           hessian_(current, previous) -= 2.0 * rate_weight;
@@ -391,8 +399,7 @@ private:
       const auto uy = static_cast<Eigen::Index>(controlIndex(step, 1));
       const auto uz = static_cast<Eigen::Index>(controlIndex(step, 2));
       for (std::size_t side = 0; side < kPolygonSides; ++side) {
-        const double angle = 2.0 * M_PI * static_cast<double>(side)
-          / static_cast<double>(kPolygonSides);
+        const double angle = 2.0 * M_PI * static_cast<double>(side) / static_cast<double>(kPolygonSides);
         const double nx = std::cos(angle);
         const double ny = std::sin(angle);
 

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mpc_controller/mpc_solver.hpp"
+#include "mpc_controller/solver/mpc_solver.hpp"
 
 #include <algorithm>
 #include <array>

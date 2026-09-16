@@ -27,6 +27,7 @@ FetchContent_MakeAvailable(osqp)
 find_package(ament_cmake REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(nlohmann_json REQUIRED)
 find_package(px4_msgs REQUIRED)
 find_package(px4_ros2_cpp REQUIRED)
 find_package(rclcpp REQUIRED)
@@ -48,42 +49,100 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   DEPENDENCIES builtin_interfaces std_msgs
 )
 
-add_library(mpc_core STATIC src/mpc_solver.cpp)
-target_compile_features(mpc_core PUBLIC cxx_std_17)
-target_include_directories(mpc_core PUBLIC
+add_library(mpc_common INTERFACE)
+target_compile_features(mpc_common INTERFACE cxx_std_17)
+target_include_directories(mpc_common INTERFACE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/px4-ros2-interface-lib/px4_ros2_cpp/include>
   $<INSTALL_INTERFACE:include>)
-target_link_libraries(mpc_core PUBLIC Eigen3::Eigen PRIVATE osqpstatic)
+target_link_libraries(mpc_common INTERFACE Eigen3::Eigen)
 
-function(add_mpc_node target source)
-  add_executable(${target} ${source})
-  target_compile_features(${target} PRIVATE cxx_std_17)
-  target_include_directories(${target} PRIVATE
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/px4-ros2-interface-lib/px4_ros2_cpp/include>)
-  ament_target_dependencies(${target} rclcpp ${ARGN})
-  rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
-  target_link_libraries(${target} "${cpp_typesupport_target}")
-  install(TARGETS ${target} DESTINATION lib/${PROJECT_NAME})
-endfunction()
+rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
-add_mpc_node(reference_generator_node src/reference_generator_node.cpp
-  px4_msgs std_msgs std_srvs visualization_msgs)
-add_mpc_node(mpc_controller_node src/mpc_controller_node.cpp std_msgs)
-target_link_libraries(mpc_controller_node mpc_core)
-add_mpc_node(vehicle_state_bridge_node src/vehicle_state_bridge_node.cpp px4_msgs)
-add_mpc_node(px4_attitude_mode_node src/px4_attitude_mode_node.cpp px4_msgs px4_ros2_cpp std_msgs std_srvs)
-target_link_libraries(px4_attitude_mode_node Eigen3::Eigen px4_ros2_cpp::px4_ros2_cpp)
+add_library(mpc_mission STATIC
+  src/mission/mission_json_parser.cpp
+  src/mission/mission_trajectory.cpp)
+target_compile_features(mpc_mission PUBLIC cxx_std_17)
+target_link_libraries(mpc_mission PUBLIC
+  mpc_common nlohmann_json::nlohmann_json)
+
+add_library(mpc_solver STATIC
+  src/solver/osqp_solver.cpp)
+target_compile_features(mpc_solver PUBLIC cxx_std_17)
+target_link_libraries(mpc_solver PUBLIC mpc_common PRIVATE osqpstatic)
+
+add_executable(mpc_controller_node
+  src/controller/mpc_controller_node.cpp)
+target_compile_features(mpc_controller_node PRIVATE cxx_std_17)
+ament_target_dependencies(mpc_controller_node rclcpp std_msgs)
+target_link_libraries(mpc_controller_node
+  mpc_common mpc_solver "${cpp_typesupport_target}")
+
+add_executable(reference_generator_node
+  src/mission/reference_generator_node.cpp)
+target_compile_features(reference_generator_node PRIVATE cxx_std_17)
+ament_target_dependencies(reference_generator_node
+  rclcpp std_msgs std_srvs visualization_msgs)
+target_link_libraries(reference_generator_node
+  mpc_mission "${cpp_typesupport_target}")
+
+add_executable(vehicle_state_bridge_node
+  src/px4/vehicle_state_bridge_node.cpp)
+target_compile_features(vehicle_state_bridge_node PRIVATE cxx_std_17)
+ament_target_dependencies(vehicle_state_bridge_node rclcpp px4_msgs)
+target_link_libraries(vehicle_state_bridge_node
+  mpc_common "${cpp_typesupport_target}")
+
+add_executable(px4_attitude_mode_node
+  src/px4/px4_attitude_mode_node.cpp)
+target_compile_features(px4_attitude_mode_node PRIVATE cxx_std_17)
+ament_target_dependencies(px4_attitude_mode_node
+  rclcpp px4_msgs px4_ros2_cpp std_msgs std_srvs)
+target_link_libraries(px4_attitude_mode_node
+  mpc_common px4_ros2_cpp::px4_ros2_cpp "${cpp_typesupport_target}")
+
+add_executable(pid_mode_node src/PID_validation/pid_mode_node.cpp)
+ament_target_dependencies(pid_mode_node rclcpp px4_msgs px4_ros2_cpp)
+target_link_libraries(pid_mode_node
+  mpc_common px4_ros2_cpp::px4_ros2_cpp "${cpp_typesupport_target}")
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(pid_reference_test test/unit/pid_valid/pid_reference_test.cpp)
+  target_link_libraries(pid_reference_test mpc_common)
+
+  ament_add_gtest(force_attitude_mapper_test
+    test/unit/px4/force_attitude_mapper_test.cpp)
+  target_link_libraries(force_attitude_mapper_test mpc_common)
+
+  ament_add_gtest(mission_reference_generator_test
+    test/unit/mission/mission_trajectory_test.cpp)
+  target_link_libraries(mission_reference_generator_test mpc_mission)
+
+  ament_add_gtest(mission_json_parser_test
+    test/integration/mission/mission_json_parser_test.cpp)
+  target_compile_definitions(mission_json_parser_test PRIVATE
+    MPC_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")
+  target_link_libraries(mission_json_parser_test mpc_mission)
+endif()
 
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)
-install(TARGETS mpc_core
+install(TARGETS
+  mpc_mission
+  mpc_solver
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib)
 
+install(TARGETS
+  reference_generator_node
+  mpc_controller_node
+  vehicle_state_bridge_node
+  px4_attitude_mode_node
+  pid_mode_node
+  DESTINATION lib/${PROJECT_NAME})
+
 install(FILES
-  launch/mpc_offboard.launch.py
+  launch/mpc_external_mode.launch.py
   DESTINATION share/${PROJECT_NAME}/launch)
 
 ament_export_include_directories(include)

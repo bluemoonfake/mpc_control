@@ -1,3 +1,4 @@
+#vector state & input
 std_msgs/Header header
 float64[3] position
 float64[3] velocity

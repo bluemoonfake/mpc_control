@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "mission": {
+    "defaults": {
+      "horizontalVelocity": 8.0,
+      "verticalVelocity": 2.0,
+      "maxHeadingRate": 60,
+      "tpmc": {
+        "maximumAcceleration": 4.0,
+        "maximumJerk": 8.0
+      }
+    },
+    "items": [
+      {
+        "id": "takeoff",
+        "type": "takeoff",
+        "z": 10.0
+      },
+      {
+        "id": "hover_origin",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0,
+        "y": 0.0,
+        "z": 10.0
+      },
+      {
+        "id": "hold_10s",
+        "type": "hold",
+        "duration": 10.0
+      },
+      {
+        "id": "lateral_step_10m",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 10.0,
+        "y": 0.0,
+        "z": 10.0
+      },
+      {
+        "id": "hold_step_10s",
+        "type": "hold",
+        "duration": 10.0
+      },
+      {
+        "id": "return_origin",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0,
+        "y": 0.0,
+        "z": 10.0
+      },
+      {
+        "id": "hold_return_5s",
+        "type": "hold",
+        "duration": 5.0
+      },
+      {
+        "id": "landing",
+        "type": "land"
+      }
+    ]
+  }
+}

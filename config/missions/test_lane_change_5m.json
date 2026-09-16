@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "mission": {
+    "defaults": {
+      "horizontalVelocity": 10.0,
+      "verticalVelocity": 2.0,
+      "maxHeadingRate": 60,
+      "tpmc": {
+        "maximumAcceleration": 4.0,
+        "maximumJerk": 8.0
+      }
+    },
+    "items": [
+      {
+        "id": "takeoff",
+        "type": "takeoff",
+        "z": 10.0
+      },
+      {
+        "id": "start",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0,
+        "y": 0.0,
+        "z": 10.0
+      },
+      {
+        "id": "hold_start_3s",
+        "type": "hold",
+        "duration": 3.0
+      },
+      {
+        "id": "straight_50m",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 50.0,
+        "y": 0.0,
+        "z": 10.0
+      },
+      {
+        "id": "lane_offset_5m",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 100.0,
+        "y": 5.0,
+        "z": 10.0
+      },
+      {
+        "id": "lane_return",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 150.0,
+        "y": 0.0,
+        "z": 10.0
+      },
+      {
+        "id": "hold_end_3s",
+        "type": "hold",
+        "duration": 3.0
+      },
+      {
+        "id": "return_origin",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0,
+        "y": 0.0,
+        "z": 10.0
+      },
+      {
+        "id": "hold_return_3s",
+        "type": "hold",
+        "duration": 3.0
+      },
+      {
+        "id": "landing",
+        "type": "land"
+      }
+    ]
+  }
+}

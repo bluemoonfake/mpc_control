@@ -95,6 +95,15 @@ inline std::optional<Quaternion> frdNedToFluEnu(const Quaternion &q_frd_ned) noe
   return fluEnuToFrdNed(q_frd_ned);
 }
 
+inline std::optional<double> enuYawRateToNed(double yaw_rate_enu_rad_s) noexcept
+{
+  if (!std::isfinite(yaw_rate_enu_rad_s)) {
+    return std::nullopt;
+  }
+  // yaw_NED = pi/2 - yaw_ENU, hence yaw_rate_NED = -yaw_rate_ENU.
+  return -yaw_rate_enu_rad_s;
+}
+
 inline std::optional<Quaternion> withEnuYaw(
   const Quaternion &desired_body_flu_to_world_enu, double yaw_enu_rad) noexcept
 {

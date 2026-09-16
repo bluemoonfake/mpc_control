@@ -1,4 +1,4 @@
-# Compact simulator orchestration for the PX4 torque/thrust Offboard path.
+# Compact simulator orchestration for the PX4 External MPC Mode path.
 #
 # The Makefile does not arm PX4 and does not change PX4 failsafe parameters.
 # PX4 and px4_msgs remain external dependencies of this source-only branch.
@@ -33,10 +33,25 @@ JMAVSIM_RUNNER := $(PX4_DIR)/Tools/simulation/jmavsim/jmavsim_run.sh
 DDS_AGENT ?= MicroXRCEAgent
 DDS_TRANSPORT ?= udp4
 DDS_PORT ?= 8888
+# PX4 may rebuild before its uXRCE client can announce DDS topics.  More
+# importantly, NodeWithMode::doRegister() requires an actual VehicleStatus
+# sample (not merely a discovered DDS endpoint). Gate ROS on the endpoint and
+# allow a short settle period; NodeWithMode keeps the authoritative sample wait.
+PX4_FMU_READY_TOPIC ?= /fmu/out/vehicle_status_v1
+PX4_DDS_READY_TIMEOUT_SECONDS ?= 120
+PX4_FMU_SETTLE_SECONDS ?= 3
 
 ROS_PACKAGE ?= mpc_controller
-ROS_LAUNCH ?= mpc_offboard.launch.py
-ROS_LAUNCH_ARGS ?=
+ROS_LAUNCH ?= mpc_external_mode.launch.py
+MISSION_JSON ?= config/missions/benchmark_square.json
+CONTROLLER ?= mpc
+# `px4_pid` is the canonical launch profile.  Keep `pid_px4` as a
+# compatibility spelling because it is an easy inversion to make at the CLI.
+CONTROLLER_CANONICAL := $(CONTROLLER)
+ifeq ($(CONTROLLER),pid_px4)
+CONTROLLER_CANONICAL := px4_pid
+endif
+ROS_LAUNCH_ARGS ?= mission_file_path:=$(abspath $(MISSION_JSON)) controller:=$(CONTROLLER_CANONICAL)
 ROS_BUILD_ARGS ?= --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 # The package contains several Eigen-heavy translation units. Building all of
 # them with the host-default job count can exhaust RAM and kill cc1plus.
@@ -68,6 +83,9 @@ source "$(ROS_SETUP)"; \
 export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; \
 gui_bin=$$(command -v gz); \
 gui_ld="$${LD_LIBRARY_PATH:-}"; \
+gui_config="$${GZ_CONFIG_PATH:-}"; \
+gui_resource="$${GZ_SIM_RESOURCE_PATH:-}"; \
+gui_plugin="$${GZ_SIM_SYSTEM_PLUGIN_PATH:-}"; \
 gui_home="$${HOME:-$(HOME)}"; \
 gui_user="$${USER:-$$(id -un)}"; \
 gui_runtime="$${XDG_RUNTIME_DIR:-/run/user/$$(id -u)}"; \
@@ -82,13 +100,16 @@ DISPLAY="$$gui_display" WAYLAND_DISPLAY="$$gui_wayland" \
 XDG_RUNTIME_DIR="$$gui_runtime" XDG_SESSION_TYPE="$$gui_session" \
 XAUTHORITY="$${XAUTHORITY:-}" QT_QPA_PLATFORM="$(GZ_GUI_QT_PLATFORM)" \
 LD_LIBRARY_PATH="$$gui_ld" \
+GZ_CONFIG_PATH="$$gui_config" \
+GZ_SIM_RESOURCE_PATH="$$gui_resource" \
+GZ_SIM_SYSTEM_PLUGIN_PATH="$$gui_plugin" \
 ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)" \
 "$$gui_bin" sim -g -v "$(GZ_GUI_VERBOSE)"
 endef
 
 .PHONY: help check check-build check-hil-tools check-hil-firmware-config \
 	check-hil-device hil-check hil-config hil-firmware hil-upload jmavsim \
-	_jmavsim-start hil hil-stop build px4 dds ros \
+	_jmavsim-start hil hil-stop build px4 dds ros external-mode mission-run \
 	gui sim stop status logs
 
 define PX4_START_COMMAND
@@ -117,6 +138,8 @@ help:
 	@echo "make stop    - stop SITL/HIL processes started by this Makefile"
 	@echo "make status  - show simulator process status"
 	@echo "make logs    - follow PX4, DDS and ROS logs"
+	@echo "CONTROLLER=mpc|px4_pid selects the External Mode implementation (pid_px4 is accepted as an alias)"
+	@echo "make external-mode - show manual mode-selection instructions"
 	@echo "make mission-start - trigger mission trajectory execution via ROS 2 service"
 	@echo "make benchmark     - run side-by-side PID vs MPC log comparison script"
 	@echo ""
@@ -280,34 +303,59 @@ ros: check build
 	@echo "ROS 2 launch started; log: $(ROS_LOG)"
 
 gui: check
-	@mkdir -p "$(SIM_RUNTIME_DIR)"
-	@if test -f "$(GZ_GUI_PID)"; then \
+	@mkdir -p "$(SIM_RUNTIME_DIR)"; \
+	if test -f "$(GZ_GUI_PID)"; then \
 		pid=$$(cat "$(GZ_GUI_PID)"); \
-		if kill -0 "$$pid" 2>/dev/null; then \
+		if kill -0 "$$pid" 2>/dev/null && ps -p "$$pid" -o stat= | grep -qv '^[[:space:]]*Z'; then \
 			echo "Gazebo GUI already running (pid $$pid)."; exit 0; \
 		fi; \
 		rm -f "$(GZ_GUI_PID)"; \
-	fi
-	@if pgrep -u "$$(id -u)" -f '[g]z sim .* -g' >/dev/null 2>&1; then \
+	fi; \
+	if pgrep -u "$$(id -u)" -f '[g]z sim -g([[:space:]]|$$)' >/dev/null 2>&1; then \
 		echo "Gazebo GUI already running outside this Makefile."; exit 0; \
-	fi
-	@setsid bash -c '$(GZ_GUI_START_COMMAND)' \
-		>"$(GZ_GUI_LOG)" 2>&1 & echo $$! >"$(GZ_GUI_PID)"
-	@echo "Gazebo GUI started; log: $(GZ_GUI_LOG)"
+	fi; \
+	setsid bash -c '$(GZ_GUI_START_COMMAND)' \
+		>"$(GZ_GUI_LOG)" 2>&1 & pid=$$!; echo "$$pid" >"$(GZ_GUI_PID)"; \
+	for attempt in 1 2 3 4 5; do \
+		sleep 1; \
+		if ! kill -0 "$$pid" 2>/dev/null || ! ps -p "$$pid" -o stat= | grep -qv '^[[:space:]]*Z'; then \
+			echo "Gazebo GUI exited during startup; log: $(GZ_GUI_LOG)"; \
+			tail -n 30 "$(GZ_GUI_LOG)"; rm -f "$(GZ_GUI_PID)"; exit 1; \
+		fi; \
+	done; \
+	echo "Gazebo GUI process running (pid $$pid, checked for 5 seconds); log: $(GZ_GUI_LOG)"
 
 sim: check build
 	@mkdir -p "$(SIM_RUNTIME_DIR)"
 	@if test -f "$(PX4_PID)" || test -f "$(DDS_PID)" || test -f "$(ROS_PID)"; then \
 		 echo "A simulator runtime already exists. Run 'make status' or 'make stop' first."; exit 1; \
 	fi
-	@setsid bash -c '$(PX4_START_COMMAND)' \
+	@setsid env HEADLESS=1 bash -c '$(PX4_START_COMMAND)' \
 		>"$(PX4_LOG)" 2>&1 & echo $$! >"$(PX4_PID)"
 	@setsid bash -c 'export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; exec "$(DDS_AGENT)" "$(DDS_TRANSPORT)" -p "$(DDS_PORT)"' \
 		>"$(DDS_LOG)" 2>&1 & echo $$! >"$(DDS_PID)"
-	@sleep 2
+	@source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; \
+		ready=0; \
+		for attempt in $$(seq 1 "$(PX4_DDS_READY_TIMEOUT_SECONDS)"); do \
+			if ros2 topic list 2>/dev/null | grep -qx "$(PX4_FMU_READY_TOPIC)"; then ready=1; break; fi; \
+			sleep 1; \
+		done; \
+		if test "$$ready" -ne 1; then \
+			echo "PX4 DDS did not announce $(PX4_FMU_READY_TOPIC) within $(PX4_DDS_READY_TIMEOUT_SECONDS)s; ROS launch was not started."; \
+			echo "Inspect $(PX4_LOG) and $(DDS_LOG)."; exit 1; \
+		fi; \
+		echo "PX4 FMU endpoint ready: $(PX4_FMU_READY_TOPIC); settling $(PX4_FMU_SETTLE_SECONDS)s for first sample"; \
+		sleep "$(PX4_FMU_SETTLE_SECONDS)"
 	@setsid bash -c 'exec 9>"$(ROS_LOCK)"; if ! flock -n 9; then echo "Another MPC ROS 2 pipeline already holds $(ROS_LOCK)"; exit 75; fi; echo $$$$ >"$(ROS_PID)"; source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; exec ros2 launch "$(ROS_PACKAGE)" "$(ROS_LAUNCH)" $(ROS_LAUNCH_ARGS)' \
 		>"$(ROS_LOG)" 2>&1 &
-	@echo "Simulation started with Gazebo GUI. No arm/offboard command was sent."
+	@$(MAKE) --no-print-directory gui
+	@for entry in "PX4:$(PX4_PID)" "DDS:$(DDS_PID)" "ROS:$(ROS_PID)"; do \
+		name=$${entry%%:*}; file=$${entry#*:}; pid=$$(cat "$$file" 2>/dev/null); \
+		if ! kill -0 "$$pid" 2>/dev/null || ! ps -p "$$pid" -o stat= | grep -qv '^[[:space:]]*Z'; then \
+			echo "$$name startup failed; inspect $(SIM_RUNTIME_DIR). Existing processes are left running; use make status."; exit 1; \
+		fi; \
+	done
+	@echo "Simulation processes and Gazebo GUI are running. Start the External Mode when ready."
 	@echo "Run 'make status' and inspect logs under $(SIM_RUNTIME_DIR)."
 
 stop:
@@ -339,7 +387,6 @@ logs:
 
 PID_LOG ?= $(firstword $(wildcard /home/ubuntu/Dev/PX4_tracker/PX4-Autopilot/build/px4_sitl_default/rootfs/log/*/*_pid*.ulg /tmp/pid_flight.ulg))
 MPC_LOG ?= $(firstword $(wildcard /home/ubuntu/Dev/PX4_tracker/PX4-Autopilot/build/px4_sitl_default/rootfs/log/*/*_mpc*.ulg /tmp/mpc_flight.ulg))
-MISSION_JSON ?= config/missions/benchmark_square.json
 BENCHMARK_OUT ?= mission_benchmark_comparison.png
 
 mission-start:
@@ -360,18 +407,12 @@ disarm:
 	if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; \
 	ros2 topic pub --once /fmu/in/vehicle_command px4_msgs/msg/VehicleCommand "{command: 400, param1: 0.0, param2: 21196.0, target_system: $(PX4_SYS_ID), target_component: 1, source_system: $(PX4_SYS_ID), source_component: 1, from_external: true}"
 
-offboard:
-	@source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; \
-	if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; \
-	if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; \
-	ros2 topic pub --once /fmu/in/vehicle_command px4_msgs/msg/VehicleCommand "{command: 176, param1: 1.0, param2: 6.0, target_system: $(PX4_SYS_ID), target_component: 1, source_system: $(PX4_SYS_ID), source_component: 1, from_external: true}"
+external-mode:
+	@echo "No autonomous mode/arm/takeoff command is provided."
+	@echo "Arm and take off manually in a stock PX4 mode; select 'MPC Controller' or 'PX4 PID' matching the launched profile."
 
-mission-run: mission-start
-	@sleep 1.0
-	@$(MAKE) --no-print-directory arm
-	@sleep 0.5
-	@$(MAKE) --no-print-directory offboard
-	@echo "Mission initiated: trajectory streaming, vehicle armed, and offboard control active."
+mission-run: external-mode
+	@echo "Start the reference mission separately only after the operator selects MPC Controller."
 
 pid-mission-run:
 	@python3 scripts/run_px4_pid_mission.py --mission "$(MISSION_JSON)"
@@ -383,5 +424,3 @@ benchmark:
 	@test -n "$(PID_LOG)" && test -f "$(PID_LOG)" || { echo "PID_LOG not found. Usage: make benchmark PID_LOG=path/to/pid.ulg MPC_LOG=path/to/mpc.ulg"; exit 1; }
 	@test -n "$(MPC_LOG)" && test -f "$(MPC_LOG)" || { echo "MPC_LOG not found. Usage: make benchmark PID_LOG=path/to/pid.ulg MPC_LOG=path/to/mpc.ulg"; exit 1; }
 	@python3 scripts/compare_mission_logs.py "$(PID_LOG)" "$(MPC_LOG)" --mission "$(MISSION_JSON)" --out "$(BENCHMARK_OUT)"
-
-

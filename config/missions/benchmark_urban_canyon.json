@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "mission": {
+    "defaults": {
+      "horizontalVelocity": 12.0,
+      "verticalVelocity": 2.0,
+      "maxHeadingRate": 90,
+      "tpmc": {
+        "maximumAcceleration": 4.0,
+        "maximumJerk": 8.0
+      }
+    },
+    "description": "Benchmark Urban Canyon: Constrained narrow corridor with 90-deg chicanes and U-turn obstacle bypass",
+    "items": [
+      {
+        "id": "takeoff",
+        "type": "takeoff",
+        "z": 10.0
+      },
+      {
+        "id": "wp1_entry",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0,
+        "y": 0.0,
+        "z": 10.0
+      },
+      {
+        "id": "wp2_canyon_run",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 35.0,
+        "y": 0.0,
+        "z": 10.0
+      },
+      {
+        "id": "wp3_chicane_turn1",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 35.0,
+        "y": 20.0,
+        "z": 12.0
+      },
+      {
+        "id": "wp4_chicane_reverse",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 15.0,
+        "y": 20.0,
+        "z": 12.0
+      },
+      {
+        "id": "wp5_chicane_climb",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 15.0,
+        "y": 40.0,
+        "z": 15.0
+      },
+      {
+        "id": "wp6_u_turn_apex",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": -10.0,
+        "y": 40.0,
+        "z": 15.0
+      },
+      {
+        "id": "wp7_return_corridor",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": -10.0,
+        "y": 0.0,
+        "z": 10.0
+      },
+      {
+        "id": "wp8_home",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0,
+        "y": 0.0,
+        "z": 10.0
+      },
+      {
+        "id": "hold_5s",
+        "type": "hold",
+        "duration": 5.0
+      },
+      {
+        "id": "landing",
+        "type": "land"
+      }
+    ]
+  }
+}

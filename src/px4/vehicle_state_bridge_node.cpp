@@ -1,5 +1,5 @@
 #include "mpc_controller/msg/vehicle_state.hpp"
-#include "mpc_controller/state_bridge.hpp"
+#include "mpc_controller/px4/vehicle_state_mapper.hpp"
 
 #include <px4_msgs/msg/vehicle_angular_velocity.hpp>
 #include <px4_msgs/msg/vehicle_attitude.hpp>
@@ -12,12 +12,9 @@
 #include <limits>
 #include <mutex>
 
-class VehicleStateBridgeNode final : public rclcpp::Node
-{
+class VehicleStateBridgeNode final : public rclcpp::Node {
 public:
-  VehicleStateBridgeNode()
-  : Node("vehicle_state_bridge_node")
-  {
+  VehicleStateBridgeNode() : Node("vehicle_state_bridge_node") {
     // Topic names stay configurable because PX4 DDS names can differ between
     // firmware/message revisions; frame and timing policy are fixed per run.
     declare_parameter("position_topic", position_topic_);
@@ -38,18 +35,16 @@ public:
     get_parameter("publish_rate_hz", publish_rate_hz_);
 
     const auto qos = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort();
-    position_subscription_ = create_subscription<Px4Position>(
-      position_topic_, qos, std::bind(&VehicleStateBridgeNode::positionCallback, this, std::placeholders::_1));
-    attitude_subscription_ = create_subscription<Px4Attitude>(
-      attitude_topic_, qos, std::bind(&VehicleStateBridgeNode::attitudeCallback, this, std::placeholders::_1));
-    angular_velocity_subscription_ = create_subscription<Px4AngularVelocity>(
-      angular_velocity_topic_, qos,
-      std::bind(&VehicleStateBridgeNode::angularVelocityCallback, this, std::placeholders::_1));
+    position_subscription_ = create_subscription<Px4Position>(position_topic_, qos,
+        std::bind(&VehicleStateBridgeNode::positionCallback, this,std::placeholders::_1));
+    attitude_subscription_ = create_subscription<Px4Attitude>(attitude_topic_, qos,
+        std::bind(&VehicleStateBridgeNode::attitudeCallback, this,std::placeholders::_1));
+    angular_velocity_subscription_ = create_subscription<Px4AngularVelocity>(angular_velocity_topic_, qos,
+        std::bind(&VehicleStateBridgeNode::angularVelocityCallback, this,std::placeholders::_1));
     state_publisher_ = create_publisher<State>(output_topic_, 10);
-    timer_ = create_wall_timer(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::duration<double>(1.0 / std::max(publish_rate_hz_, 1.0))),
-      std::bind(&VehicleStateBridgeNode::publish, this));
+    timer_ = create_wall_timer(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::duration<double>(1.0 / std::max(publish_rate_hz_, 1.0))),
+                              std::bind(&VehicleStateBridgeNode::publish, this));
   }
 
 private:
@@ -59,8 +54,7 @@ private:
   using Px4AngularVelocity = px4_msgs::msg::VehicleAngularVelocity;
   using Clock = std::chrono::steady_clock;
 
-  struct Cache
-  {
+  struct Cache {
     // Receipt timing is kept separately from PX4 sample time: steady clock
     // measures freshness while timestamp_sample measures cross-topic skew.
     Clock::time_point received_at{};
@@ -75,16 +69,15 @@ private:
     uint64_t receipt_steady_timestamp_ns = 0;
   };
 
-  static uint64_t steadyTimestampNs(const Clock::time_point time) noexcept
-  {
-    return static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(time.time_since_epoch()).count());
+  static uint64_t steadyTimestampNs(const Clock::time_point time) noexcept {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            time.time_since_epoch()).count());
   }
 
-  static void recordReception(Cache &cache, Clock::time_point now)
-  {
+  static void recordReception(Cache &cache, Clock::time_point now) {
     if (cache.received) {
-      const double gap = std::chrono::duration<double>(now - cache.received_at).count();
+      const double gap =
+          std::chrono::duration<double>(now - cache.received_at).count();
       if (std::isfinite(gap) && gap >= 0.0) {
         ++cache.gap_count;
         cache.gap_sum_seconds += gap;
@@ -96,8 +89,7 @@ private:
     cache.received = true;
   }
 
-  void positionCallback(const Px4Position::SharedPtr message)
-  {
+  void positionCallback(const Px4Position::SharedPtr message) {
     if (!message) {
       return;
     }
@@ -109,8 +101,7 @@ private:
     recordReception(position_cache_, Clock::now());
   }
 
-  void attitudeCallback(const Px4Attitude::SharedPtr message)
-  {
+  void attitudeCallback(const Px4Attitude::SharedPtr message) {
     if (!message) {
       return;
     }
@@ -122,8 +113,7 @@ private:
     recordReception(attitude_cache_, Clock::now());
   }
 
-  void angularVelocityCallback(const Px4AngularVelocity::SharedPtr message)
-  {
+  void angularVelocityCallback(const Px4AngularVelocity::SharedPtr message) {
     if (!message) {
       return;
     }
@@ -135,24 +125,22 @@ private:
     recordReception(angular_velocity_cache_, Clock::now());
   }
 
-  static mpc_controller::state_check::Timing sourceTiming(
-    const Cache &cache, const uint64_t sample_timestamp, const uint64_t evaluation_ns)
-  {
+  static mpc_controller::state_check::Timing
+  sourceTiming(const Cache &cache, const uint64_t sample_timestamp,const uint64_t evaluation_ns) {
     mpc_controller::state_check::Timing result;
     result.sample_time = sample_timestamp;
     result.received = cache.received;
     if (cache.received && evaluation_ns >= cache.receipt_steady_timestamp_ns) {
-      result.age = static_cast<double>(evaluation_ns - cache.receipt_steady_timestamp_ns) * 1.0e-9;
+      result.age = static_cast<double>(evaluation_ns - cache.receipt_steady_timestamp_ns) *1.0e-9;
     } else if (cache.received) {
       result.age = std::numeric_limits<double>::quiet_NaN();
     }
     return result;
   }
 
-  static double sampleSkewMs(
-    const uint64_t position_timestamp, const uint64_t attitude_timestamp,
-    const uint64_t angular_velocity_timestamp)
-  {
+  static double sampleSkewMs(const uint64_t position_timestamp,
+                             const uint64_t attitude_timestamp,
+                             const uint64_t angular_velocity_timestamp) {
     if (position_timestamp == 0 || attitude_timestamp == 0 || angular_velocity_timestamp == 0) {
       return std::numeric_limits<double>::infinity();
     }
@@ -161,17 +149,14 @@ private:
     return static_cast<double>(maximum - minimum) * 1.0e-3;
   }
 
-  bool acceptTimestamp(Cache &cache, uint64_t timestamp_sample)
-  {
+  bool acceptTimestamp(Cache &cache, uint64_t timestamp_sample) {
     if (timestamp_sample == 0U) {
       ++timestamp_rejection_count_;
       return false;
     }
-    const bool synchronized = mpc_controller::frame::synchronizedTimestamp(timestamp_sample);
-    uint64_t &history = synchronized
-      ? cache.last_synced_timestamp_sample : cache.last_boot_timestamp_sample;
-    if (mpc_controller::frame::timestampMonotonic(
-        history, timestamp_sample)) {
+    const bool synchronized =mpc_controller::frame::synchronizedTimestamp(timestamp_sample);
+    uint64_t &history = synchronized ? cache.last_synced_timestamp_sample : cache.last_boot_timestamp_sample;
+    if (mpc_controller::frame::timestampMonotonic(history, timestamp_sample)) {
       if (cache.received && synchronized != cache.last_timestamp_was_synced) {
         ++timestamp_domain_switch_count_;
       }
@@ -181,14 +166,12 @@ private:
       return true;
     }
     ++timestamp_rejection_count_;
-    RCLCPP_WARN_THROTTLE(
-      get_logger(), *get_clock(), 5000,
-      "VehicleState input rejected: PX4 timestamp is zero or moved backwards");
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                         "VehicleState input rejected: PX4 timestamp is zero or moved backwards");
     return false;
   }
 
-  void publish()
-  {
+  void publish() {
     // Atomically snapshot the three asynchronous PX4 streams, validate their
     // freshness/skew, convert NED/FRD to ENU/FLU, then publish one state.
     Px4Position position;
@@ -207,19 +190,15 @@ private:
       angular_velocity = angular_velocity_;
       position_timing = sourceTiming(position_cache_, position.timestamp_sample, evaluation_ns);
       attitude_timing = sourceTiming(attitude_cache_, attitude.timestamp_sample, evaluation_ns);
-      angular_velocity_timing = sourceTiming(
-        angular_velocity_cache_, angular_velocity.timestamp_sample, evaluation_ns);
+      angular_velocity_timing = sourceTiming(angular_velocity_cache_, angular_velocity.timestamp_sample, evaluation_ns);
     }
 
     const auto freshness_decision = mpc_controller::state_check::evaluate(
-      position_timing, attitude_timing, angular_velocity_timing,
-      state_timeout_seconds_, max_sample_skew_seconds_);
-    const double current_sample_skew_ms = sampleSkewMs(
-      position.timestamp_sample, attitude.timestamp_sample, angular_velocity.timestamp_sample);
+        position_timing, attitude_timing, angular_velocity_timing, state_timeout_seconds_, max_sample_skew_seconds_);
+    const double current_sample_skew_ms =
+        sampleSkewMs(position.timestamp_sample, attitude.timestamp_sample, angular_velocity.timestamp_sample);
     if (!freshness_decision.valid) {
-      if (freshness_decision.reason ==
-        mpc_controller::state_check::Reject::sample_skew)
-      {
+      if (freshness_decision.reason == mpc_controller::state_check::Reject::sample_skew) {
         std::lock_guard<std::mutex> lock(mutex_);
         ++skew_rejection_count_;
       } else {
@@ -227,12 +206,11 @@ private:
         ++stale_rejection_count_;
       }
       RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 5000,
-        "VehicleState not published: reason=%s pos_age=%.3f ms att_age=%.3f ms "
-        "ang_age=%.3f ms sample_skew=%.3f ms",
-        mpc_controller::state_check::reasonName(freshness_decision.reason),
-        position_timing.age * 1.0e3, attitude_timing.age * 1.0e3,
-        angular_velocity_timing.age * 1.0e3, current_sample_skew_ms);
+          get_logger(), *get_clock(), 5000,
+          "VehicleState not published: reason=%s pos_age=%.3f ms att_age=%.3f ms ang_age=%.3f ms sample_skew=%.3f ms",
+          mpc_controller::state_check::reasonName(freshness_decision.reason),
+          position_timing.age * 1.0e3, attitude_timing.age * 1.0e3,
+          angular_velocity_timing.age * 1.0e3, current_sample_skew_ms);
       return;
     }
 
@@ -249,19 +227,16 @@ private:
 
     mpc_controller::frame::Px4AttitudeSample attitude_sample;
     attitude_sample.timestamp_sample = attitude.timestamp_sample;
-    attitude_sample.body_frd_to_world_ned = {
-      attitude.q[0], attitude.q[1], attitude.q[2], attitude.q[3]};
+    attitude_sample.body_frd_to_world_ned = {attitude.q[0], attitude.q[1], attitude.q[2], attitude.q[3]};
 
     mpc_controller::frame::Px4AngularVelocitySample angular_sample;
     angular_sample.timestamp_sample = angular_velocity.timestamp_sample;
-    angular_sample.body_rate_frd = {
-      angular_velocity.xyz[0], angular_velocity.xyz[1], angular_velocity.xyz[2]};
+    angular_sample.body_rate_frd = {angular_velocity.xyz[0], angular_velocity.xyz[1], angular_velocity.xyz[2]};
 
     mpc_controller::frame::VehicleStateData converted;
     if (!mpc_controller::frame::convert(local_sample, attitude_sample, angular_sample, converted)) {
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 5000,
-        "VehicleState not published: PX4 estimator data invalid or non-finite");
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "VehicleState not published: PX4 estimator data invalid or non-finite");
       return;
     }
 
@@ -276,9 +251,9 @@ private:
     // `valid` means the measured state is usable by the controller
     // processing. Active attitude/thrust control additionally requires
     // PX4's heading readiness, exposed separately below.
-    state.valid = converted.position_valid && converted.velocity_valid
-      && converted.acceleration_valid && converted.attitude_valid
-      && converted.body_rate_valid;
+    state.valid = converted.position_valid && converted.velocity_valid &&
+                  converted.acceleration_valid && converted.attitude_valid &&
+                  converted.body_rate_valid;
     state.position_valid = converted.position_valid;
     state.velocity_valid = converted.velocity_valid;
     state.acceleration_valid = converted.acceleration_valid;
@@ -292,47 +267,44 @@ private:
     }
   }
 
-  void reportTiming(Clock::time_point now)
-  {
+  void reportTiming(Clock::time_point now) {
     if (std::chrono::duration<double>(now - timing_report_at_).count() < 5.0) {
       return;
     }
     timing_report_at_ = now;
     const auto age_ms = [now](const Cache &cache) {
-        return cache.received
-          ? std::chrono::duration<double>(now - cache.received_at).count() * 1.0e3
-          : std::numeric_limits<double>::infinity();
-      };
+      return cache.received ? std::chrono::duration<double>(now - cache.received_at).count() *1.0e3
+                 : std::numeric_limits<double>::infinity();
+    };
     const auto mean_gap_ms = [](const Cache &cache) {
-        return cache.gap_count > 0
-          ? cache.gap_sum_seconds / static_cast<double>(cache.gap_count) * 1.0e3
-          : 0.0;
-      };
-    const uint64_t minimum_sample = std::min({
-      position_.timestamp_sample, attitude_.timestamp_sample,
-      angular_velocity_.timestamp_sample});
-    const uint64_t maximum_sample = std::max({
-      position_.timestamp_sample, attitude_.timestamp_sample,
-      angular_velocity_.timestamp_sample});
-    const double skew_ms = maximum_sample >= minimum_sample
-      ? static_cast<double>(maximum_sample - minimum_sample) * 1.0e-3 : 0.0;
-    RCLCPP_INFO(
-      get_logger(),
-      "VehicleState timing: published=%lu timestamp_reject=%lu "
-      "clock_switch=%lu stale_reject=%lu skew_reject=%lu "
-      "age_ms[pos att ang]=[%.1f %.1f %.1f] gap_mean_ms[pos att ang]=[%.2f %.2f %.2f] "
-      "gap_max_ms[pos att ang]=[%.2f %.2f %.2f] sample_skew_ms=%.3f",
-      static_cast<unsigned long>(state_publish_count_),
-      static_cast<unsigned long>(timestamp_rejection_count_),
-      static_cast<unsigned long>(timestamp_domain_switch_count_),
-      static_cast<unsigned long>(stale_rejection_count_),
-      static_cast<unsigned long>(skew_rejection_count_),
-      age_ms(position_cache_), age_ms(attitude_cache_), age_ms(angular_velocity_cache_),
-      mean_gap_ms(position_cache_), mean_gap_ms(attitude_cache_),
-      mean_gap_ms(angular_velocity_cache_),
-      position_cache_.gap_max_seconds * 1.0e3,
-      attitude_cache_.gap_max_seconds * 1.0e3,
-      angular_velocity_cache_.gap_max_seconds * 1.0e3, skew_ms);
+      return cache.gap_count > 0 ? cache.gap_sum_seconds /static_cast<double>(cache.gap_count) * 1.0e3
+                 : 0.0;
+    };
+    const uint64_t minimum_sample =
+        std::min({position_.timestamp_sample, attitude_.timestamp_sample, angular_velocity_.timestamp_sample});
+    const uint64_t maximum_sample =
+        std::max({position_.timestamp_sample, attitude_.timestamp_sample, angular_velocity_.timestamp_sample});
+    const double skew_ms =
+        maximum_sample >= minimum_sample ? static_cast<double>(maximum_sample - minimum_sample) * 1.0e-3
+                  : 0.0;
+    RCLCPP_INFO(get_logger(),
+                "VehicleState timing: published=%lu timestamp_reject=%lu "
+                "clock_switch=%lu stale_reject=%lu skew_reject=%lu "
+                "age_ms[pos att ang]=[%.1f %.1f %.1f] gap_mean_ms[pos att "
+                "ang]=[%.2f %.2f %.2f] "
+                "gap_max_ms[pos att ang]=[%.2f %.2f %.2f] sample_skew_ms=%.3f",
+                static_cast<unsigned long>(state_publish_count_),
+                static_cast<unsigned long>(timestamp_rejection_count_),
+                static_cast<unsigned long>(timestamp_domain_switch_count_),
+                static_cast<unsigned long>(stale_rejection_count_),
+                static_cast<unsigned long>(skew_rejection_count_),
+                age_ms(position_cache_), age_ms(attitude_cache_),
+                age_ms(angular_velocity_cache_), mean_gap_ms(position_cache_),
+                mean_gap_ms(attitude_cache_),
+                mean_gap_ms(angular_velocity_cache_),
+                position_cache_.gap_max_seconds * 1.0e3,
+                attitude_cache_.gap_max_seconds * 1.0e3,
+                angular_velocity_cache_.gap_max_seconds * 1.0e3, skew_ms);
   }
 
   std::mutex mutex_;
@@ -366,8 +338,7 @@ private:
   rclcpp::TimerBase::SharedPtr timer_;
 };
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
   rclcpp::spin(std::make_shared<VehicleStateBridgeNode>());
   rclcpp::shutdown();

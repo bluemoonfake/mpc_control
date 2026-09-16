@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "mission": {
+    "defaults": {
+      "horizontalVelocity": 18.0,
+      "verticalVelocity": 1.5,
+      "maxHeadingRate": 90
+    },
+    "description": "Benchmark Slalom: High-speed 3D obstacle avoidance corridor comparing MPC dynamic preview vs PX4 PID",
+    "items": [
+      {
+        "id": "takeoff",
+        "type": "takeoff",
+        "z": 10.0
+      },
+      {
+        "id": "wp_start",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0,
+        "y": 0.0,
+        "z": 10.0
+      },
+      {
+        "id": "wp_obs1_bypass_left",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 15.0,
+        "y": 8.0,
+        "z": 10.0
+      },
+      {
+        "id": "wp_obs2_bypass_right",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 30.0,
+        "y": -8.0,
+        "z": 12.0
+      },
+      {
+        "id": "wp_obs3_bypass_left",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 45.0,
+        "y": 8.0,
+        "z": 14.0
+      },
+      {
+        "id": "wp_obs4_bypass_right",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 60.0,
+        "y": -8.0,
+        "z": 12.0
+      },
+      {
+        "id": "wp_corridor_exit",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 75.0,
+        "y": 0.0,
+        "z": 10.0
+      },
+      {
+        "id": "wp_return_home",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0,
+        "y": 0.0,
+        "z": 10.0
+      },
+      {
+        "id": "hold_5s",
+        "type": "hold",
+        "duration": 5.0
+      },
+      {
+        "id": "landing",
+        "type": "land"
+      }
+    ]
+  }
+}

@@ -5,7 +5,9 @@ bags/
 .sim/
 __pycache__/
 *.pyc
-/config/missions/
-/agent/
+/config/missions/*.plan
 /scripts/
 /log_matlab/
+/agent/
+/validation_runs
+/test/
