@@ -1,14 +1,11 @@
 # MPC Controller for PX4 (Native External Attitude Mode)
 
-A ROS 2 translational MPC for PX4 External Flight Mode. The current backend solves
-one coupled, convex 3D quadratic program with OSQP 1.0.0. The control input is
-**acceleration command in ENU, not jerk**. PX4 owns the attitude/rate loops and
-motor allocation.
+A ROS 2 translational MPC for PX4 External Mode. The current backend solves
+one coupled, convex 3D quadratic program with OSQP 1.0.0.
 
 This document describes the checked-in implementation and the profile in
 [controller.yaml](config/controller.yaml). Launch/parameter overrides can change
-runtime values. The Makefile defaults to ROS 2 Jazzy and Gazebo gz_x500; this is
-not a statement of validation on every ROS distribution or airframe.
+runtime values. The Makefile defaults to ROS 2 Jazzy and Gazebo gz_x500.
 
 ## 1. System Architecture
 
@@ -44,8 +41,7 @@ Default bridge input topics are /fmu/out/vehicle_local_position_v1,
 
 ## 2. Controller Execution
 
-The controller callback runs at 50 Hz. Compact labels keep the diagram readable;
-equations and limits are detailed below.
+The controller callback runs at 50 Hz.
 
 ```mermaid
 %%{init: {"flowchart": {"curve": "linear", "htmlLabels": false}}}%%
@@ -57,27 +53,20 @@ flowchart TD
     QP --> Solve["Solve with OSQP"]
     Solve --> Check{"Result valid and in time?"}
     Check -->|Yes| Command["Use first acceleration command"]
-    Check -->|No| Recovery["Bounded recovery command"]
-    Command --> Map["Map force to attitude"]
+    Check -->|No| Recovery["P command"]
+    Command --> Map["Force to attitude"]
     Recovery --> Map
     Map --> Publish["Publish setpoint and diagnostics"]
 ```
 
 - Stale state/reference inputs skip the update and reset solver/observer memory
-  when entering a stale interval. Finite-value checks remain active; the
-  additional strict state-validity/acceleration gate is disabled by the YAML
-  setting strict_validation: false.
+  when entering a stale interval. 
 - The XY acceleration observer blends the previous-command response model with
   measured acceleration. Z acceleration remains measured.
 - The reference generator publishes a 30 s horizon at 0.1 s spacing (301 samples).
   The solver independently samples **26 prediction stages**: first step 0.01 s,
-  remaining 25 steps 0.20 s, for a **5.01 s** prediction span.
-- Solver budget: 18 ms; maximum iterations: 400. These are configured limits,
-  not measured timing guarantees.
-- Recovery brakes horizontal velocity and corrects height:
-  u_xy = -k_v v_xy; u_z = k_p(z_ref-z) - k_v v_z.
-  The command is bounded to 2.5 m/s² horizontally and ±1.5 m/s² vertically.
-  Recovery is for failed solves with usable inputs, not all invalid-input cases.
+  remaining 25 steps 0.20 s. So it's 5.01 s state prediction
+- Solver budget: 18 ms; maximum iterations: 400.
 
 Sources: [controller node](src/controller/mpc_controller_node.cpp),
 [controller and sampler](include/mpc_controller/controller/translational_mpc.hpp),
@@ -137,16 +126,14 @@ constraints couple their optimization in one QP.
 ### 3.2 Decision variables and objective
 
 The solver eliminates predicted states using X = F x_0 + G U. Its decision
-vector contains 78 acceleration-command components and 52 slack variables:
+vector contains 26x3 = 78 acceleration-command components and 26 + 26 slack variables:
 
 ```math
 z=[u_0^\top,\ldots,u_{N-1}^\top,s_v^\top,s_a^\top]^\top
 \in\mathbb{R}^{130},\qquad N=26
 ```
 
-There is one velocity slack and one acceleration slack per prediction stage,
-shared across that stage's corresponding axis constraints. Let
-e_(k+1) = x_(k+1) - x_ref,(k+1). The objective, before positive numerical scaling, is:
+Let e_(k+1) = x_(k+1) - x_ref,(k+1). The objective, before positive numerical scaling, is:
 
 ```math
 J=
@@ -168,12 +155,6 @@ OSQP solves the resulting convex QP:
 \min_z \tfrac12 z^\top Pz+q^\top z,\qquad l\le Cz\le h
 ```
 
-C denotes the constraint matrix, distinct from the dynamics matrix A.
-The implementation builds dense Eigen matrices, then supplies sparse CSC
-matrices to OSQP. Condensing can make the Hessian less sparse.
-
-Weight ratios alone do not establish critical damping, zero overshoot or
-closed-loop stability; those claims require analysis and measured validation.
 
 ### 3.3 Hard command limits and soft state limits
 
@@ -231,9 +212,6 @@ f_{\min}\le u_{z,k}+g
 ```
 
 Together with the horizontal command bound, this ensures ||f|| ≤ f_max.
-It is more restrictive than the full spherical force envelope. It also
-intersects the separate ±u_z,max bound. The solver checks the resulting force
-norm and tilt when validating its output.
 
 ### 3.4 Acceleration to attitude and PX4 thrust
 
@@ -262,29 +240,14 @@ to FRD/NED and uses:
 
 ```math
 T_{\mathrm{norm}}=
-\operatorname{clamp}\left(h\,\|f_{\mathrm{des}}\|/9.80665,\;0.05,\;0.95\right),
+\mathrm{clamp}\left(h\,\|f_{\mathrm{des}}\|/9.80665,\;0.05,\;0.95\right),
 \qquad \mathbf{T}_{\mathrm{FRD}}=[0,0,-T_{\mathrm{norm}}]^\top
 ```
-
-Here h starts at the source default 0.60 and is updated from accepted PX4
-HoverThrustEstimate messages. The adapter currently does not read the
-hover_thrust: 0.59 or gravity_m_s2 entries in YAML. Its active path clamps
-thrust rather than using the rejecting specificForceToBodyFrdZ helper.
-
-ENU yaw rate is negated for NED. Before receiving a setpoint, or when its
-receipt age exceeds 0.5 s, the adapter sends identity attitude and hover thrust.
-That is the implemented fallback, not a position-hold guarantee.
 
 ## 4. Reference Generation and State Feedback
 
 - Mission JSON is parsed by [mission_json_parser.cpp](src/mission/mission_json_parser.cpp).
   The generator supports takeoff, navigation waypoints, hold and land references.
-- The current reference horizon follows the active leg and holds its endpoint.
-  It does **not** preview unaccepted successor waypoints.
-- Advancement requires measured distance within the acceptance radius and
-  elapsed leg time at least the target hold duration. The general radius is
-  2.5 m; targets classified as landing use 0.35 m. Finish-plane crossing is
-  diagnostic and does not independently advance a waypoint.
 - /reference_generator_node/start_mission starts reference execution;
   /reference_generator_node/reset_mission resets the generator.
   Starting the reference does not arm or switch PX4 modes.
@@ -308,13 +271,8 @@ src/
   controller/    MPC node, observer, recovery and setpoint mapping
   solver/        OSQP implementation
   px4/           state bridge and External Attitude Mode
-  PID_validation/ PX4 PID External Mode
+  PID_validation/ PX4 PID External Mode for validate with mpc
 ```
-
-CMake builds mpc_mission and mpc_solver, plus the four MPC-profile executables
-and pid_mode_node. It fetches pinned OSQP 1.0.0 sources. Required dependencies
-include ROS 2, px4_msgs, px4_ros2_cpp, Eigen3 and nlohmann_json; see
-[CMakeLists.txt](CMakeLists.txt) and [package.xml](package.xml).
 
 ## 6. Build and Run
 
@@ -355,9 +313,6 @@ make logs
 make stop
 ```
 
-Existing running sessions are not replaced merely by rebuilding; restart the
-relevant processes to apply changes.
-
 ## 7. PX4 PID Comparison and Missions
 
 The px4_pid launch profile replaces the MPC/controller-adapter pair with
@@ -374,8 +329,7 @@ make mission-start
 
 The PID adapter validates frame, timestamps, reference contents and freshness.
 Invalid references prevent readiness; loss during operation reports mode failure
-and stops new trajectory publication. Its fallback behavior differs from the
-MPC attitude adapter and must be considered when comparing logs.
+and stops new trajectory publication.
 
 | Mission file under config/missions/ | Requested default XY speed | Scenario |
 | --- | --- | --- |
@@ -384,10 +338,7 @@ MPC attitude adapter and must be considered when comparing logs.
 | benchmark_urban_canyon.json | 12 m/s | Chicanes, return legs and altitude changes |
 
 These are mission inputs, not achieved speeds or measured MPC-versus-PID
-results. The current generator waits for waypoint acceptance; no continuous
-cornering, zero-overshoot or obstacle-clearance guarantee follows from these
-files. The QP has no obstacle-avoidance constraints. The 18 m/s profile is a SITL
-experiment, not a validated hardware flight envelope.
+results.
 
 ## 8. Current Configuration and Validation
 
