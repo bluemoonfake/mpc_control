@@ -41,10 +41,16 @@ public:
 
   struct Waypoint {
     std::string id;
+    ItemType type = ItemType::Unknown;
     std::array<double, 3> position{0.0, 0.0, 1.0};
     double horizontal_speed = 4.0;
     double vertical_speed = 1.5;
     double hold_duration_s = 0.0;
+    double heading_rad = NAN;
+    double max_heading_rate_rad_s = 1.0471975511965976;
+    double maximum_acceleration_m_s2 = NAN;
+    double maximum_jerk_m_s3 = NAN;
+    bool return_to_mission_start_xy = false;
   };
 
   struct Update {

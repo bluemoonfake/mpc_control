@@ -56,6 +56,21 @@ struct MeasuredState
   Vector3 acceleration{};
 };
 
+struct WaypointGoal
+{
+  Vector3 position{};
+};
+
+struct SolveLimits
+{
+  double max_speed_xy = 0.0;
+  double max_speed_z = 0.0;
+  double max_acceleration_xy = 0.0;
+  double max_acceleration_z = 0.0;
+  double max_control_rate_xy = 0.0;
+  double max_control_rate_z = 0.0;
+};
+
 struct Config
 {
   double dt_first = kDtFirst;
@@ -113,6 +128,19 @@ struct UpdateResult
   bool coupled_control_active = true;
   double shadow_control_difference_norm = 0.0;
   double coupled_solve_time_seconds = 0.0;
+  double problem_update_seconds = 0.0;
+  double vector_copy_seconds = 0.0;
+  double osqp_data_update_seconds = 0.0;
+  double osqp_settings_update_seconds = 0.0;
+  double warm_start_seconds = 0.0;
+  double warm_start_prepare_seconds = 0.0;
+  double osqp_warm_start_seconds = 0.0;
+  double osqp_solve_seconds = 0.0;
+  double result_postprocess_seconds = 0.0;
+  double remaining_budget_before_osqp_seconds = 0.0;
+  double coupled_solve_cpu_seconds = 0.0;
+  double warm_start_cpu_seconds = 0.0;
+  double osqp_solve_cpu_seconds = 0.0;
   bool deadline_missed = false;
   double solve_time_seconds = 0.0;
 };
@@ -290,7 +318,34 @@ public:
     coupled_solver_.reset();
   }
 
+  // Clear only the solver's receding-horizon warm start.  The previous input
+  // remains available for the first-input rate constraint on the next solve.
+  void resetWarmStart() noexcept {coupled_solver_.reset();}
+
   UpdateResult update(const MeasuredState &measured, const ReferenceHorizon &reference)
+  {
+    return updateWithReference(measured, reference, configuredLimits());
+  }
+
+  UpdateResult update(const MeasuredState &measured, const WaypointGoal &goal,
+                      const SolveLimits &limits)
+  {
+    if (!finite(goal.position)) {
+      UpdateResult output;
+      output.failure_reason = FailureReason::invalid_reference;
+      return output;
+    }
+    ReferenceHorizon reference;
+    for (auto &point : reference.points) {
+      point.position = goal.position;
+    }
+    return updateWithReference(measured, reference, limits);
+  }
+
+private:
+  UpdateResult updateWithReference(const MeasuredState &measured,
+                                   const ReferenceHorizon &reference,
+                                   const SolveLimits &limits)
   {
     UpdateResult output;
     if (!validConfig(config_) || !coupled_solver_.configured()) {
@@ -318,10 +373,30 @@ public:
     output.coupled = coupled_solver_.solve(
       coupled_initial_, coupled_reference_,
       coupled_mpc::Input(last_input_[0], last_input_[1], last_input_[2]),
+      coupledLimits(limits),
       coupled_deadline);
     output.coupled_solve_time_seconds = std::chrono::duration<double>(
       coupled_mpc::Clock::now() - start).count();
     output.solve_time_seconds = output.coupled_solve_time_seconds;
+    output.problem_update_seconds = output.coupled.problem_update_seconds;
+    output.vector_copy_seconds = output.coupled.vector_copy_seconds;
+    output.osqp_data_update_seconds = output.coupled.osqp_data_update_seconds;
+    output.osqp_settings_update_seconds =
+      output.coupled.osqp_settings_update_seconds;
+    output.warm_start_seconds = output.coupled.warm_start_seconds;
+    output.warm_start_prepare_seconds =
+      output.coupled.warm_start_prepare_seconds;
+    output.osqp_warm_start_seconds =
+      output.coupled.osqp_warm_start_seconds;
+    output.osqp_solve_seconds = output.coupled.osqp_solve_seconds;
+    output.result_postprocess_seconds =
+      output.coupled.result_postprocess_seconds;
+    output.remaining_budget_before_osqp_seconds =
+      output.coupled.remaining_budget_before_osqp_seconds;
+    output.coupled_solve_cpu_seconds =
+      output.coupled.coupled_solve_cpu_seconds;
+    output.warm_start_cpu_seconds = output.coupled.warm_start_cpu_seconds;
+    output.osqp_solve_cpu_seconds = output.coupled.osqp_solve_cpu_seconds;
     output.deadline_missed = (output.coupled.status == coupled_mpc::Status::deadline_exceeded);
 
     if (!output.coupled.valid) {
@@ -347,7 +422,26 @@ public:
     return output;
   }
 
-private:
+  SolveLimits configuredLimits() const noexcept
+  {
+    return {config_.max_speed_xy,
+            config_.max_speed_z,
+            config_.max_acceleration_xy,
+            config_.max_acceleration_z,
+            config_.max_control_rate_xy,
+            config_.max_control_rate_z};
+  }
+
+  static coupled_mpc::Limits coupledLimits(const SolveLimits &limits) noexcept
+  {
+    return {limits.max_speed_xy,
+            limits.max_speed_z,
+            limits.max_acceleration_xy,
+            limits.max_acceleration_z,
+            limits.max_control_rate_xy,
+            limits.max_control_rate_z};
+  }
+
   static coupled_mpc::Configuration coupledConfiguration(const Config &config)
   {
     coupled_mpc::Configuration output;

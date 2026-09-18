@@ -4,7 +4,8 @@
     "defaults": {
       "horizontalVelocity": 3.0,
       "verticalVelocity": 1.0,
-      "maxHeadingRate": 45.0
+      "maxHeadingRate": 45.0,
+      "tpmc": {"maximumAcceleration": 2.0, "maximumJerk": 4.0}
     },
     "items": [
       {"id": "takeoff", "type": "takeoff", "z": 5.0},

@@ -42,10 +42,17 @@ set(msg_files
   "msg/VehicleState.msg"
   "msg/MpcTranslationalOutput.msg"
   "msg/ForceAttitudeSetpoint.msg"
+  "msg/MpcMissionWaypoint.msg"
+  "msg/MpcMissionPlan.msg"
+)
+
+set(srv_files
+  "srv/LoadAndStartMission.srv"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   ${msg_files}
+  ${srv_files}
   DEPENDENCIES builtin_interfaces std_msgs
 )
 
@@ -60,7 +67,8 @@ rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typ
 
 add_library(mpc_mission STATIC
   src/mission/mission_json_parser.cpp
-  src/mission/mission_trajectory.cpp)
+  src/mission/mission_trajectory.cpp
+  src/mission/runtime_mission_loader.cpp)
 target_compile_features(mpc_mission PUBLIC cxx_std_17)
 target_link_libraries(mpc_mission PUBLIC
   mpc_common nlohmann_json::nlohmann_json)
@@ -85,6 +93,12 @@ ament_target_dependencies(reference_generator_node
 target_link_libraries(reference_generator_node
   mpc_mission "${cpp_typesupport_target}")
 
+add_executable(runtime_mission_client
+  src/mission/runtime_mission_client.cpp)
+target_compile_features(runtime_mission_client PRIVATE cxx_std_17)
+ament_target_dependencies(runtime_mission_client rclcpp)
+target_link_libraries(runtime_mission_client "${cpp_typesupport_target}")
+
 add_executable(vehicle_state_bridge_node
   src/px4/vehicle_state_bridge_node.cpp)
 target_compile_features(vehicle_state_bridge_node PRIVATE cxx_std_17)
@@ -101,7 +115,7 @@ target_link_libraries(px4_attitude_mode_node
   mpc_common px4_ros2_cpp::px4_ros2_cpp "${cpp_typesupport_target}")
 
 add_executable(pid_mode_node src/PID_validation/pid_mode_node.cpp)
-ament_target_dependencies(pid_mode_node rclcpp px4_msgs px4_ros2_cpp)
+ament_target_dependencies(pid_mode_node rclcpp px4_msgs px4_ros2_cpp std_msgs)
 target_link_libraries(pid_mode_node
   mpc_common px4_ros2_cpp::px4_ros2_cpp "${cpp_typesupport_target}")
 
@@ -118,11 +132,29 @@ if(BUILD_TESTING)
     test/unit/mission/mission_trajectory_test.cpp)
   target_link_libraries(mission_reference_generator_test mpc_mission)
 
+  ament_add_gtest(runtime_mission_loader_test
+    test/unit/mission/runtime_mission_loader_test.cpp)
+  target_compile_definitions(runtime_mission_loader_test PRIVATE
+    MPC_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")
+  target_link_libraries(runtime_mission_loader_test mpc_mission)
+
   ament_add_gtest(mission_json_parser_test
     test/integration/mission/mission_json_parser_test.cpp)
   target_compile_definitions(mission_json_parser_test PRIVATE
     MPC_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")
   target_link_libraries(mission_json_parser_test mpc_mission)
+
+  ament_add_gtest(vehicle_state_mapper_test
+    test/unit/px4/vehicle_state_mapper_test.cpp)
+  target_link_libraries(vehicle_state_mapper_test mpc_common)
+
+  ament_add_gtest(waypoint_mission_test
+    test/unit/controller/waypoint_mission_test.cpp)
+  target_link_libraries(waypoint_mission_test mpc_common)
+
+  ament_add_gtest(translational_mpc_goal_test
+    test/unit/controller/translational_mpc_goal_test.cpp)
+  target_link_libraries(translational_mpc_goal_test mpc_common mpc_solver)
 endif()
 
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
@@ -135,6 +167,7 @@ install(TARGETS
 
 install(TARGETS
   reference_generator_node
+  runtime_mission_client
   mpc_controller_node
   vehicle_state_bridge_node
   px4_attitude_mode_node

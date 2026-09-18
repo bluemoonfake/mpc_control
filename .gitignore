@@ -11,3 +11,4 @@ __pycache__/
 /agent/
 /validation_runs
 /test/
+/tmp/

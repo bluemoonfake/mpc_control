@@ -1,7 +1,9 @@
 #include "mpc_controller/msg/reference_trajectory.hpp"
+#include "mpc_controller/mission/controller_profile.hpp"
 #include "mpc_controller/px4/pid_reference.hpp"
 #include <px4_ros2/components/node_with_mode.hpp>
 #include <px4_ros2/control/setpoint_types/experimental/trajectory.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <chrono>
 #include <stdexcept>
 
@@ -41,12 +43,17 @@ public:
           reference_ = std::move(ref);
           received_ = Clock::now();
         });
+    external_mode_state_publisher_ = node.create_publisher<std_msgs::msg::Bool>(
+        mpc_controller::mission::kPx4PidExternalModeStateTopic.data(),
+        rclcpp::QoS(1).reliable().transient_local());
+    publishModeState(false);
   }
 
   void onActivate() override {
+    publishModeState(true);
     RCLCPP_INFO(node_.get_logger(), "PX4 PID active; mission start remains operator-controlled");
   }
-  void onDeactivate() override {}
+  void onDeactivate() override { publishModeState(false); }
 
   void checkArmingAndRunConditions(px4_ros2::HealthAndArmingCheckReporter &reporter) override {
     if (!sample()) reporter.armingCheckFailureExt(0x70696401, px4_ros2::events::Log::Error, "PID reference unavailable or stale");
@@ -65,6 +72,12 @@ public:
     setpoint_->update(sp);
   }
 private:
+  void publishModeState(bool active) {
+    std_msgs::msg::Bool message;
+    message.data = active;
+    external_mode_state_publisher_->publish(message);
+  }
+
   std::optional<mpc_controller::pid_validation::Sample> sample() {
     const double now = node_.now().seconds();
     if (last_now_ > 0 && now < last_now_) reference_.reset();
@@ -79,6 +92,7 @@ private:
   Clock::time_point received_{};
   std::shared_ptr<px4_ros2::TrajectorySetpointType> setpoint_;
   rclcpp::Subscription<Message>::SharedPtr ref_sub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr external_mode_state_publisher_;
 };
 
 int main(int argc, char **argv) {

@@ -24,6 +24,8 @@ struct Defaults
   double horizontal_velocity_m_s = 4.0;
   double vertical_velocity_m_s = 1.5;
   double max_heading_rate_deg_s = 60.0;
+  double maximum_acceleration_m_s2 = NAN;
+  double maximum_jerk_m_s3 = NAN;
 };
 
 struct WaypointData
@@ -43,6 +45,8 @@ struct ChangeSettingsData
   double horizontal_velocity_m_s = NAN;
   double vertical_velocity_m_s = NAN;
   double max_heading_rate_deg_s = NAN;
+  double maximum_acceleration_m_s2 = NAN;
+  double maximum_jerk_m_s3 = NAN;
 };
 
 struct MissionItem

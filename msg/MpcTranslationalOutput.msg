@@ -12,6 +12,19 @@ float64[3] sampled_reference_position
 float64[3] sampled_reference_velocity
 float64[3] sampled_reference_acceleration
 
+# Direct waypoint-MPC diagnostics. Defaults are used for legacy reference mode.
+bool direct_waypoint_mode
+uint64 mission_id
+uint32 active_waypoint_index
+uint32 active_waypoint_count
+float64[3] active_target_position
+float64 active_max_speed_xy
+float64 active_max_speed_z
+float64 active_max_acceleration_xy
+float64 active_max_acceleration_z
+float64 active_max_control_rate_xy
+float64 active_max_control_rate_z
+
 # Optimizer input u0 for X/Y/Z.
 float64[3] control_input
 # First predicted physical acceleration state a[k+1]. Diagnostic only.
@@ -45,11 +58,28 @@ float64 coupled_max_acceleration_xy
 float64 coupled_max_tilt_rad
 float64 coupled_max_collective_specific_force_m_s2
 float64 coupled_solve_time_seconds
+float64 problem_update_seconds
+float64 vector_copy_seconds
+float64 osqp_data_update_seconds
+float64 osqp_settings_update_seconds
+float64 warm_start_seconds
+float64 warm_start_prepare_seconds
+float64 osqp_warm_start_seconds
+float64 osqp_solve_seconds
+float64 result_postprocess_seconds
+float64 remaining_budget_before_osqp_seconds
+float64 coupled_solve_cpu_seconds
+float64 warm_start_cpu_seconds
+float64 osqp_solve_cpu_seconds
 float64 shadow_control_difference_norm
 uint32 shadow_admission_samples
 bool shadow_admission_ready
 uint8 active_backend
 float64 solve_time_seconds
+float64 callback_period_seconds
+float64 callback_period_jitter_seconds
+float64 callback_execution_seconds
+float64 mutex_wait_seconds
 bool solver_deadline_missed
 bool recovery_command_active
 uint8 failure_reason

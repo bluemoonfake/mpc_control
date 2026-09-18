@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <ctime>
+#include <limits>
 #include <vector>
 
 
@@ -50,6 +52,26 @@ constexpr std::size_t kRowsPerStep    = 5 * kPolygonSides + 9;
 constexpr std::size_t kConstraintCount = kRowsPerStep * kHorizonLength;
 constexpr double kRecoveryMargin = 1.0e-6;
 constexpr double kLimitToleranceMultiplier = 50.0;
+
+bool threadCpuTimeSeconds(double &seconds) noexcept
+{
+  timespec value{};
+  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) {
+    return false;
+  }
+  seconds = static_cast<double>(value.tv_sec)
+    + static_cast<double>(value.tv_nsec) * 1.0e-9;
+  return true;
+}
+
+double elapsedThreadCpuSeconds(double start_seconds, bool start_valid) noexcept
+{
+  double end_seconds = 0.0;
+  if (!start_valid || !threadCpuTimeSeconds(end_seconds)) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  return std::max(0.0, end_seconds - start_seconds);
+}
 
 using StateTrajectory = Eigen::VectorXd;
 using DecisionVector = Eigen::VectorXd;
@@ -174,13 +196,15 @@ public:
 
   bool update(
     const State &initial_state, const Reference &reference,
-    const Input &last_control, ProblemData &data) const noexcept
+    const Input &last_control, const Limits &requested_limits,
+    ProblemData &data) const noexcept
   {
     if (!valid_ || !initial_state.allFinite() || !last_control.allFinite()
       || !std::all_of(reference.begin(), reference.end(),
         [](const State &state) {return state.allFinite();})) {
       return false;
     }
+    const Limits limits = effectiveLimits(requested_limits);
 
     StateTrajectory reference_vector(9 * kHorizonLength);
     for (std::size_t step = 0; step < kHorizonLength; ++step) {
@@ -199,8 +223,9 @@ public:
     data.lower.setConstant(-OSQP_INFTY);
     data.upper.setConstant(OSQP_INFTY);
     const double polygon_scale = std::cos(M_PI / static_cast<double>(kPolygonSides));
-    const double velocity_xy_limit = config_.max_speed_xy * polygon_scale;
-    const double acceleration_xy_limit = config_.max_acceleration_xy * polygon_scale;
+    const double velocity_xy_limit = limits.max_speed_xy * polygon_scale;
+    const double acceleration_xy_limit =
+        limits.max_acceleration_xy * polygon_scale;
     const double control_xy_limit = config_.max_control_xy * polygon_scale;
     const double tilt_scale = std::tan(config_.max_tilt_rad) * polygon_scale;
     const double maximum_force_z = std::sqrt(config_.max_collective_specific_force_m_s2* config_.max_collective_specific_force_m_s2- config_.max_control_xy * config_.max_control_xy);
@@ -215,7 +240,8 @@ public:
 
         data.upper(rowIndex(step, side)) = control_xy_limit;
         const std::size_t rate_row = rowIndex(step, kRowRateXyBase + side);
-        data.upper(rate_row) = config_.max_control_rate_xy * dt * polygon_scale;
+        data.upper(rate_row) =
+            limits.max_control_rate_xy * dt * polygon_scale;
         if (step == 0) {
           data.upper(rate_row) += nx * last_control.x() + ny * last_control.y();
         }
@@ -238,16 +264,20 @@ public:
       data.upper(input_z_row) = config_.max_control_z;
 
       const std::size_t rate_z_row = rowIndex(step, kRowRateUz);
-      const double rate_z_change = config_.max_control_rate_z * dt;
+      const double rate_z_change = limits.max_control_rate_z * dt;
       data.lower(rate_z_row) = step == 0 ? last_control.z() - rate_z_change : -rate_z_change;
       data.upper(rate_z_row) = step == 0 ? last_control.z() + rate_z_change : rate_z_change;
 
       const double free_velocity_z = data.free_prediction(9 * step + 5);
-      data.upper(rowIndex(step, kRowVelZUpper)) = config_.max_speed_z - free_velocity_z;
-      data.upper(rowIndex(step, kRowVelZLower)) = config_.max_speed_z + free_velocity_z;
+      data.upper(rowIndex(step, kRowVelZUpper)) =
+          limits.max_speed_z - free_velocity_z;
+      data.upper(rowIndex(step, kRowVelZLower)) =
+          limits.max_speed_z + free_velocity_z;
       const double free_acceleration_z = data.free_prediction(9 * step + 8);
-      data.upper(rowIndex(step, kRowAccZUpper)) = config_.max_acceleration_z - free_acceleration_z;
-      data.upper(rowIndex(step, kRowAccZLower)) = config_.max_acceleration_z + free_acceleration_z;
+      data.upper(rowIndex(step, kRowAccZUpper)) =
+          limits.max_acceleration_z - free_acceleration_z;
+      data.upper(rowIndex(step, kRowAccZLower)) =
+          limits.max_acceleration_z + free_acceleration_z;
 
       data.lower(rowIndex(step, kRowSlackVel)) = 0.0;
       data.upper(rowIndex(step, kRowSlackVel)) = config_.max_constraint_slack;
@@ -267,11 +297,32 @@ public:
       && (data.lower.array() <= data.upper.array()).all();
   }
 
+  Limits effectiveLimits(const Limits &requested) const noexcept
+  {
+    return {boundedLimit(requested.max_speed_xy, config_.max_speed_xy),
+            boundedLimit(requested.max_speed_z, config_.max_speed_z),
+            boundedLimit(requested.max_acceleration_xy,
+                         config_.max_acceleration_xy),
+            boundedLimit(requested.max_acceleration_z,
+                         config_.max_acceleration_z),
+            boundedLimit(requested.max_control_rate_xy,
+                         config_.max_control_rate_xy),
+            boundedLimit(requested.max_control_rate_z,
+                         config_.max_control_rate_z)};
+  }
+
+  static double boundedLimit(double requested, double maximum) noexcept
+  {
+    return std::isfinite(requested) && requested > 0.0
+               ? std::min(requested, maximum)
+               : maximum;
+  }
+
   Result result(
     const ProblemData &data, const DecisionVector &decision,
     double absolute_tolerance, double relative_tolerance) const noexcept
   {
-    Result output;
+    Result output{};
     if (decision.size() != static_cast<Eigen::Index>(kDecisionCount)
       || !decision.allFinite()) {
       output.status = Status::non_finite_output;
@@ -570,34 +621,70 @@ public:
 
   Result solve(
     const State &initial_state, const Reference &reference,
-    const Input &last_control, Clock::time_point deadline) noexcept
+    const Input &last_control, const Limits &limits,
+    Clock::time_point deadline) noexcept
   {
     Result output;
+    double coupled_cpu_start = 0.0;
+    const bool coupled_cpu_start_valid = threadCpuTimeSeconds(coupled_cpu_start);
+    const auto finish = [&]() noexcept -> Result {
+      output.coupled_solve_cpu_seconds =
+        elapsedThreadCpuSeconds(coupled_cpu_start, coupled_cpu_start_valid);
+      return output;
+    };
     if (!configured_ || Clock::now() >= deadline) {
       output.status = configured_ ? Status::deadline_exceeded : Status::invalid_input;
-      return output;
+      return finish();
     }
     ProblemData data;
-    if (!problem_.update(initial_state, reference, last_control, data)) return output;
+    auto phase_start = Clock::now();
+    if (!problem_.update(initial_state, reference, last_control, limits, data)) {
+      output.problem_update_seconds = std::chrono::duration<double>(
+        Clock::now() - phase_start).count();
+      return finish();
+    }
+    output.problem_update_seconds = std::chrono::duration<double>(
+      Clock::now() - phase_start).count();
+
+    phase_start = Clock::now();
     std::copy_n(data.gradient.data(), kDecisionCount, gradient_.begin());
     std::copy_n(data.lower.data(), kConstraintCount, lower_.begin());
     std::copy_n(data.upper.data(), kConstraintCount, upper_.begin());
+    output.vector_copy_seconds = std::chrono::duration<double>(
+      Clock::now() - phase_start).count();
+
+    phase_start = Clock::now();
     if (osqp_update_data_vec(
         solver_.get(), gradient_.data(), lower_.data(), upper_.data()) != 0) {
+      output.osqp_data_update_seconds = std::chrono::duration<double>(
+        Clock::now() - phase_start).count();
       output.status = Status::factorization_failure;
-      return output;
+      return finish();
     }
+    output.osqp_data_update_seconds = std::chrono::duration<double>(
+      Clock::now() - phase_start).count();
+
     const double remaining = std::chrono::duration<double>(deadline - Clock::now()).count();
+    output.remaining_budget_before_osqp_seconds = remaining;
     if (!std::isfinite(remaining) || remaining <= 0.0) {
       output.status = Status::deadline_exceeded;
-      return output;
+      return finish();
     }
     settings_->time_limit = std::max(remaining, 1.0e-6);
+    phase_start = Clock::now();
     if (osqp_update_settings(solver_.get(), settings_.get()) != 0) {
+      output.osqp_settings_update_seconds = std::chrono::duration<double>(
+        Clock::now() - phase_start).count();
       output.status = Status::factorization_failure;
-      return output;
+      return finish();
     }
+    output.osqp_settings_update_seconds = std::chrono::duration<double>(
+      Clock::now() - phase_start).count();
 
+    double warm_start_cpu_start = 0.0;
+    const bool warm_start_cpu_start_valid =
+      threadCpuTimeSeconds(warm_start_cpu_start);
+    phase_start = Clock::now();
     if (warm_start_valid_) {
       // Receding-horizon warm start: U[k] <- U[k+1]. The constraint rows are
       // step-major, so the ADMM multipliers use the same one-step shift.
@@ -618,11 +705,35 @@ public:
       warm_start_.tail(2 * kHorizonLength).setZero();
       std::fill(dual_.begin(), dual_.end(), 0.0);
     }
-    if (osqp_warm_start(solver_.get(), warm_start_.data(), dual_.data()) != 0
-      || osqp_solve(solver_.get()) != 0 || !solver_->info) {
+    output.warm_start_prepare_seconds = std::chrono::duration<double>(
+      Clock::now() - phase_start).count();
+    phase_start = Clock::now();
+    const OSQPInt warm_start_error =
+      osqp_warm_start(solver_.get(), warm_start_.data(), dual_.data());
+    output.osqp_warm_start_seconds = std::chrono::duration<double>(
+      Clock::now() - phase_start).count();
+    output.warm_start_seconds = output.warm_start_prepare_seconds
+      + output.osqp_warm_start_seconds;
+    output.warm_start_cpu_seconds = elapsedThreadCpuSeconds(
+      warm_start_cpu_start, warm_start_cpu_start_valid);
+    if (warm_start_error != 0) {
       output.status = Status::factorization_failure;
       reset();
-      return output;
+      return finish();
+    }
+    phase_start = Clock::now();
+    double osqp_solve_cpu_start = 0.0;
+    const bool osqp_solve_cpu_start_valid =
+      threadCpuTimeSeconds(osqp_solve_cpu_start);
+    const OSQPInt solve_error = osqp_solve(solver_.get());
+    output.osqp_solve_seconds = std::chrono::duration<double>(
+      Clock::now() - phase_start).count();
+    output.osqp_solve_cpu_seconds = elapsedThreadCpuSeconds(
+      osqp_solve_cpu_start, osqp_solve_cpu_start_valid);
+    if (solve_error != 0 || !solver_->info) {
+      output.status = Status::factorization_failure;
+      reset();
+      return finish();
     }
     output.iterations = solver_->info->iter;
     output.primal_residual = solver_->info->prim_res;
@@ -631,12 +742,12 @@ public:
     if (status != OSQP_SOLVED && status != OSQP_SOLVED_INACCURATE) {
       output.status = statusFromOsqp(status);
       reset();
-      return output;
+      return finish();
     }
     if (!solver_->solution || !solver_->solution->x || !solver_->solution->y) {
       output.status = Status::non_finite_output;
       reset();
-      return output;
+      return finish();
     }
     for (std::size_t index = 0; index < kDecisionCount; ++index) {
       warm_start_(index) = solver_->solution->x[index];
@@ -645,11 +756,38 @@ public:
     if (!warm_start_.allFinite()) {
       output.status = Status::non_finite_output;
       reset();
-      return output;
+      return finish();
     }
 
+    const double problem_update_seconds = output.problem_update_seconds;
+    const double vector_copy_seconds = output.vector_copy_seconds;
+    const double osqp_data_update_seconds = output.osqp_data_update_seconds;
+    const double osqp_settings_update_seconds = output.osqp_settings_update_seconds;
+    const double warm_start_seconds = output.warm_start_seconds;
+    const double warm_start_prepare_seconds = output.warm_start_prepare_seconds;
+    const double osqp_warm_start_seconds = output.osqp_warm_start_seconds;
+    const double osqp_solve_seconds = output.osqp_solve_seconds;
+    const double warm_start_cpu_seconds = output.warm_start_cpu_seconds;
+    const double osqp_solve_cpu_seconds = output.osqp_solve_cpu_seconds;
+    const double remaining_budget_before_osqp_seconds =
+      output.remaining_budget_before_osqp_seconds;
+    phase_start = Clock::now();
     output = problem_.result(
       data, warm_start_, config_.absolute_tolerance, config_.relative_tolerance);
+    output.result_postprocess_seconds = std::chrono::duration<double>(
+      Clock::now() - phase_start).count();
+    output.problem_update_seconds = problem_update_seconds;
+    output.vector_copy_seconds = vector_copy_seconds;
+    output.osqp_data_update_seconds = osqp_data_update_seconds;
+    output.osqp_settings_update_seconds = osqp_settings_update_seconds;
+    output.warm_start_seconds = warm_start_seconds;
+    output.warm_start_prepare_seconds = warm_start_prepare_seconds;
+    output.osqp_warm_start_seconds = osqp_warm_start_seconds;
+    output.osqp_solve_seconds = osqp_solve_seconds;
+    output.warm_start_cpu_seconds = warm_start_cpu_seconds;
+    output.osqp_solve_cpu_seconds = osqp_solve_cpu_seconds;
+    output.remaining_budget_before_osqp_seconds =
+      remaining_budget_before_osqp_seconds;
     output.iterations = solver_->info->iter;
     output.primal_residual = solver_->info->prim_res;
     output.dual_residual = solver_->info->dual_res;
@@ -663,12 +801,14 @@ public:
     output.dual_tolerance = config_.absolute_tolerance
       + config_.relative_tolerance
       * (problem_.constraints().transpose() * dual).template lpNorm<Eigen::Infinity>();
+    output.result_postprocess_seconds = std::chrono::duration<double>(
+      Clock::now() - phase_start).count();
     if (!output.valid) {
       reset();
-      return output;
+      return finish();
     }
     warm_start_valid_ = true;
-    return output;
+    return finish();
   }
 
 private:
@@ -708,9 +848,12 @@ void Solver::reset() noexcept
 
 Result Solver::solve(
   const State &initial_state, const Reference &reference,
-  const Input &last_control, Clock::time_point deadline) noexcept
+  const Input &last_control, const Limits &limits,
+  Clock::time_point deadline) noexcept
 {
-  return impl_ ? impl_->solve(initial_state, reference, last_control, deadline) : Result{};
+  return impl_ ? impl_->solve(initial_state, reference, last_control, limits,
+                              deadline)
+               : Result{};
 }
 
 }  // namespace mpc_controller::coupled_mpc

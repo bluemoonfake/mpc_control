@@ -19,10 +19,12 @@ flowchart LR
     Bridge -->|vehicle_state| MPC["MPC controller"]
     Bridge -->|vehicle_state| Ref["Reference generator"]
     Mission["Mission JSON"] --> Ref
-    Ref -->|reference_trajectory| MPC
+    Ref -->|MpcMissionPlan| MPC
+    Ref -->|ReferenceTrajectory| PID["PX4 PID mode"]
     MPC -->|force_attitude_setpoint| Adapter["PX4 attitude mode"]
     MPC -->|mpc_translational_output| Diagnostics["Diagnostics"]
-    Ref -->|mission_completed| Adapter
+    MPC -->|mission_completed| Adapter
+    PID -->|mission_completed| Adapter
     Adapter -->|AttitudeSetpointType| PX4["PX4 attitude and rate loops"]
     Adapter <-->|Mode registration| Manager["PX4 mode manager"]
 ```
@@ -31,10 +33,11 @@ flowchart LR
 | --- | --- |
 | PX4 → bridge | VehicleLocalPosition, VehicleAttitude, VehicleAngularVelocity |
 | vehicle_state | VehicleState: ENU position, velocity, acceleration; orientation, rates and validity |
+| mpc_mission_plan | MpcMissionPlan: discrete resolved waypoints and constraints consumed by MPC |
 | reference_trajectory | ReferenceTrajectory: timed position, velocity, acceleration, yaw and yaw rate |
 | force_attitude_setpoint | ForceAttitudeSetpoint: desired FLU→ENU quaternion, collective specific force and yaw rate |
 | mpc_translational_output | MpcTranslationalOutput: commands, prediction and solver diagnostics; not the adapter input |
-| /reference_generator_node/mission_completed | Bool; the MPC adapter reports External Mode completion, not an explicit landing command |
+| /reference_generator_node/mission_completed | Bool; MPC publishes completion for direct missions and the generator does so for PID trajectories; the adapter reports External Mode completion, not an explicit landing command |
 
 Default bridge input topics are /fmu/out/vehicle_local_position_v1,
 /fmu/out/vehicle_attitude and /fmu/out/vehicle_angular_velocity.
@@ -46,9 +49,9 @@ The controller callback runs at 50 Hz.
 ```mermaid
 %%{init: {"flowchart": {"curve": "linear", "htmlLabels": false}}}%%
 flowchart TD
-    Input["State and reference"] --> Gate{"Inputs usable?"}
+    Input["State and discrete waypoint goal"] --> Gate{"Inputs usable?"}
     Gate -->|No| Skip["Skip update"]
-    Gate -->|Yes| Prepare["Observe XY acceleration; sample horizon"]
+    Gate -->|Yes| Prepare["Observe XY acceleration; update waypoint goal"]
     Prepare --> QP["Update coupled QP"]
     QP --> Solve["Solve with OSQP"]
     Solve --> Check{"Result valid and in time?"}
@@ -59,13 +62,14 @@ flowchart TD
     Map --> Publish["Publish setpoint and diagnostics"]
 ```
 
-- Stale state/reference inputs skip the update and reset solver/observer memory
+- Stale state inputs, and legacy fallback reference inputs, skip the update and reset solver/observer memory
   when entering a stale interval. 
 - The XY acceleration observer blends the previous-command response model with
   measured acceleration. Z acceleration remains measured.
-- The reference generator publishes a 30 s horizon at 0.1 s spacing (301 samples).
-  The solver independently samples **26 prediction stages**: first step 0.01 s,
-  remaining 25 steps 0.20 s. So it's 5.01 s state prediction
+- For an active MPC mission, the generator publishes one discrete plan and MPC
+  owns measured target progression; the QP receives `[p_target, 0, 0]` across
+  **26 prediction stages** (first step 0.01 s, remaining 25 steps 0.20 s).
+  The timed 30 s `ReferenceTrajectory` remains the PX4 PID interface and an MPC hold fallback.
 - Solver budget: 18 ms; maximum iterations: 400.
 
 Sources: [controller node](src/controller/mpc_controller_node.cpp),
@@ -248,15 +252,71 @@ T_{\mathrm{norm}}=
 
 - Mission JSON is parsed by [mission_json_parser.cpp](src/mission/mission_json_parser.cpp).
   The generator supports takeoff, navigation waypoints, hold and land references.
-- /reference_generator_node/start_mission starts reference execution;
-  /reference_generator_node/reset_mission resets the generator.
-  Starting the reference does not arm or switch PX4 modes.
+- /reference_generator_node/load_and_start_mission atomically replaces and
+  starts a mission from its requested path;
+  /reference_generator_node/reset_mission returns to measured-position hold.
+  Neither service arms nor switches PX4 modes.
 - The state bridge converts NED/FRD telemetry to ENU/FLU and publishes validity
   information, with 0.25 s freshness and 0.10 s cross-topic skew settings.
   Consumers must honor the appropriate validity checks.
 
 See [mission_trajectory.cpp](src/mission/mission_trajectory.cpp) and
 [reference_generator_node.cpp](src/mission/reference_generator_node.cpp).
+
+### Runtime mission loading
+
+`make sim` registers both External Modes without preloading a mission. After
+manually taking off and selecting one mode, it captures the measured
+position/yaw and holds there.
+
+Load and start a schema-v1 waypoint mission without restarting ROS:
+
+```bash
+make mission-start CONTROLLER=mpc \
+  MISSION_PATH=/absolute/path/to/mission.json
+```
+
+The target verifies that the requested controller is the External Mode selected
+in PX4; it never switches PX4 modes. Invalid paths or mission JSON addressed to
+the active controller stop a prior mission and leave the generator in
+measured-position hold.
+
+### Polynomia mission trajectories
+
+`config/missions/test_polynomia.json` is the waypoint approximation of
+`polynomial_curve_python.gif` at a constant 5 m altitude. For MPC it is a
+discrete mission plan, not a timed polynomial or fly-through spline: the
+current waypoint is the constant goal `[p_target, 0, 0]`, and the coupled QP
+optimizes its own predicted position, velocity, acceleration and input.
+
+`horizontalVelocity`, `verticalVelocity`, and `maxHeadingRate` describe the
+active MPC limits. The optional `tpmc.maximumAcceleration` (m/s²) and
+`tpmc.maximumJerk` (m/s³) fields tighten MPC acceleration and command-rate
+limits; they never relax the controller's hard safety envelope. Missions that
+omit `tpmc` use that configured envelope.
+An explicitly supplied heading is honored; otherwise yaw follows the
+horizontal course of the current leg.
+
+For MPC, the MPC node owns measured waypoint acceptance, hold dwell and target
+progression; it never exposes an unaccepted successor to the QP. PX4 PID
+continues to consume the legacy generated `ReferenceTrajectory`. Takeoff and
+landing remain type-based mission items, while `rtl` is a reference-level
+return to the XY position captured when the runtime mission starts. RTL
+inherits the preceding target's altitude and does not arm, disarm, land, or
+change PX4 mode.
+
+These reference limits describe the requested trajectory; they are not
+flight-performance guarantees. Actual tracking depends on the vehicle,
+controller, estimator validity, and the validated operating envelope.
+
+Run the Polynomia mission through the runtime workflow:
+
+```bash
+make sim
+# Manually arm/take off in a stock PX4 mode, then select MPC Controller.
+make mission-start CONTROLLER=mpc \
+  MISSION_PATH="$(pwd)/config/missions/test_polynomia.json"
+```
 
 ## 5. Source and Build Architecture
 
@@ -284,8 +344,8 @@ its configured PX4 revision and Gazebo version before starting SITL.
 make build
 source install/setup.bash
 
-# Start PX4 SITL, Gazebo GUI, DDS and the MPC ROS nodes
-make sim CONTROLLER=mpc MISSION_JSON=config/missions/benchmark_square.json
+# Start PX4 SITL, Gazebo GUI, DDS and both External Mode ROS nodes
+make sim
 ```
 
 Arm and take off manually in a stock PX4 mode, then select the registered
@@ -293,7 +353,8 @@ MPC Controller External Mode in QGroundControl. Start reference execution
 separately:
 
 ```bash
-make mission-start
+make mission-start CONTROLLER=mpc \
+  MISSION_PATH=/absolute/path/to/mission.json
 ```
 
 make mission-run only prints instructions; it does not start the mission.
@@ -304,9 +365,7 @@ the reference start service.
 For an already prepared ROS/PX4 environment, launch the nodes directly with:
 
 ```bash
-ros2 launch mpc_controller mpc_external_mode.launch.py \
-  controller:=mpc \
-  mission_file_path:=/absolute/path/to/mission.json
+ros2 launch mpc_controller mpc_external_mode.launch.py
 
 make status
 make logs
@@ -315,16 +374,17 @@ make stop
 
 ## 7. PX4 PID Comparison and Missions
 
-The px4_pid launch profile replaces the MPC/controller-adapter pair with
+The PX4 PID External Mode is provided by
 [pid_mode_node](src/PID_validation/pid_mode_node.cpp). It shares the reference
-generator and state bridge, samples the reference at the current time, and
+generator and state bridge with the MPC mode, samples the reference at the current time, and
 publishes position, velocity, acceleration, yaw and yaw rate at 50 Hz through
 TrajectorySetpointType. PX4 owns the feedback loops in this profile.
 
 ```bash
-make sim CONTROLLER=px4_pid MISSION_JSON=config/missions/test_hover_step.json
+make sim
 # After manual takeoff and selection of PX4 PID:
-make mission-start
+make mission-start CONTROLLER=px4_pid \
+  MISSION_PATH=/absolute/path/to/mission.json
 ```
 
 The PID adapter validates frame, timestamps, reference contents and freshness.

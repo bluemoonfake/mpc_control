@@ -1,11 +1,8 @@
 reference_generator_node:
   ros__parameters:
-    mission_file_path: "config/missions/benchmark_square.json"
     mission_acceptance_radius_m: 2.5
     mission_speed_override_m_s: 0.0
     frame_id: map
-    # Follow measured position/yaw before the External MPC Mode and freeze at mode entry.
-    auto_capture_current_hold: true
     hold_yaw_rad: 0.0
     state_timeout_seconds: 0.25
     horizon_seconds: 30.0
@@ -23,11 +20,14 @@ vehicle_state_bridge_node:
 
 mpc_controller_node:
   ros__parameters:
-    # Tuned x500 profile.
     update_rate_hz: 50.0
     strict_validation: false
     reference_timeout_seconds: 1.5
     state_timeout_seconds: 0.25
+    # A waypoint is eligible to advance only after this measured total speed.
+    waypoint_acceptance_speed_m_s: 2.0
+    # Diagnostic A/B switch; baseline keeps the shifted solver warm start.
+    cold_start_on_waypoint_transition: false
     # Short first prediction knot remains independent of the 50 Hz callback.
     dt_first: 0.01
     dt_later: 0.20
@@ -65,14 +65,14 @@ mpc_controller_node:
     # Provisional jerk limit for the external-attitude path; validate with
     # actuator saturation and attitude-response SITL data before raising it.
     max_control_rate_xy: 8.0
-    max_speed_z: 2.0
-    max_acceleration_z: 2.0
+    max_speed_z: 3.0
+    max_acceleration_z: 5.0
     max_measured_acceleration_z_m_s2: 10.0
     max_control_z: 3.0
     max_control_rate_z: 4.0
     # Coupled-QP physical envelope.
     min_collective_specific_force_m_s2: 1.0
-    max_collective_specific_force_m_s2: 13.0
+    max_collective_specific_force_m_s2: 16.0
     constraint_slack_weight: 10000.0
     max_constraint_slack: 20.0
     # Bounded command used only while MPC is invalid or misses its deadline.

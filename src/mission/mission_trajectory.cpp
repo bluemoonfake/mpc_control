@@ -5,6 +5,77 @@
 
 namespace mpc_controller::mission {
 
+namespace {
+
+struct ActiveSettings {
+  double horizontal_speed;
+  double vertical_speed;
+  double max_heading_rate_rad_s;
+  double maximum_acceleration_m_s2;
+  double maximum_jerk_m_s3;
+};
+
+ActiveSettings missionSettings(const Defaults &defaults,
+                               double speed_override_m_s) {
+  return {speed_override_m_s > 0.0 ? speed_override_m_s
+                                   : defaults.horizontal_velocity_m_s,
+          defaults.vertical_velocity_m_s,
+          defaults.max_heading_rate_deg_s * M_PI / 180.0,
+          defaults.maximum_acceleration_m_s2, defaults.maximum_jerk_m_s3};
+}
+
+void applySettings(const ChangeSettingsData &change, const Defaults &defaults,
+                   double speed_override_m_s, ActiveSettings &settings) {
+  if (change.reset_all) {
+    settings = missionSettings(defaults, speed_override_m_s);
+  }
+  if (std::isfinite(change.horizontal_velocity_m_s)) {
+    settings.horizontal_speed = change.horizontal_velocity_m_s;
+  }
+  if (std::isfinite(change.vertical_velocity_m_s)) {
+    settings.vertical_speed = change.vertical_velocity_m_s;
+  }
+  if (std::isfinite(change.max_heading_rate_deg_s)) {
+    settings.max_heading_rate_rad_s =
+        change.max_heading_rate_deg_s * M_PI / 180.0;
+  }
+  if (std::isfinite(change.maximum_acceleration_m_s2)) {
+    settings.maximum_acceleration_m_s2 = change.maximum_acceleration_m_s2;
+  }
+  if (std::isfinite(change.maximum_jerk_m_s3)) {
+    settings.maximum_jerk_m_s3 = change.maximum_jerk_m_s3;
+  }
+}
+
+void assignSettings(MissionReferenceGenerator::Waypoint &waypoint,
+                    const ActiveSettings &settings) {
+  waypoint.horizontal_speed = settings.horizontal_speed;
+  waypoint.vertical_speed = settings.vertical_speed;
+  waypoint.max_heading_rate_rad_s = settings.max_heading_rate_rad_s;
+  waypoint.maximum_acceleration_m_s2 = settings.maximum_acceleration_m_s2;
+  waypoint.maximum_jerk_m_s3 = settings.maximum_jerk_m_s3;
+}
+
+bool validWaypoint(const MissionReferenceGenerator::Waypoint &waypoint) {
+  const auto finite = [](double value) { return std::isfinite(value); };
+  return std::all_of(waypoint.position.begin(), waypoint.position.end(),
+                     finite) &&
+         finite(waypoint.horizontal_speed) &&
+         waypoint.horizontal_speed >= 0.0 && finite(waypoint.vertical_speed) &&
+         waypoint.vertical_speed >= 0.0 &&
+         finite(waypoint.max_heading_rate_rad_s) &&
+         waypoint.max_heading_rate_rad_s > 0.0 &&
+         finite(waypoint.hold_duration_s) && waypoint.hold_duration_s >= 0.0 &&
+         (std::isnan(waypoint.maximum_acceleration_m_s2) ||
+          (finite(waypoint.maximum_acceleration_m_s2) &&
+           waypoint.maximum_acceleration_m_s2 > 0.0)) &&
+         (std::isnan(waypoint.maximum_jerk_m_s3) ||
+          (finite(waypoint.maximum_jerk_m_s3) &&
+           waypoint.maximum_jerk_m_s3 > 0.0));
+}
+
+} // namespace
+
 MissionReferenceGenerator::MissionReferenceGenerator(Config config)
     : config_(config), leg_start_position_(config.reference.hold_position),
       leg_start_yaw_(config.reference.hold_yaw_rad) {}
@@ -20,45 +91,74 @@ bool MissionReferenceGenerator::setMission(const Mission &mission,
     return false;
   }
 
-  const double horizontal_speed =
-      config_.speed_override_m_s > 0.0
-          ? config_.speed_override_m_s
-          : mission.defaults.horizontal_velocity_m_s;
-  const double vertical_speed = mission.defaults.vertical_velocity_m_s;
+  ActiveSettings settings =
+      missionSettings(mission.defaults, config_.speed_override_m_s);
+  bool return_to_start_seen = false;
 
   for (const auto &item : mission.items) {
+    if (return_to_start_seen) {
+      error = "rtl must be the final mission item";
+      waypoints_.clear();
+      return false;
+    }
+
     Waypoint waypoint;
     if (item.type == ItemType::Takeoff) {
       waypoint.id = item.id.empty() ? "takeoff" : item.id;
+      waypoint.type = ItemType::Takeoff;
       waypoint.position = config_.reference.hold_position;
       if (std::isfinite(item.waypoint.position_enu[2]) &&
           item.waypoint.position_enu[2] > config_.reference.hold_position[2]) {
         waypoint.position[2] = item.waypoint.position_enu[2];
       }
+      assignSettings(waypoint, settings);
       waypoint.horizontal_speed = 0.0;
-      waypoint.vertical_speed = std::clamp(vertical_speed, 0.5, 1.2);
+      waypoint.vertical_speed = std::clamp(settings.vertical_speed, 0.5, 1.2);
       waypoints_.push_back(waypoint);
     } else if (item.type == ItemType::Waypoint) {
       waypoint.id = item.id;
+      waypoint.type = ItemType::Waypoint;
       waypoint.position = item.waypoint.position_enu;
-      waypoint.horizontal_speed = horizontal_speed;
-      waypoint.vertical_speed = vertical_speed;
+      waypoint.heading_rad = item.waypoint.heading_rad;
+      assignSettings(waypoint, settings);
       waypoints_.push_back(waypoint);
     } else if (item.type == ItemType::Hold && !waypoints_.empty()) {
       waypoints_.back().hold_duration_s = item.hold.duration_seconds;
+    } else if (item.type == ItemType::ChangeSettings) {
+      applySettings(item.settings, mission.defaults, config_.speed_override_m_s,
+                    settings);
     } else if (item.type == ItemType::Land) {
       waypoint.id = item.id.empty() ? "landing" : item.id;
+      waypoint.type = ItemType::Land;
       waypoint.position = waypoints_.empty() ? config_.reference.hold_position
                                              : waypoints_.back().position;
       waypoint.position[2] = 0.0;
+      assignSettings(waypoint, settings);
       waypoint.horizontal_speed = 0.0;
-      waypoint.vertical_speed = std::clamp(vertical_speed, 0.4, 0.8);
+      waypoint.vertical_speed = std::clamp(settings.vertical_speed, 0.4, 0.8);
       waypoints_.push_back(waypoint);
+    } else if (item.type == ItemType::Rtl) {
+      if (waypoints_.empty()) {
+        error = "rtl requires a preceding executable waypoint";
+        return false;
+      }
+      waypoint.id = item.id.empty() ? "rtl" : item.id;
+      waypoint.type = ItemType::Rtl;
+      waypoint.position = waypoints_.back().position;
+      assignSettings(waypoint, settings);
+      waypoint.return_to_mission_start_xy = true;
+      waypoints_.push_back(waypoint);
+      return_to_start_seen = true;
     }
   }
 
   if (waypoints_.empty()) {
     error = "mission contains no executable waypoints";
+    return false;
+  }
+  if (!std::all_of(waypoints_.begin(), waypoints_.end(), validWaypoint)) {
+    error = "mission contains invalid compiled waypoint settings";
+    waypoints_.clear();
     return false;
   }
   error.clear();
@@ -91,6 +191,12 @@ bool MissionReferenceGenerator::start(double now_seconds) noexcept {
                                              : config_.reference.hold_position;
   leg_start_yaw_ = vehicle_state_.valid ? vehicle_state_.yaw
                                         : config_.reference.hold_yaw_rad;
+  for (auto &waypoint : waypoints_) {
+    if (waypoint.return_to_mission_start_xy) {
+      waypoint.position[0] = leg_start_position_[0];
+      waypoint.position[1] = leg_start_position_[1];
+    }
+  }
   leg_duration_seconds_ = legDuration(leg_start_position_, waypoints_.front());
   leg_started_at_seconds_ = now_seconds;
   leg_started_ = true;
@@ -210,10 +316,8 @@ TrajectorySample MissionReferenceGenerator::sample(
       target.id == "takeoff" || target.id == "landing";
   if (takeoff_or_landing) {
     const double alpha =
-        leg_duration_seconds_ > 1e-3
-            ? std::min(1.0, (elapsed + horizon_offset_seconds) /
-                                leg_duration_seconds_)
-            : 1.0;
+        leg_duration_seconds_ > 1e-3 ? std::min(1.0, (elapsed + horizon_offset_seconds) /
+                                leg_duration_seconds_) : 1.0;
     const double dx = target.position[0] - leg_start_position_[0];
     const double dy = target.position[1] - leg_start_position_[1];
     const double dz = target.position[2] - leg_start_position_[2];
@@ -271,8 +375,7 @@ TrajectorySample MissionReferenceGenerator::sample(
   point.position = target.position;
   const double dx = target.position[0] - leg_start_position_[0];
   const double dy = target.position[1] - leg_start_position_[1];
-  point.yaw = std::hypot(dx, dy) > 1e-3 ? std::atan2(dy, dx)
-                                        : leg_start_yaw_;
+  point.yaw = std::hypot(dx, dy) > 1e-3 ? std::atan2(dy, dx) : leg_start_yaw_;
   return point;
 }
 

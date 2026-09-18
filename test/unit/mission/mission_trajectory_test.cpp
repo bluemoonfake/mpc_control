@@ -36,6 +36,15 @@ mpc_controller::mission::Mission makeTwoWaypointMission() {
   return mission;
 }
 
+mpc_controller::mission::Mission makeReturnMission() {
+  auto mission = makeMission();
+  mpc_controller::mission::MissionItem rtl;
+  rtl.type = mpc_controller::mission::ItemType::Rtl;
+  rtl.id = "return_home";
+  mission.items.push_back(rtl);
+  return mission;
+}
+
 TEST(MissionReferenceGenerator, ProducesDeterministicRollingHorizonWithoutRos) {
   mpc_controller::mission::MissionReferenceGenerator::Config config;
   config.reference.hold_position = {0.0, 0.0, 1.0};
@@ -81,6 +90,41 @@ TEST(MissionReferenceGenerator, AdvancesUsingMeasuredVehicleState) {
   EXPECT_EQ(generator.currentWaypointIndex(), 1U);
 }
 
+TEST(MissionReferenceGenerator, ChangeSettingsApplyOnlyToFollowingWaypoints) {
+  auto mission = makeMission();
+  mission.defaults.maximum_acceleration_m_s2 = 2.0;
+  mission.defaults.maximum_jerk_m_s3 = 4.0;
+  mpc_controller::mission::MissionItem change;
+  change.type = mpc_controller::mission::ItemType::ChangeSettings;
+  change.settings.horizontal_velocity_m_s = 3.0;
+  change.settings.maximum_acceleration_m_s2 = 1.0;
+  change.settings.maximum_jerk_m_s3 = 2.0;
+  mission.items.push_back(change);
+  auto second = mission.items[1];
+  second.id = "wp2";
+  mission.items.push_back(second);
+  mpc_controller::mission::MissionItem reset;
+  reset.type = mpc_controller::mission::ItemType::ChangeSettings;
+  reset.settings.reset_all = true;
+  mission.items.push_back(reset);
+  auto third = mission.items[1];
+  third.id = "wp3";
+  mission.items.push_back(third);
+
+  mpc_controller::mission::MissionReferenceGenerator generator({});
+  std::string error;
+  ASSERT_TRUE(generator.setMission(mission, error)) << error;
+  const auto &waypoints = generator.waypoints();
+  ASSERT_EQ(waypoints.size(), 4U);
+  EXPECT_DOUBLE_EQ(waypoints[1].horizontal_speed, 2.0);
+  EXPECT_DOUBLE_EQ(waypoints[2].horizontal_speed, 3.0);
+  EXPECT_DOUBLE_EQ(waypoints[2].maximum_acceleration_m_s2, 1.0);
+  EXPECT_DOUBLE_EQ(waypoints[2].maximum_jerk_m_s3, 2.0);
+  EXPECT_DOUBLE_EQ(waypoints[3].horizontal_speed, 2.0);
+  EXPECT_DOUBLE_EQ(waypoints[3].maximum_acceleration_m_s2, 2.0);
+  EXPECT_DOUBLE_EQ(waypoints[3].maximum_jerk_m_s3, 4.0);
+}
+
 TEST(MissionReferenceGenerator, DoesNotAdvanceOnElapsedTimeOutsideAcceptance) {
   mpc_controller::mission::MissionReferenceGenerator generator({});
   std::string error;
@@ -103,7 +147,8 @@ TEST(MissionReferenceGenerator, DoesNotAdvanceOnElapsedTimeOutsideAcceptance) {
   EXPECT_EQ(generator.currentWaypointIndex(), 0U);
 }
 
-TEST(MissionReferenceGenerator, DoesNotAdvanceWhenCrossingPlaneFarFromWaypoint) {
+TEST(MissionReferenceGenerator,
+     DoesNotAdvanceWhenCrossingPlaneFarFromWaypoint) {
   mpc_controller::mission::MissionReferenceGenerator generator({});
   std::string error;
   ASSERT_TRUE(generator.setMission(makeMission(), error)) << error;
@@ -169,6 +214,74 @@ TEST(MissionReferenceGenerator, DoesNotPreviewAnUnacceptedSuccessorWaypoint) {
     EXPECT_DOUBLE_EQ(sample.velocity[1], 0.0);
     EXPECT_DOUBLE_EQ(sample.velocity[2], 0.0);
   }
+}
+
+TEST(MissionReferenceGenerator, RtlReturnsToMissionStartAtMissionAltitude) {
+  mpc_controller::mission::MissionReferenceGenerator generator({});
+  std::string error;
+  ASSERT_TRUE(generator.setMission(makeReturnMission(), error)) << error;
+
+  mpc_controller::mission::MissionReferenceGenerator::VehicleState state;
+  state.position = {2.0, -3.0, 2.0};
+  state.valid = true;
+  generator.updateVehicleState(state);
+  ASSERT_TRUE(generator.start(0.0));
+
+  ASSERT_EQ(generator.waypoints().back().id, "return_home");
+  EXPECT_EQ(generator.waypoints().back().position,
+            (std::array<double, 3>{2.0, -3.0, 5.0}));
+
+  state.position = {40.0, 50.0, 5.0};
+  generator.updateVehicleState(state);
+  EXPECT_EQ(generator.waypoints().back().position,
+            (std::array<double, 3>{2.0, -3.0, 5.0}));
+}
+
+TEST(MissionReferenceGenerator, RtlRebindsWhenMissionIsRestarted) {
+  mpc_controller::mission::MissionReferenceGenerator generator({});
+  std::string error;
+  ASSERT_TRUE(generator.setMission(makeReturnMission(), error)) << error;
+
+  mpc_controller::mission::MissionReferenceGenerator::VehicleState state;
+  state.position = {1.0, 2.0, 5.0};
+  state.valid = true;
+  generator.updateVehicleState(state);
+  ASSERT_TRUE(generator.start(0.0));
+
+  state.position = {-4.0, 6.0, 5.0};
+  generator.updateVehicleState(state);
+  ASSERT_TRUE(generator.start(10.0));
+  EXPECT_EQ(generator.waypoints().back().position,
+            (std::array<double, 3>{-4.0, 6.0, 5.0}));
+}
+
+TEST(MissionReferenceGenerator, RejectsNonTerminalRtl) {
+  auto mission = makeReturnMission();
+  mpc_controller::mission::MissionItem waypoint;
+  waypoint.type = mpc_controller::mission::ItemType::Waypoint;
+  waypoint.id = "after_rtl";
+  waypoint.waypoint.position_enu = {10.0, 0.0, 5.0};
+  mission.items.push_back(waypoint);
+
+  mpc_controller::mission::MissionReferenceGenerator generator({});
+  std::string error;
+  EXPECT_FALSE(generator.setMission(mission, error));
+  EXPECT_EQ(error, "rtl must be the final mission item");
+  EXPECT_TRUE(generator.waypoints().empty());
+}
+
+TEST(MissionReferenceGenerator, RejectsRtlWithoutPrecedingWaypoint) {
+  mpc_controller::mission::Mission mission;
+  mission.valid = true;
+  mpc_controller::mission::MissionItem rtl;
+  rtl.type = mpc_controller::mission::ItemType::Rtl;
+  mission.items.push_back(rtl);
+
+  mpc_controller::mission::MissionReferenceGenerator generator({});
+  std::string error;
+  EXPECT_FALSE(generator.setMission(mission, error));
+  EXPECT_EQ(error, "rtl requires a preceding executable waypoint");
+  EXPECT_TRUE(generator.waypoints().empty());
 }
 
 } // namespace

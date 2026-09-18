@@ -1,4 +1,5 @@
 #include "mpc_controller/msg/force_attitude_setpoint.hpp"
+#include "mpc_controller/mission/controller_profile.hpp"
 #include "mpc_controller/px4/geometric_mapping.hpp"
 
 #include <px4_msgs/msg/hover_thrust_estimate.hpp>
@@ -51,7 +52,7 @@ public:
     mission_completed_sub_ = node.create_subscription<std_msgs::msg::Bool>(
         "/reference_generator_node/mission_completed", rclcpp::QoS(10),
         [this](const std_msgs::msg::Bool::SharedPtr msg) {
-          if (msg && msg->data) {
+          if (msg && msg->data && isActive()) {
             RCLCPP_INFO(
                 node_.get_logger(),
                 "Mission completed signal received; completing External Mode. "
@@ -59,6 +60,10 @@ public:
             completed(px4_ros2::Result::Success);
           }
         });
+    external_mode_state_publisher_ = node.create_publisher<std_msgs::msg::Bool>(
+        mpc_controller::mission::kMpcExternalModeStateTopic.data(),
+        rclcpp::QoS(1).reliable().transient_local());
+    publishModeState(false);
 
     RCLCPP_INFO(
         node_.get_logger(),
@@ -66,10 +71,12 @@ public:
   }
 
   void onActivate() override {
+    publishModeState(true);
     RCLCPP_INFO(node_.get_logger(), "MpcFlightMode ACTIVATED");
   }
 
   void onDeactivate() override {
+    publishModeState(false);
     RCLCPP_INFO(node_.get_logger(), "MpcFlightMode DEACTIVATED");
   }
 
@@ -130,6 +137,12 @@ public:
   }
 
 private:
+  void publishModeState(bool active) {
+    std_msgs::msg::Bool message;
+    message.data = active;
+    external_mode_state_publisher_->publish(message);
+  }
+
   rclcpp::Node &node_;
   std::shared_ptr<px4_ros2::AttitudeSetpointType> attitude_setpoint_;
   rclcpp::Subscription<mpc_controller::msg::ForceAttitudeSetpoint>::SharedPtr
@@ -137,6 +150,8 @@ private:
   rclcpp::Subscription<px4_msgs::msg::HoverThrustEstimate>::SharedPtr
       hover_thrust_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr mission_completed_sub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr
+      external_mode_state_publisher_;
   std::optional<mpc_controller::msg::ForceAttitudeSetpoint> latest_setpoint_;
   std::optional<rclcpp::Time> last_setpoint_time_;
   double hover_thrust_ = 0.60;

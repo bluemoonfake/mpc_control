@@ -44,14 +44,15 @@ PX4_FMU_SETTLE_SECONDS ?= 3
 ROS_PACKAGE ?= mpc_controller
 ROS_LAUNCH ?= mpc_external_mode.launch.py
 MISSION_JSON ?= config/missions/benchmark_square.json
+MISSION_PATH ?=
 CONTROLLER ?= mpc
-# `px4_pid` is the canonical launch profile.  Keep `pid_px4` as a
+# `px4_pid` is the canonical mission-start profile. Keep `pid_px4` as a
 # compatibility spelling because it is an easy inversion to make at the CLI.
 CONTROLLER_CANONICAL := $(CONTROLLER)
 ifeq ($(CONTROLLER),pid_px4)
 CONTROLLER_CANONICAL := px4_pid
 endif
-ROS_LAUNCH_ARGS ?= mission_file_path:=$(abspath $(MISSION_JSON)) controller:=$(CONTROLLER_CANONICAL)
+ROS_LAUNCH_ARGS ?=
 ROS_BUILD_ARGS ?= --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 # The package contains several Eigen-heavy translation units. Building all of
 # them with the host-default job count can exhaust RAM and kill cc1plus.
@@ -122,7 +123,19 @@ if test -n "$$stale_cache"; then \
 	echo "Recreating only the generated PX4 build directory: $(PX4_BUILD_DIR)"; \
 	rm -rf "$(PX4_BUILD_DIR)"; \
 fi; \
-	cd "$(PX4_DIR)" && exec env PX4_SYS_ID="$(PX4_SYS_ID)" PX4_SIM_MODEL_INSTANCE="$(PX4_SIM_MODEL_INSTANCE)" make "$(PX4_TARGET)" "$(PX4_SIM)" < <(exec tail -f /dev/null)
+	cd "$(PX4_DIR)" && exec env PX4_SYS_ID="$(PX4_SYS_ID)" PX4_UXRCE_DDS_PORT="$(DDS_PORT)" PX4_SIM_MODEL_INSTANCE="$(PX4_SIM_MODEL_INSTANCE)" make "$(PX4_TARGET)" "$(PX4_SIM)" < <(exec tail -f /dev/null)
+endef
+
+define CHECK_DDS_PORT_COMMAND
+if command -v ss >/dev/null 2>&1; then \
+	dds_listener=$$(ss -H -lunp 2>/dev/null | awk '$$4 ~ /:$(DDS_PORT)$$/ {print; exit}'); \
+	if test -n "$$dds_listener"; then \
+		echo "DDS UDP port $(DDS_PORT) is already in use:"; \
+		echo "$$dds_listener"; \
+		echo "Stop the stale MicroXRCEAgent or choose another port, for example: DDS_PORT=8889 make sim"; \
+		exit 1; \
+	fi; \
+fi
 endef
 
 help:
@@ -138,9 +151,9 @@ help:
 	@echo "make stop    - stop SITL/HIL processes started by this Makefile"
 	@echo "make status  - show simulator process status"
 	@echo "make logs    - follow PX4, DDS and ROS logs"
-	@echo "CONTROLLER=mpc|px4_pid selects the External Mode implementation (pid_px4 is accepted as an alias)"
+	@echo "make sim registers MPC Controller and PX4 PID (pid_px4 is accepted as a mission-start alias)"
 	@echo "make external-mode - show manual mode-selection instructions"
-	@echo "make mission-start - trigger mission trajectory execution via ROS 2 service"
+	@echo "make mission-start CONTROLLER=mpc|px4_pid MISSION_PATH=/abs/path/mission.json"
 	@echo "make benchmark     - run side-by-side PID vs MPC log comparison script"
 	@echo ""
 	@echo "Overrides: PX4_DIR=... HIL_DEVICE=/dev/ttyACM0 HIL_BAUD=921600 HIL_RATE_HZ=250 HIL_HEADLESS=0|1"
@@ -276,6 +289,7 @@ px4: check
 
 dds: check
 	@mkdir -p "$(SIM_RUNTIME_DIR)"
+	@$(CHECK_DDS_PORT_COMMAND)
 	@setsid bash -c 'export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; exec "$(DDS_AGENT)" "$(DDS_TRANSPORT)" -p "$(DDS_PORT)"' \
 		>"$(DDS_LOG)" 2>&1 & echo $$! >"$(DDS_PID)"
 	@echo "uXRCE-DDS agent started; log: $(DDS_LOG)"
@@ -330,6 +344,7 @@ sim: check build
 	@if test -f "$(PX4_PID)" || test -f "$(DDS_PID)" || test -f "$(ROS_PID)"; then \
 		 echo "A simulator runtime already exists. Run 'make status' or 'make stop' first."; exit 1; \
 	fi
+	@$(CHECK_DDS_PORT_COMMAND)
 	@setsid env HEADLESS=1 bash -c '$(PX4_START_COMMAND)' \
 		>"$(PX4_LOG)" 2>&1 & echo $$! >"$(PX4_PID)"
 	@setsid bash -c 'export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; exec "$(DDS_AGENT)" "$(DDS_TRANSPORT)" -p "$(DDS_PORT)"' \
@@ -393,7 +408,14 @@ mission-start:
 	@source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; \
 	if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; \
 	if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; \
-	ros2 service call /reference_generator_node/start_mission std_srvs/srv/Trigger {}
+	nodes="$$(ros2 node list)"; \
+	case "$(CONTROLLER_CANONICAL)" in \
+	  mpc) echo "$$nodes" | grep -Fxq /reference_generator_node && echo "$$nodes" | grep -Fxq /mpc_controller_node && echo "$$nodes" | grep -Fxq /px4_attitude_mode_node || { echo "MPC profile is not running; mission unchanged"; exit 3; } ;; \
+	  px4_pid) echo "$$nodes" | grep -Fxq /reference_generator_node && echo "$$nodes" | grep -Fxq /pid_mode_node || { echo "PX4 PID profile is not running; mission unchanged"; exit 3; } ;; \
+	  *) echo "Unsupported CONTROLLER: $(CONTROLLER)"; exit 2 ;; \
+	esac; \
+	if test -n "$(MISSION_PATH)"; then path="$$(realpath -m -- "$(MISSION_PATH)")"; else path=""; fi; \
+	ros2 run mpc_controller runtime_mission_client "$(CONTROLLER_CANONICAL)" "$$path"
 
 arm:
 	@source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; \
@@ -409,7 +431,7 @@ disarm:
 
 external-mode:
 	@echo "No autonomous mode/arm/takeoff command is provided."
-	@echo "Arm and take off manually in a stock PX4 mode; select 'MPC Controller' or 'PX4 PID' matching the launched profile."
+	@echo "Arm and take off manually in a stock PX4 mode; select 'MPC Controller' or 'PX4 PID' before mission-start."
 
 mission-run: external-mode
 	@echo "Start the reference mission separately only after the operator selects MPC Controller."

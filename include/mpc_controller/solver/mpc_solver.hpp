@@ -66,6 +66,16 @@ struct Configuration
   double relative_tolerance = 1.0e-5;
 };
 
+struct Limits
+{
+  double max_speed_xy = 0.0;
+  double max_speed_z = 0.0;
+  double max_acceleration_xy = 0.0;
+  double max_acceleration_z = 0.0;
+  double max_control_rate_xy = 0.0;
+  double max_control_rate_z = 0.0;
+};
+
 struct Result
 {
   bool valid = false;
@@ -83,6 +93,19 @@ struct Result
   double max_predicted_acceleration_xy = 0.0;
   double max_predicted_tilt_rad = 0.0;
   double max_predicted_collective_specific_force_m_s2 = 0.0;
+  double problem_update_seconds = 0.0;
+  double vector_copy_seconds = 0.0;
+  double osqp_data_update_seconds = 0.0;
+  double osqp_settings_update_seconds = 0.0;
+  double warm_start_seconds = 0.0;
+  double warm_start_prepare_seconds = 0.0;
+  double osqp_warm_start_seconds = 0.0;
+  double osqp_solve_seconds = 0.0;
+  double result_postprocess_seconds = 0.0;
+  double remaining_budget_before_osqp_seconds = 0.0;
+  double coupled_solve_cpu_seconds = 0.0;
+  double warm_start_cpu_seconds = 0.0;
+  double osqp_solve_cpu_seconds = 0.0;
   Input first_control = Input::Zero();
   Prediction prediction{};
 };
@@ -100,7 +123,8 @@ public:
   void reset() noexcept;
   Result solve(
     const State &initial_state, const Reference &reference,
-    const Input &last_control, Clock::time_point deadline) noexcept;
+    const Input &last_control, const Limits &limits,
+    Clock::time_point deadline) noexcept;
 
 private:
   class Impl;

@@ -1,8 +1,12 @@
-#include "mpc_controller/mission/mission_json_parser.hpp"
+#include "mpc_controller/mission/controller_profile.hpp"
 #include "mpc_controller/mission/mission_trajectory.hpp"
+#include "mpc_controller/mission/runtime_mission_loader.hpp"
+#include "mpc_controller/msg/mpc_mission_plan.hpp"
+#include "mpc_controller/msg/mpc_mission_waypoint.hpp"
 #include "mpc_controller/msg/reference_trajectory.hpp"
 #include "mpc_controller/msg/trajectory_point.hpp"
 #include "mpc_controller/msg/vehicle_state.hpp"
+#include "mpc_controller/srv/load_and_start_mission.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
@@ -19,17 +23,16 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 class ReferenceGeneratorNode final : public rclcpp::Node {
 public:
   ReferenceGeneratorNode() : Node("reference_generator_node") {
     declareAndGet("frame_id", frame_id_);
-    declareAndGet("mission_file_path", mission_file_path_);
     declareAndGet("mission_acceptance_radius_m", acceptance_radius_m_);
     declareAndGet("mission_speed_override_m_s", speed_override_m_s_);
     declareAndGet("hold_yaw_rad", hold_yaw_rad_);
-    declareAndGet("auto_capture_current_hold", auto_capture_current_hold_);
     declareAndGet("state_timeout_seconds", state_timeout_seconds_);
     declareAndGet("horizon_seconds", horizon_seconds_);
     declareAndGet("sample_period_seconds", sample_period_seconds_);
@@ -41,11 +44,14 @@ public:
     declare_parameter("hold_position", std::vector<double>{0.0, 0.0, 1.0});
     getVectorParameter("hold_position", hold_position_);
 
-    valid_config_ = !frame_id_.empty() && positiveFinite(horizon_seconds_) &&
-                    positiveFinite(sample_period_seconds_) &&
-                    positiveFinite(publish_rate_hz_) &&
-                    positiveFinite(state_timeout_seconds_) &&
-                    horizon_seconds_ >= sample_period_seconds_;
+    valid_config_ =
+        !frame_id_.empty() && positiveFinite(acceptance_radius_m_) &&
+        std::isfinite(speed_override_m_s_) && speed_override_m_s_ >= 0.0 &&
+        positiveFinite(horizon_seconds_) &&
+        positiveFinite(sample_period_seconds_) &&
+        positiveFinite(publish_rate_hz_) &&
+        positiveFinite(state_timeout_seconds_) &&
+        horizon_seconds_ >= sample_period_seconds_;
     if (!valid_config_) {
       RCLCPP_ERROR(
           get_logger(),
@@ -63,8 +69,13 @@ public:
     generator_ =
         std::make_unique<mpc_controller::mission::MissionReferenceGenerator>(
             config);
+    runtime_mission_loader_ =
+        std::make_unique<mpc_controller::mission::RuntimeMissionLoader>(
+            *generator_);
 
     publisher_ = create_publisher<Reference>("reference_trajectory", 10);
+    mpc_plan_publisher_ = create_publisher<MpcPlan>(
+        "mpc_mission_plan", rclcpp::QoS(1).reliable().transient_local());
     mission_completed_publisher_ = create_publisher<std_msgs::msg::Bool>(
         "/reference_generator_node/mission_completed", 10);
     if (visualization_enabled_) {
@@ -78,39 +89,61 @@ public:
         "vehicle_state", qos,
         std::bind(&ReferenceGeneratorNode::stateCallback, this,
                   std::placeholders::_1));
+    const auto mode_state_qos = rclcpp::QoS(1).reliable().transient_local();
+    mpc_mode_state_subscription_ = createModeStateSubscription(
+        mpc_controller::mission::kMpcExternalModeStateTopic,
+        mpc_controller::mission::kMpcController, mode_state_qos);
+    px4_pid_mode_state_subscription_ = createModeStateSubscription(
+        mpc_controller::mission::kPx4PidExternalModeStateTopic,
+        mpc_controller::mission::kPx4PidController, mode_state_qos);
+    load_and_start_mission_service_ =
+        create_service<mpc_controller::srv::LoadAndStartMission>(
+            "~/load_and_start_mission",
+            [this](const mpc_controller::srv::LoadAndStartMission::Request::
+                       SharedPtr request,
+                   mpc_controller::srv::LoadAndStartMission::Response::SharedPtr
+                       response) {
+              const auto result = loadAndStartMission(request->controller,
+                                                      request->mission_path);
+              response->success = result.success;
+              response->message = result.message;
+            });
     start_mission_service_ = create_service<std_srvs::srv::Trigger>(
         "~/start_mission",
         [this](const std_srvs::srv::Trigger::Request::SharedPtr,
                std_srvs::srv::Trigger::Response::SharedPtr response) {
-          response->success = startMission();
-          response->message = response->success
-                                  ? "Mission started"
-                                  : "Mission JSON could not be loaded";
+          response->success = false;
+          response->message =
+              "Use /reference_generator_node/load_and_start_mission with "
+              "the mission path.";
         });
     reset_mission_service_ = create_service<std_srvs::srv::Trigger>(
         "~/reset_mission",
         [this](const std_srvs::srv::Trigger::Request::SharedPtr,
                std_srvs::srv::Trigger::Response::SharedPtr response) {
-          generator_->reset();
+          if (active_controller_ == mpc_controller::mission::kMpcController) {
+            publishMpcPlan(false);
+          }
+          transitionToMeasuredHold("Mission reset");
           response->success = true;
-          response->message = "Mission reset to initial state";
+          response->message = "Mission reset; holding the latest measured pose";
         });
 
-    loadMission();
     const auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::duration<double>(1.0 / std::max(publish_rate_hz_, 1.0)));
     timer_ = create_wall_timer(
         period, std::bind(&ReferenceGeneratorNode::publish, this));
-    RCLCPP_INFO(get_logger(),
-                "Reference generator initialized: mission='%s' waypoints=%zu "
-                "rate=%.1f Hz",
-                mission_file_path_.c_str(), generator_->waypoints().size(),
-                publish_rate_hz_);
+    RCLCPP_INFO(
+        get_logger(),
+        "Reference generator initialized without a mission; rate=%.1f Hz",
+        publish_rate_hz_);
   }
 
 private:
   using Reference = mpc_controller::msg::ReferenceTrajectory;
   using Point = mpc_controller::msg::TrajectoryPoint;
+  using MpcPlan = mpc_controller::msg::MpcMissionPlan;
+  using MpcWaypoint = mpc_controller::msg::MpcMissionWaypoint;
   using State = mpc_controller::msg::VehicleState;
   using SteadyClock = std::chrono::steady_clock;
 
@@ -146,37 +179,158 @@ private:
     return duration;
   }
 
-  bool loadMission() {
-    if (mission_file_path_.empty()) {
-      RCLCPP_ERROR(get_logger(), "Mission file path is empty");
-      return false;
+  mpc_controller::mission::RuntimeMissionLoader::Result
+  loadAndStartMission(const std::string &controller,
+                      const std::string &mission_path) {
+    if (!mpc_controller::mission::isKnownController(controller)) {
+      return rejectMissionStart("unsupported controller: " + controller);
     }
-    const auto mission = mission_source_.load(mission_file_path_);
-    std::string error;
-    if (!generator_->setMission(mission, error)) {
-      RCLCPP_ERROR(get_logger(), "Failed to load mission JSON '%s': %s",
-                   mission_file_path_.c_str(), error.c_str());
-      return false;
+    if (active_controller_ != controller) {
+      return rejectMissionStart("requested controller is not the active "
+                                "PX4 External Mode");
     }
-    RCLCPP_INFO(get_logger(), "Loaded %zu mission waypoints from '%s'",
-                generator_->waypoints().size(), mission_file_path_.c_str());
-    return true;
-  }
 
-  bool startMission() {
-    if (generator_->waypoints().empty() && !loadMission()) {
-      return false;
+    if (controller == mpc_controller::mission::kMpcController) {
+      publishMpcPlan(false);
     }
-    if (!generator_->start(steadySeconds())) {
-      return false;
+
+    // A request addressed to the active mode always replaces the previous
+    // trajectory. Readiness and mission-validation failures therefore end in
+    // measured-position hold, never the old trajectory.
+    transitionToMeasuredHold("Mission replacement requested");
+    if (!hasFreshControlReadyState()) {
+      return rejectMissionStart(
+          "fresh control-ready vehicle state is unavailable");
+    }
+    const auto result =
+        runtime_mission_loader_->loadAndStart(mission_path, steadySeconds());
+    if (!result.success) {
+      transitionToMeasuredHold("Mission request rejected");
+      RCLCPP_ERROR(get_logger(), "Mission request rejected: %s",
+                   result.message.c_str());
+      return result;
     }
     const auto &target = generator_->waypoints().front();
+    if (controller == mpc_controller::mission::kMpcController) {
+      publishMpcPlan(true);
+      generator_->reset();
+    }
     RCLCPP_INFO(
         get_logger(),
         "Mission started: %zu waypoints, target='%s' [%.2f, %.2f, %.2f]",
         generator_->waypoints().size(), target.id.c_str(), target.position[0],
         target.position[1], target.position[2]);
-    return true;
+    return result;
+  }
+
+  mpc_controller::mission::RuntimeMissionLoader::Result
+  rejectMissionStart(const std::string &message) {
+    RCLCPP_ERROR(get_logger(), "Mission request rejected: %s", message.c_str());
+    return {false, message};
+  }
+
+  bool hasFreshControlReadyState() const {
+    return last_state_received_at_ && last_state_control_ready_ &&
+           std::chrono::duration<double>(SteadyClock::now() -
+                                         *last_state_received_at_)
+                   .count() <= state_timeout_seconds_;
+  }
+
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr
+  createModeStateSubscription(std::string_view topic,
+                              std::string_view controller,
+                              const rclcpp::QoS &qos) {
+    return create_subscription<std_msgs::msg::Bool>(
+        topic.data(), qos,
+        [this, controller](const std_msgs::msg::Bool::SharedPtr message) {
+          if (message) {
+            externalModeStateCallback(controller, message->data);
+          }
+        });
+  }
+
+  void externalModeStateCallback(std::string_view controller, bool active) {
+    if (active) {
+      if (active_controller_ == controller) {
+        return;
+      }
+      active_controller_ = controller;
+      transitionToMeasuredHold("External Mode activation");
+      return;
+    }
+    if (active_controller_ != controller) {
+      return;
+    }
+    if (controller == mpc_controller::mission::kMpcController) {
+      publishMpcPlan(false);
+    }
+    active_controller_.clear();
+    transitionToMeasuredHold("External Mode deactivation");
+  }
+
+  void transitionToMeasuredHold(const char *reason) {
+    runtime_mission_loader_->abortToHold();
+    pending_hold_capture_ = true;
+    hold_reference_captured_ = false;
+    captureHoldIfFresh();
+    RCLCPP_INFO(get_logger(), "%s; waiting for measured-position hold", reason);
+  }
+
+  static uint8_t mpcItemType(mpc_controller::mission::ItemType type) {
+    switch (type) {
+    case mpc_controller::mission::ItemType::Takeoff:
+      return MpcWaypoint::TAKEOFF;
+    case mpc_controller::mission::ItemType::Land:
+      return MpcWaypoint::LAND;
+    case mpc_controller::mission::ItemType::Rtl:
+      return MpcWaypoint::RTL;
+    default:
+      return MpcWaypoint::WAYPOINT;
+    }
+  }
+
+  void publishMpcPlan(bool active) {
+    if (!mpc_plan_publisher_) {
+      return;
+    }
+    MpcPlan plan;
+    plan.header.stamp = get_clock()->now();
+    plan.header.frame_id = frame_id_;
+    plan.mission_id = mpc_plan_id_++;
+    plan.active = active;
+    if (active && generator_) {
+      const auto &waypoints = generator_->waypoints();
+      plan.waypoints.reserve(waypoints.size());
+      for (const auto &source : waypoints) {
+        MpcWaypoint target;
+        target.id = source.id;
+        target.item_type = mpcItemType(source.type);
+        target.position = source.position;
+        target.acceptance_radius_m =
+            source.type == mpc_controller::mission::ItemType::Land
+                ? 0.35
+                : acceptance_radius_m_;
+        target.hold_duration_s = source.hold_duration_s;
+        target.horizontal_speed_m_s = source.horizontal_speed;
+        target.vertical_speed_m_s = source.vertical_speed;
+        target.heading_rad = source.heading_rad;
+        target.max_heading_rate_rad_s = source.max_heading_rate_rad_s;
+        target.maximum_acceleration_m_s2 = source.maximum_acceleration_m_s2;
+        target.maximum_jerk_m_s3 = source.maximum_jerk_m_s3;
+        plan.waypoints.push_back(std::move(target));
+      }
+    }
+    mpc_plan_publisher_->publish(plan);
+  }
+
+  void captureHoldIfFresh() {
+    if (!pending_hold_capture_ || !hasFreshControlReadyState()) {
+      return;
+    }
+    generator_->captureHoldFromVehicle();
+    pending_hold_capture_ = false;
+    hold_reference_captured_ = true;
+    RCLCPP_INFO(get_logger(), "Measured hold captured");
   }
 
   void stateCallback(const State::SharedPtr message) {
@@ -188,16 +342,16 @@ private:
                       message->velocity[2]};
     state.yaw = message->yaw;
     state.valid = message->control_ready;
+    last_state_control_ready_ = state.valid;
     generator_->updateVehicleState(state);
 
-    if (auto_capture_current_hold_ && !hold_reference_captured_ &&
-        state.valid) {
+    // Before the PX4 External Mode is selected, continuously follow the
+    // admitted vehicle pose. Activation freezes that already-current target.
+    if (state.valid && active_controller_.empty()) {
       generator_->captureHoldFromVehicle();
       hold_reference_captured_ = true;
-      RCLCPP_INFO(get_logger(),
-                  "Initial hold captured: [%.3f, %.3f, %.3f], yaw=%.3f rad",
-                  state.position[0], state.position[1], state.position[2],
-                  state.yaw);
+    } else if (state.valid && pending_hold_capture_) {
+      captureHoldIfFresh();
     }
   }
 
@@ -228,7 +382,7 @@ private:
       completed.data = true;
       mission_completed_publisher_->publish(completed);
       RCLCPP_INFO(get_logger(),
-                  "Mission completed; handing off to native landing");
+                  "Mission completed; holding the final mission position");
     }
 
     Reference message;
@@ -337,11 +491,11 @@ private:
     visualization_publisher_->publish(markers);
   }
 
-  mpc_controller::mission::MissionJsonParser mission_source_;
   std::unique_ptr<mpc_controller::mission::MissionReferenceGenerator>
       generator_;
+  std::unique_ptr<mpc_controller::mission::RuntimeMissionLoader>
+      runtime_mission_loader_;
   std::array<double, 3> hold_position_{0.0, 0.0, 1.0};
-  std::string mission_file_path_{"config/missions/benchmark_square.json"};
   std::string frame_id_{"map"};
   double hold_yaw_rad_ = 0.0;
   double acceptance_radius_m_ = 2.5;
@@ -350,21 +504,31 @@ private:
   double sample_period_seconds_ = 0.1;
   double publish_rate_hz_ = 50.0;
   double state_timeout_seconds_ = 0.25;
-  bool auto_capture_current_hold_ = true;
   bool hold_reference_captured_ = false;
+  bool pending_hold_capture_ = false;
+  std::string active_controller_;
+  bool last_state_control_ready_ = false;
   bool visualization_enabled_ = true;
   double visualization_publish_rate_hz_ = 20.0;
   bool valid_config_ = false;
   uint64_t trajectory_id_ = 1;
+  uint64_t mpc_plan_id_ = 1;
   std::optional<Reference> last_reference_;
   std::optional<SteadyClock::time_point> last_state_received_at_;
   std::optional<SteadyClock::time_point> last_visualization_published_at_;
   rclcpp::Publisher<Reference>::SharedPtr publisher_;
+  rclcpp::Publisher<MpcPlan>::SharedPtr mpc_plan_publisher_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr
       mission_completed_publisher_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       visualization_publisher_;
   rclcpp::Subscription<State>::SharedPtr state_subscription_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr
+      mpc_mode_state_subscription_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr
+      px4_pid_mode_state_subscription_;
+  rclcpp::Service<mpc_controller::srv::LoadAndStartMission>::SharedPtr
+      load_and_start_mission_service_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr start_mission_service_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_mission_service_;
   rclcpp::TimerBase::SharedPtr timer_;

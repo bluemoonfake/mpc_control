@@ -1,0 +1,5 @@
+string controller
+string mission_path
+---
+bool success
+string message

@@ -1,11 +1,43 @@
 #include "mpc_controller/mission/mission_json_parser.hpp"
 
+#include <cmath>
 #include <fstream>
 #include <string>
 
 #include <nlohmann/json.hpp>
 
 namespace mpc_controller::mission {
+
+namespace {
+
+bool readFinite(const nlohmann::json &object, const char *name, double &output,
+                bool allow_zero, std::string &error) {
+  if (!object.contains(name)) {
+    return true;
+  }
+  output = object.at(name).get<double>();
+  if (std::isfinite(output) && (allow_zero ? output >= 0.0 : output > 0.0)) {
+    return true;
+  }
+  error = std::string(name) + " must be finite and " +
+          (allow_zero ? "non-negative" : "positive");
+  return false;
+}
+
+bool readTpmc(const nlohmann::json &object, double &acceleration, double &jerk,
+              std::string &error) {
+  if (!object.contains("tpmc"))
+    return true;
+  const auto &tpmc = object.at("tpmc");
+  if (!tpmc.is_object()) {
+    error = "tpmc must be an object";
+    return false;
+  }
+  return readFinite(tpmc, "maximumAcceleration", acceleration, false, error) &&
+         readFinite(tpmc, "maximumJerk", jerk, false, error);
+}
+
+} // namespace
 
 Mission MissionJsonParser::load(const std::string &source) const {
   Mission parsed_mission;
@@ -37,17 +69,20 @@ Mission MissionJsonParser::load(const std::string &source) const {
     if (mission_json.contains("defaults") &&
         mission_json["defaults"].is_object()) {
       const auto &defaults_json = mission_json["defaults"];
-      if (defaults_json.contains("horizontalVelocity")) {
-        parsed_mission.defaults.horizontal_velocity_m_s =
-            defaults_json["horizontalVelocity"].get<double>();
-      }
-      if (defaults_json.contains("verticalVelocity")) {
-        parsed_mission.defaults.vertical_velocity_m_s =
-            defaults_json["verticalVelocity"].get<double>();
-      }
-      if (defaults_json.contains("maxHeadingRate")) {
-        parsed_mission.defaults.max_heading_rate_deg_s =
-            defaults_json["maxHeadingRate"].get<double>();
+      if (!readFinite(defaults_json, "horizontalVelocity",
+                      parsed_mission.defaults.horizontal_velocity_m_s, false,
+                      parsed_mission.error) ||
+          !readFinite(defaults_json, "verticalVelocity",
+                      parsed_mission.defaults.vertical_velocity_m_s, false,
+                      parsed_mission.error) ||
+          !readFinite(defaults_json, "maxHeadingRate",
+                      parsed_mission.defaults.max_heading_rate_deg_s, false,
+                      parsed_mission.error) ||
+          !readTpmc(defaults_json,
+                    parsed_mission.defaults.maximum_acceleration_m_s2,
+                    parsed_mission.defaults.maximum_jerk_m_s3,
+                    parsed_mission.error)) {
+        return parsed_mission;
       }
     }
 
@@ -81,20 +116,26 @@ Mission MissionJsonParser::load(const std::string &source) const {
       } else if (type == "hold") {
         item.type = ItemType::Hold;
         item.hold.duration_seconds = item_json.value("duration", 2.0);
+        if (!std::isfinite(item.hold.duration_seconds) ||
+            item.hold.duration_seconds < 0.0) {
+          parsed_mission.error = "duration must be finite and non-negative";
+          return parsed_mission;
+        }
       } else if (type == "changeSettings") {
         item.type = ItemType::ChangeSettings;
         item.settings.reset_all = item_json.value("resetAll", false);
-        if (item_json.contains("horizontalVelocity")) {
-          item.settings.horizontal_velocity_m_s =
-              item_json["horizontalVelocity"].get<double>();
-        }
-        if (item_json.contains("verticalVelocity")) {
-          item.settings.vertical_velocity_m_s =
-              item_json["verticalVelocity"].get<double>();
-        }
-        if (item_json.contains("maxHeadingRate")) {
-          item.settings.max_heading_rate_deg_s =
-              item_json["maxHeadingRate"].get<double>();
+        if (!readFinite(item_json, "horizontalVelocity",
+                        item.settings.horizontal_velocity_m_s, false,
+                        parsed_mission.error) ||
+            !readFinite(item_json, "verticalVelocity",
+                        item.settings.vertical_velocity_m_s, false,
+                        parsed_mission.error) ||
+            !readFinite(item_json, "maxHeadingRate",
+                        item.settings.max_heading_rate_deg_s, false,
+                        parsed_mission.error) ||
+            !readTpmc(item_json, item.settings.maximum_acceleration_m_s2,
+                      item.settings.maximum_jerk_m_s3, parsed_mission.error)) {
+          return parsed_mission;
         }
       } else if (type == "land") {
         item.type = ItemType::Land;
