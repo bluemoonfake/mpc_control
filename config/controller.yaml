@@ -1,13 +1,24 @@
 reference_generator_node:
   ros__parameters:
     mission_acceptance_radius_m: 2.5
+    mission_acceptance_speed_m_s: 2.0
     mission_speed_override_m_s: 0.0
     frame_id: map
     hold_yaw_rad: 0.0
     state_timeout_seconds: 0.25
-    horizon_seconds: 30.0
+    # Planner/reference preview horizon; independent of the 30-stage MPC prediction horizon below.
+    horizon_seconds: 10.0
     sample_period_seconds: 0.1
-    publish_rate_hz: 50.0
+    # Planner envelope mirrors the current MPC envelope.
+    planner_max_speed_xy_m_s: 18.0
+    planner_max_speed_z_m_s: 1.5
+    planner_max_acceleration_xy_m_s2: 10.0
+    # PX4 V6X snapshot allows 8.0 m/s^2 up and 3.0 m/s^2 down; use the
+    # conservative common bound for the symmetric planner interface.
+    planner_max_acceleration_z_m_s2: 10.0
+    planner_max_jerk_xy_m_s3: 12.0
+    planner_max_jerk_z_m_s3: 6.0
+    publish_rate_hz: 100.0
     # RViz visualization markers.
     visualization_enabled: true
     visualization_publish_rate_hz: 20.0
@@ -16,33 +27,26 @@ vehicle_state_bridge_node:
   ros__parameters:
     state_timeout_seconds: 0.25
     max_sample_skew_seconds: 0.10
-    publish_rate_hz: 50.0
+    publish_rate_hz: 100.0
 
 mpc_controller_node:
   ros__parameters:
-    update_rate_hz: 50.0
+    update_rate_hz: 100.0
     strict_validation: false
     reference_timeout_seconds: 1.5
     state_timeout_seconds: 0.25
-    # A waypoint is eligible to advance only after this measured total speed.
-    waypoint_acceptance_speed_m_s: 2.0
-    # Diagnostic A/B switch; baseline keeps the shifted solver warm start.
-    cold_start_on_waypoint_transition: false
-    # Short first prediction knot remains independent of the 50 Hz callback.
+    # MPC grid: 30 stages; first knot 0.01 s, later knots 0.10 s;
+    # independent of the 100 Hz solve loop.
     dt_first: 0.01
-    dt_later: 0.20
-    # Whole X/Y/Z solve must finish before the 20 ms controller period.
-    solver_deadline_seconds: 0.018
-    max_iterations: 400
+    dt_later: 0.1
+    # Target budget with margin inside the 10 ms control period; validate on
+    # the target host before enabling flight experiments.
+    solver_deadline_seconds: 0.0094
+    # HPIPM has no wall-clock cancellation; cap IPM iterations before SITL.
+    max_iterations: 50
     # Identified acceleration-response lag (effective delay of PX4 Attitude cascade).
     model_time_constant_xyz: [0.25, 0.25, 0.08]
-    # ADMM solver settings.
-    admm_rho: 0.05
-    coupled_admm_rho: 0.05
-    solver_absolute_tolerance: 0.0003
-    solver_relative_tolerance: 0.001
     # coupled: one 3D QP owns the command.
-    controller_backend: coupled
     # Stage and terminal weights ordered [position, velocity, acceleration].
     # Near-aperiodic damping: Q_vel/Q_pos ~7 kills lateral velocity before line-crossing.
     q_xy: [80.0, 550.0, 2.0]
@@ -50,7 +54,7 @@ mpc_controller_node:
     q_z: [200.0, 350.0, 2.0]
     s_z: [300.0, 400.0, 4.0]
     # Penalize control rate (jerk) to damp attitude oscillations and ensure smooth tilting.
-    control_weight_xy: 1.5
+    control_weight_xy: 8.0
     control_rate_weight_xy: 40.0
     control_weight_z: 4.0
     control_rate_weight_z: 10.0
@@ -59,38 +63,31 @@ mpc_controller_node:
     # maximum 16.56 m/s^2 collective specific force: at 35 deg tilt the
     # lateral physical capability is 6.87 m/s^2, so 6.0 m/s^2 is retained as
     # a bounded tracking command.  This is not a hardware flight envelope.
-    max_speed_xy: 18.0
-    max_acceleration_xy: 6.0
-    max_control_xy: 6.0
+    # Reduced QP profile: six-sided XY polygons; predicted-acceleration rows
+    # are removed. Hard command-rate rows remain active over all 30 stages;
+    # command/velocity/tilt/thrust and recovery caps remain active throughout.
+    max_speed_xy: 30.0
+    max_acceleration_xy: 10.0  # mission limit tightens the QP command envelope
+    max_control_xy: 10.0
     # Provisional jerk limit for the external-attitude path; validate with
     # actuator saturation and attitude-response SITL data before raising it.
     max_control_rate_xy: 8.0
+    # Symmetric Z limits use the conservative PX4 down direction bounds.
     max_speed_z: 3.0
-    max_acceleration_z: 5.0
+    max_acceleration_z: 3.0  # mission limit tightens the QP command envelope
     max_measured_acceleration_z_m_s2: 10.0
     max_control_z: 3.0
     max_control_rate_z: 4.0
-    # Coupled-QP physical envelope.
     min_collective_specific_force_m_s2: 1.0
     max_collective_specific_force_m_s2: 16.0
-    constraint_slack_weight: 10000.0
-    max_constraint_slack: 20.0
-    # Bounded command used only while MPC is invalid or misses its deadline.
+    # Bounded command used only while MPC is invalid
     recovery_velocity_gain: 1.0
     recovery_position_gain_z: 0.5
     recovery_max_acceleration_xy: 2.5
     recovery_max_acceleration_z: 1.5
-    # Hard translational-force tilt limit: 35 degrees.
-    max_tilt: 0.6108652381980153
+    max_tilt: 0.785398  # 45 degrees
 
 pid_mode_node:
   ros__parameters:
     frame_id: map
     reference_timeout_seconds: 1.5
-
-px4_attitude_mode_node:
-  ros__parameters:
-    # Thrust mapping coefficients: specific force [m/s^2] -> normalized thrust [0..1]
-    # hover_thrust: hover normalized thrust in PX4 (~0.59 for x500)
-    hover_thrust: 0.59
-    gravity_m_s2: 9.80665

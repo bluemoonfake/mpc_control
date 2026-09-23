@@ -19,13 +19,6 @@ def generate_launch_description():
         ),
         Node(
             package="mpc_controller",
-            executable="vehicle_state_bridge_node",
-            name="vehicle_state_bridge_node",
-            parameters=[controller_config],
-            output="screen",
-        ),
-        Node(
-            package="mpc_controller",
             executable="mpc_controller_node",
             name="mpc_controller_node",
             parameters=[controller_config],

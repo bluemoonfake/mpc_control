@@ -2,7 +2,7 @@ std_msgs/Header header
 uint64 trajectory_id
 uint64 sequence
 
-# Current feedback state used as x0=[p,v,a] by the selected backend.
+# Current feedback state used as x0=[p,v,a] by HPIPM.
 # XY acceleration is the model-consistent observer estimate; Z is measured.
 float64[3] measured_position
 float64[3] measured_velocity
@@ -12,35 +12,14 @@ float64[3] sampled_reference_position
 float64[3] sampled_reference_velocity
 float64[3] sampled_reference_acceleration
 
-# Direct waypoint-MPC diagnostics. Defaults are used for legacy reference mode.
-bool direct_waypoint_mode
-uint64 mission_id
-uint32 active_waypoint_index
-uint32 active_waypoint_count
-float64[3] active_target_position
-float64 active_max_speed_xy
-float64 active_max_speed_z
-float64 active_max_acceleration_xy
-float64 active_max_acceleration_z
-float64 active_max_control_rate_xy
-float64 active_max_control_rate_z
-
 # Optimizer input u0 for X/Y/Z.
 float64[3] control_input
 # First predicted physical acceleration state a[k+1]. Diagnostic only.
 float64[3] first_predicted_acceleration
 # QP prediction:
-# [step][axis][p,v,a], 26 * 3 * 3 values.
+# [step][axis][p,v,a], 30 * 3 * 3 values.
 float64[] predicted_states
-# Legacy per-axis diagnostics ordered X/Y/Z; retained for shadow comparison.
-int32[3] solver_iterations
-uint8[3] solver_status
-float64[3] solver_primal_residual
-float64[3] solver_dual_residual
-float64[3] solver_primal_tolerance
-float64[3] solver_dual_tolerance
-bool[3] recovery_constraint_active
-# Coupled 3D QP diagnostics. In shadow mode the legacy command remains active.
+# Coupled 3D QP diagnostics for the authoritative command.
 bool coupled_solver_ran
 bool coupled_solver_valid
 bool coupled_control_active
@@ -50,8 +29,6 @@ float64 coupled_primal_residual
 float64 coupled_dual_residual
 float64 coupled_primal_tolerance
 float64 coupled_dual_tolerance
-float64 coupled_velocity_slack
-float64 coupled_acceleration_slack
 float64 coupled_max_constraint_violation
 float64 coupled_max_speed_xy
 float64 coupled_max_acceleration_xy
@@ -60,21 +37,14 @@ float64 coupled_max_collective_specific_force_m_s2
 float64 coupled_solve_time_seconds
 float64 problem_update_seconds
 float64 vector_copy_seconds
-float64 osqp_data_update_seconds
-float64 osqp_settings_update_seconds
 float64 warm_start_seconds
 float64 warm_start_prepare_seconds
-float64 osqp_warm_start_seconds
-float64 osqp_solve_seconds
+float64 solve_seconds
 float64 result_postprocess_seconds
-float64 remaining_budget_before_osqp_seconds
+float64 remaining_budget_seconds
 float64 coupled_solve_cpu_seconds
 float64 warm_start_cpu_seconds
-float64 osqp_solve_cpu_seconds
-float64 shadow_control_difference_norm
-uint32 shadow_admission_samples
-bool shadow_admission_ready
-uint8 active_backend
+float64 solve_cpu_seconds
 float64 solve_time_seconds
 float64 callback_period_seconds
 float64 callback_period_jitter_seconds
@@ -93,7 +63,3 @@ uint8 SOLVER_DEADLINE_EXCEEDED=4
 uint8 SOLVER_MAX_ITERATIONS=5
 uint8 SOLVER_NON_FINITE_OUTPUT=6
 uint8 SOLVER_OUTPUT_LIMIT=7
-
-uint8 BACKEND_LEGACY=0
-uint8 BACKEND_COUPLED_SHADOW=1
-uint8 BACKEND_COUPLED=2

@@ -1,99 +1,82 @@
 {
   "version": 1,
   "mission": {
+    "description": "Sharp zigzag: consecutive 120-150 deg turns at high speed to stress-test turn_factor and jerk limits",
     "defaults": {
       "horizontalVelocity": 12.0,
       "verticalVelocity": 2.0,
       "maxHeadingRate": 90,
       "tpmc": {
-        "maximumAcceleration": 4.0,
+        "maximumAcceleration": 5.0,
         "maximumJerk": 8.0
       }
     },
-    "description": "Benchmark Urban Canyon: Constrained narrow corridor with 90-deg chicanes and U-turn obstacle bypass",
     "items": [
+      {"id": "takeoff", "type": "takeoff", "z": 10.0},
       {
-        "id": "takeoff",
-        "type": "takeoff",
-        "z": 10.0
-      },
-      {
-        "id": "wp1_entry",
+        "id": "wp_start",
         "type": "navigation",
         "navigationType": "waypoint",
         "frame": "local",
-        "x": 0.0,
-        "y": 0.0,
-        "z": 10.0
+        "x": 0.0, "y": 0.0, "z": 10.0
       },
       {
-        "id": "wp2_canyon_run",
+        "id": "zag1_right",
         "type": "navigation",
         "navigationType": "waypoint",
         "frame": "local",
-        "x": 35.0,
-        "y": 0.0,
-        "z": 10.0
+        "x": 12.0, "y": 10.0, "z": 10.0
       },
       {
-        "id": "wp3_chicane_turn1",
+        "id": "zig1_left",
         "type": "navigation",
         "navigationType": "waypoint",
         "frame": "local",
-        "x": 35.0,
-        "y": 20.0,
-        "z": 12.0
+        "x": 24.0, "y": -10.0, "z": 11.0
       },
       {
-        "id": "wp4_chicane_reverse",
+        "id": "zag2_right",
         "type": "navigation",
         "navigationType": "waypoint",
         "frame": "local",
-        "x": 15.0,
-        "y": 20.0,
-        "z": 12.0
+        "x": 36.0, "y": 10.0, "z": 10.0
       },
       {
-        "id": "wp5_chicane_climb",
+        "id": "zig2_left",
         "type": "navigation",
         "navigationType": "waypoint",
         "frame": "local",
-        "x": 15.0,
-        "y": 40.0,
-        "z": 15.0
+        "x": 48.0, "y": -10.0, "z": 11.0
       },
       {
-        "id": "wp6_u_turn_apex",
+        "id": "zag3_right",
         "type": "navigation",
         "navigationType": "waypoint",
         "frame": "local",
-        "x": -10.0,
-        "y": 40.0,
-        "z": 15.0
+        "x": 60.0, "y": 10.0, "z": 10.0
       },
       {
-        "id": "wp7_return_corridor",
+        "id": "zig3_left",
         "type": "navigation",
         "navigationType": "waypoint",
         "frame": "local",
-        "x": -10.0,
-        "y": 0.0,
-        "z": 10.0
+        "x": 72.0, "y": -10.0, "z": 11.0
       },
       {
-        "id": "wp8_home",
+        "id": "wp_end",
         "type": "navigation",
         "navigationType": "waypoint",
         "frame": "local",
-        "x": 0.0,
-        "y": 0.0,
-        "z": 10.0
+        "x": 84.0, "y": 0.0, "z": 10.0
       },
       {
-        "id": "hold_5s",
-        "type": "hold",
-        "duration": 5.0
-      }
+        "id": "return_home",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0, "y": 0.0, "z": 10.0
+      },
+      {"id": "hold_end", "type": "hold", "duration": 5.0}
     ]
   }
 }

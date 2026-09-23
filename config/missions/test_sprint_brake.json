@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "mission": {
+    "description": "Sprint-brake: max speed 100m straight, hard stop, then 180-deg U-turn return — tests acceleration/jerk saturation and turn_factor=0 at reversal",
+    "defaults": {
+      "horizontalVelocity": 18.0,
+      "verticalVelocity": 2.0,
+      "maxHeadingRate": 90,
+      "tpmc": {
+        "maximumAcceleration": 6.0,
+        "maximumJerk": 8.0
+      }
+    },
+    "items": [
+      {"id": "takeoff", "type": "takeoff", "z": 10.0},
+      {
+        "id": "launch_point",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0, "y": 0.0, "z": 10.0
+      },
+      {"id": "hold_ready_2s", "type": "hold", "duration": 2.0},
+      {
+        "id": "sprint_end_100m",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 100.0, "y": 0.0, "z": 10.0
+      },
+      {"id": "hard_brake_5s", "type": "hold", "duration": 5.0},
+      {
+        "id": "uturn_offset",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 100.0, "y": 5.0, "z": 10.0
+      },
+      {
+        "id": "return_sprint",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0, "y": 5.0, "z": 10.0
+      },
+      {
+        "id": "final_home",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0, "y": 0.0, "z": 10.0
+      },
+      {"id": "hold_end", "type": "hold", "duration": 5.0}
+    ]
+  }
+}

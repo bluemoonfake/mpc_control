@@ -1,4 +1,4 @@
-#include "mpc_controller/mission/mission_json_parser.hpp"
+#include "mpc_controller/domain/mission/loader.hpp"
 
 #include <gtest/gtest.h>
 

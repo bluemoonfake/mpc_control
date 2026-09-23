@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "mission": {
+    "description": "Precision hover box: 3x3m square at low speed with 3s hold at each vertex — tests position hold stability and slow-speed tracking",
+    "defaults": {
+      "horizontalVelocity": 1.0,
+      "verticalVelocity": 0.5,
+      "maxHeadingRate": 30,
+      "tpmc": {
+        "maximumAcceleration": 2.0,
+        "maximumJerk": 3.0
+      }
+    },
+    "items": [
+      {"id": "takeoff", "type": "takeoff", "z": 5.0},
+      {
+        "id": "box_sw",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0, "y": 0.0, "z": 5.0
+      },
+      {"id": "hold_sw", "type": "hold", "duration": 3.0},
+      {
+        "id": "box_se",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 3.0, "y": 0.0, "z": 5.0
+      },
+      {"id": "hold_se", "type": "hold", "duration": 3.0},
+      {
+        "id": "box_ne",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 3.0, "y": 3.0, "z": 5.0
+      },
+      {"id": "hold_ne", "type": "hold", "duration": 3.0},
+      {
+        "id": "box_nw",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0, "y": 3.0, "z": 5.0
+      },
+      {"id": "hold_nw", "type": "hold", "duration": 3.0},
+      {
+        "id": "box_return",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0, "y": 0.0, "z": 5.0
+      },
+      {"id": "hold_end", "type": "hold", "duration": 5.0}
+    ]
+  }
+}

@@ -1,4 +1,10 @@
 std_msgs/Header header
 uint64 trajectory_id
 bool hold_after_end
+float64 max_speed_xy
+float64 max_speed_z
+float64 max_acceleration_xy
+float64 max_acceleration_z
+float64 max_control_rate_xy
+float64 max_control_rate_z
 TrajectoryPoint[] points

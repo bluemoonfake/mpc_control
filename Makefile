@@ -27,12 +27,18 @@ HIL_DEVICE ?=
 HIL_BAUD ?= 921600
 HIL_RATE_HZ ?= 250
 HIL_HEADLESS ?= 0
+
+# Set HEADLESS=1 to skip launching the Gazebo GUI client during `make sim`.
+HEADLESS ?= 0
 HIL_CONFIG := $(PX4_DIR)/boards/px4/fmu-v6x/default.px4board
 JMAVSIM_RUNNER := $(PX4_DIR)/Tools/simulation/jmavsim/jmavsim_run.sh
 
 DDS_AGENT ?= MicroXRCEAgent
 DDS_TRANSPORT ?= udp4
-DDS_PORT ?= 8888
+# 8888 may be occupied by a stale system MicroXRCEAgent on the host.
+# Keep the simulator self-contained on the known-good project port; callers
+# can still override it with DDS_PORT=... when integrating with another PX4.
+DDS_PORT ?= 8889
 # PX4 may rebuild before its uXRCE client can announce DDS topics.  More
 # importantly, NodeWithMode::doRegister() requires an actual VehicleStatus
 # sample (not merely a discovered DDS endpoint). Gate ROS on the endpoint and
@@ -70,6 +76,11 @@ ROS_PID := $(SIM_RUNTIME_DIR)/ros.pid
 ROS_LOCK := $(SIM_RUNTIME_DIR)/ros.lock
 GZ_GUI_PID := $(SIM_RUNTIME_DIR)/gazebo_gui.pid
 HIL_PID := $(SIM_RUNTIME_DIR)/jmavsim_hil.pid
+TELEMETRY_LOG ?= $(SIM_RUNTIME_DIR)/flight_telemetry.csv
+RECORDER_PID := $(SIM_RUNTIME_DIR)/recorder.pid
+RECORDER_LOG := $(SIM_RUNTIME_DIR)/recorder.log
+SIM_METRICS ?= 1
+
 
 # The VS Code Snap exports GTK paths pointing at its bundled glibc.  Gazebo's
 # Qt GUI must not inherit those paths, otherwise libpthread/glibc symbols can
@@ -111,7 +122,7 @@ endef
 .PHONY: help check check-build check-hil-tools check-hil-firmware-config \
 	check-hil-device hil-check hil-config hil-firmware hil-upload jmavsim \
 	_jmavsim-start hil hil-stop build px4 dds ros external-mode mission-run \
-	gui sim stop status logs
+	gui sim stop status logs record-start record-stop plot
 
 define PX4_START_COMMAND
 stale_cache=$$(find "$(PX4_BUILD_DIR)" -type f -name CMakeCache.txt -print 2>/dev/null | while IFS= read -r cache; do \
@@ -132,7 +143,7 @@ if command -v ss >/dev/null 2>&1; then \
 	if test -n "$$dds_listener"; then \
 		echo "DDS UDP port $(DDS_PORT) is already in use:"; \
 		echo "$$dds_listener"; \
-		echo "Stop the stale MicroXRCEAgent or choose another port, for example: DDS_PORT=8889 make sim"; \
+		echo "Stop the stale MicroXRCEAgent or choose another port, for example: DDS_PORT=8888 make sim"; \
 		exit 1; \
 	fi; \
 fi
@@ -151,6 +162,7 @@ help:
 	@echo "make stop    - stop SITL/HIL processes started by this Makefile"
 	@echo "make status  - show simulator process status"
 	@echo "make logs    - follow PX4, DDS and ROS logs"
+	@echo "make plot    - export trajectory and torque/thrust plots from latest flight to figure/"
 	@echo "make sim registers MPC Controller and PX4 PID (pid_px4 is accepted as a mission-start alias)"
 	@echo "make external-mode - show manual mode-selection instructions"
 	@echo "make mission-start CONTROLLER=mpc|px4_pid MISSION_PATH=/abs/path/mission.json"
@@ -352,7 +364,10 @@ sim: check build
 	@source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; \
 		ready=0; \
 		for attempt in $$(seq 1 "$(PX4_DDS_READY_TIMEOUT_SECONDS)"); do \
-			if ros2 topic list 2>/dev/null | grep -qx "$(PX4_FMU_READY_TOPIC)"; then ready=1; break; fi; \
+			if ros2 topic list --no-daemon 2>/dev/null | grep -qx "$(PX4_FMU_READY_TOPIC)"; then ready=1; break; fi; \
+			if [ $$((attempt % 5)) -eq 0 ]; then \
+				echo "Waiting for PX4 DDS endpoint $(PX4_FMU_READY_TOPIC)... ($${attempt}/$(PX4_DDS_READY_TIMEOUT_SECONDS)s)"; \
+			fi; \
 			sleep 1; \
 		done; \
 		if test "$$ready" -ne 1; then \
@@ -363,7 +378,16 @@ sim: check build
 		sleep "$(PX4_FMU_SETTLE_SECONDS)"
 	@setsid bash -c 'exec 9>"$(ROS_LOCK)"; if ! flock -n 9; then echo "Another MPC ROS 2 pipeline already holds $(ROS_LOCK)"; exit 75; fi; echo $$$$ >"$(ROS_PID)"; source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; exec ros2 launch "$(ROS_PACKAGE)" "$(ROS_LAUNCH)" $(ROS_LAUNCH_ARGS)' \
 		>"$(ROS_LOG)" 2>&1 &
-	@$(MAKE) --no-print-directory gui
+	@if test "$(SIM_METRICS)" = "1"; then \
+		setsid bash -c 'source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; exec python3 scripts/recording/record_flight_telemetry.py --output "$(TELEMETRY_LOG)"' \
+			>"$(RECORDER_LOG)" 2>&1 & echo $$! >"$(RECORDER_PID)"; \
+		echo "Flight telemetry recorder started; output: $(TELEMETRY_LOG)"; \
+	fi
+	@if test "$(HEADLESS)" != "1"; then \
+		$(MAKE) --no-print-directory gui; \
+	else \
+		echo "Headless mode: Gazebo GUI skipped."; \
+	fi
 	@for entry in "PX4:$(PX4_PID)" "DDS:$(DDS_PID)" "ROS:$(ROS_PID)"; do \
 		name=$${entry%%:*}; file=$${entry#*:}; pid=$$(cat "$$file" 2>/dev/null); \
 		if ! kill -0 "$$pid" 2>/dev/null || ! ps -p "$$pid" -o stat= | grep -qv '^[[:space:]]*Z'; then \
@@ -375,7 +399,7 @@ sim: check build
 
 stop:
 	@set -u; \
-	for pid_file in "$(HIL_PID)" "$(GZ_GUI_PID)" "$(ROS_PID)" "$(DDS_PID)" "$(PX4_PID)"; do \
+	for pid_file in "$(RECORDER_PID)" "$(HIL_PID)" "$(GZ_GUI_PID)" "$(ROS_PID)" "$(DDS_PID)" "$(PX4_PID)"; do \
 		if test -f "$$pid_file"; then \
 			pid=$$(cat "$$pid_file"); \
 			if kill -0 "$$pid" 2>/dev/null; then \
@@ -383,11 +407,15 @@ stop:
 			fi; \
 			rm -f "$$pid_file"; \
 		fi; \
-	done
+	done; \
+	pkill -f "px4_sitl" 2>/dev/null || true; \
+	pkill -f "MicroXRCEAgent.*$(DDS_PORT)" 2>/dev/null || true; \
+	pkill -f "gz sim" 2>/dev/null || true; \
+	rm -f "$(SIM_RUNTIME_DIR)"/*.pid "$(SIM_RUNTIME_DIR)"/*.lock
 	@echo "Simulator processes stopped."
 
 status:
-	@for entry in "PX4:$(PX4_PID)" "Gazebo GUI:$(GZ_GUI_PID)" "jMAVSim HIL:$(HIL_PID)" "DDS:$(DDS_PID)" "ROS:$(ROS_PID)"; do \
+	@for entry in "PX4:$(PX4_PID)" "Gazebo GUI:$(GZ_GUI_PID)" "jMAVSim HIL:$(HIL_PID)" "DDS:$(DDS_PID)" "ROS:$(ROS_PID)" "Recorder:$(RECORDER_PID)"; do \
 		name=$${entry%%:*}; pid_file=$${entry#*:}; \
 		if test -f "$$pid_file"; then \
 			pid=$$(cat "$$pid_file"); \
@@ -397,8 +425,31 @@ status:
 
 logs:
 	@mkdir -p "$(SIM_RUNTIME_DIR)"
-	@touch "$(PX4_LOG)" "$(GZ_GUI_LOG)" "$(HIL_LOG)" "$(DDS_LOG)" "$(ROS_LOG)"
-	@tail -F "$(PX4_LOG)" "$(GZ_GUI_LOG)" "$(HIL_LOG)" "$(DDS_LOG)" "$(ROS_LOG)"
+	@touch "$(PX4_LOG)" "$(GZ_GUI_LOG)" "$(HIL_LOG)" "$(DDS_LOG)" "$(ROS_LOG)" "$(RECORDER_LOG)"
+	@tail -F "$(PX4_LOG)" "$(GZ_GUI_LOG)" "$(HIL_LOG)" "$(DDS_LOG)" "$(ROS_LOG)" "$(RECORDER_LOG)"
+
+record-start: check-build
+	@mkdir -p "$(SIM_RUNTIME_DIR)"
+	@if test -f "$(RECORDER_PID)" && kill -0 "$$(cat "$(RECORDER_PID)")" 2>/dev/null; then \
+		echo "Flight telemetry recorder already running (pid $$(cat "$(RECORDER_PID)"))."; \
+	else \
+		setsid bash -c 'source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; if test -n "$(PX4_MSGS_SETUP)" && test -f "$(PX4_MSGS_SETUP)"; then source "$(PX4_MSGS_SETUP)"; fi; if test -f "$(ROS_WORKSPACE_SETUP)"; then source "$(ROS_WORKSPACE_SETUP)"; fi; exec python3 scripts/recording/record_flight_telemetry.py --output "$(TELEMETRY_LOG)"' \
+			>"$(RECORDER_LOG)" 2>&1 & echo $$! >"$(RECORDER_PID)"; \
+		echo "Flight telemetry recorder started; output: $(TELEMETRY_LOG)"; \
+	fi
+
+record-stop:
+	@if test -f "$(RECORDER_PID)"; then \
+		pid=$$(cat "$(RECORDER_PID)"); \
+		if kill -0 "$$pid" 2>/dev/null; then \
+			echo "Stopping flight telemetry recorder $$pid"; kill -TERM "$$pid" 2>/dev/null || true; \
+		fi; \
+		rm -f "$(RECORDER_PID)"; \
+	fi
+
+plot:
+	@python3 scripts/plot_trajectory_tracking.py $(LOG)
+
 
 PID_LOG ?= $(firstword $(wildcard /home/ubuntu/Dev/PX4_tracker/PX4-Autopilot/build/px4_sitl_default/rootfs/log/*/*_pid*.ulg /tmp/pid_flight.ulg))
 MPC_LOG ?= $(firstword $(wildcard /home/ubuntu/Dev/PX4_tracker/PX4-Autopilot/build/px4_sitl_default/rootfs/log/*/*_mpc*.ulg /tmp/mpc_flight.ulg))
@@ -415,7 +466,7 @@ mission-start:
 	  *) echo "Unsupported CONTROLLER: $(CONTROLLER)"; exit 2 ;; \
 	esac; \
 	if test -n "$(MISSION_PATH)"; then path="$$(realpath -m -- "$(MISSION_PATH)")"; else path=""; fi; \
-	ros2 run mpc_controller runtime_mission_client "$(CONTROLLER_CANONICAL)" "$$path"
+	ros2 run mpc_controller reference_generator_node --mission-start "$(CONTROLLER_CANONICAL)" "$$path"
 
 arm:
 	@source "$(ROS_SETUP)"; export ROS_DOMAIN_ID="$(ROS_DOMAIN_ID)"; \

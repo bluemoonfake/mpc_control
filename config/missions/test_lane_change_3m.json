@@ -75,10 +75,6 @@
         "id": "hold_return_3s",
         "type": "hold",
         "duration": 3.0
-      },
-      {
-        "id": "landing",
-        "type": "land"
       }
     ]
   }

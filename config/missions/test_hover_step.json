@@ -57,10 +57,6 @@
         "id": "hold_return_5s",
         "type": "hold",
         "duration": 5.0
-      },
-      {
-        "id": "landing",
-        "type": "land"
       }
     ]
   }

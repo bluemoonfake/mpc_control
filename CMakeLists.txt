@@ -10,19 +10,88 @@ endif()
 
 include(FetchContent)
 
-# OSQP owns the numerical iteration, factorization, warm start and convergence
-# checks. Pin the source so every ROS workspace builds the same solver.
-set(OSQP_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
-set(OSQP_BUILD_STATIC_LIB ON CACHE BOOL "" FORCE)
-set(OSQP_BUILD_DEMO_EXE OFF CACHE BOOL "" FORCE)
-set(OSQP_BUILD_UNITTESTS OFF CACHE BOOL "" FORCE)
-set(OSQP_ENABLE_PRINTING OFF CACHE BOOL "" FORCE)
-set(OSQP_ENABLE_INTERRUPT OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(osqp
-  URL https://github.com/osqp/osqp/archive/refs/tags/v1.0.0.tar.gz
-  URL_HASH SHA256=dd6a1c2e7e921485697d5e7cdeeb043c712526c395b3700601f51d472a7d8e48
-  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-FetchContent_MakeAvailable(osqp)
+option(MPC_ENABLE_HPIPM
+  "Build HPIPM with BLASFEO and use the OCP-QP backend for runtime MPC"
+  ON)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+  set(_mpc_default_hpipm_target "GENERIC")
+  set(_mpc_default_blasfeo_target "ARMV8A_ARM_CORTEX_A76")
+else()
+  set(_mpc_default_hpipm_target "AVX")
+  set(_mpc_default_blasfeo_target "X64_INTEL_HASWELL")
+endif()
+set(MPC_HPIPM_TARGET "${_mpc_default_hpipm_target}" CACHE STRING
+  "HPIPM core target: AVX or GENERIC")
+set(MPC_BLASFEO_TARGET "${_mpc_default_blasfeo_target}" CACHE STRING
+  "BLASFEO target architecture")
+option(MPC_ENABLE_TINYMPC
+  "Build the pinned TinyMPC capability probe; keep runtime integration disabled"
+  OFF)
+option(MPC_BUILD_SOLVER_BENCHMARK
+  "Build the deterministic offline solver benchmark"
+  OFF)
+
+if(MPC_ENABLE_HPIPM)
+  # HPIPM is built as an OCP-QP backend.  Keep both revisions pinned so an
+  # offline/embedded build cannot silently change numerical behavior.
+  set(TARGET "${MPC_BLASFEO_TARGET}" CACHE STRING "" FORCE)
+  set(BLASFEO_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(BLASFEO_TESTING OFF CACHE BOOL "" FORCE)
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(blasfeo
+    URL https://github.com/giaf/blasfeo/archive/60493284741b3e4e5b0bf25155221d4b5f0b2232.tar.gz
+    URL_HASH SHA256=e6d28ff323693f54dc47f10a0bc86bf9a3441ed7881c5caa8500954063b8d81a
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  FetchContent_MakeAvailable(blasfeo)
+
+  set(TARGET "${MPC_HPIPM_TARGET}" CACHE STRING "" FORCE)
+  set(HPIPM_TESTING OFF CACHE BOOL "" FORCE)
+  set(HPIPM_FIND_BLASFEO OFF CACHE BOOL "" FORCE)
+  set(BLASFEO_PATH "${blasfeo_SOURCE_DIR}" CACHE PATH "" FORCE)
+  FetchContent_Declare(hpipm
+    URL https://github.com/giaf/hpipm/archive/bad1123a96136fce3cdd8bbcbe24b853d012b840.tar.gz
+    URL_HASH SHA256=d65ae2bab6467dbfc96759833c351ea28ad3f6d74dd668b185ee144001ad8d05
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  FetchContent_MakeAvailable(hpipm)
+else()
+  message(FATAL_ERROR
+    "MPC_ENABLE_HPIPM=OFF is unsupported on hpipm_mpc_controller; "
+    "this branch requires the HPIPM OCP-QP backend")
+endif()
+
+if(MPC_ENABLE_TINYMPC)
+  # Keep TinyMPC isolated and opt-in until its stage model reaches numerical
+  # Keep TinyMPC isolated and pinned so an optional audit cannot silently
+  # change with an upstream branch.
+  FetchContent_Declare(tinympc
+    URL https://github.com/TinyMPC/TinyMPC/archive/023f36bd5b27267e1a96ed47a774d120b5707f13.tar.gz
+    URL_HASH SHA256=1ef63baecb4928d17a383f7a55ead80270bbc880cd9a74eb27bca3d4a8541946
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  FetchContent_GetProperties(tinympc)
+  if(NOT tinympc_POPULATED)
+    FetchContent_Populate(tinympc)
+  endif()
+  add_subdirectory(
+    "${tinympc_SOURCE_DIR}/src/tinympc"
+    "${tinympc_BINARY_DIR}/tinympc"
+    EXCLUDE_FROM_ALL)
+  add_library(mpc_tinympc INTERFACE)
+  target_link_libraries(mpc_tinympc INTERFACE tinympcstatic)
+  target_include_directories(mpc_tinympc SYSTEM INTERFACE
+    "${tinympc_SOURCE_DIR}/src"
+    "${tinympc_SOURCE_DIR}/include/Eigen")
+  add_executable(tinympc_capability_probe
+    tools/tinympc_capability_probe.cpp)
+  target_compile_features(tinympc_capability_probe PRIVATE cxx_std_17)
+  target_link_libraries(tinympc_capability_probe PRIVATE mpc_tinympc)
+
+  add_executable(tinympc_parity_gap_test
+    tools/tinympc_parity_gap_test.cpp)
+  target_compile_features(tinympc_parity_gap_test PRIVATE cxx_std_17)
+  target_compile_definitions(tinympc_parity_gap_test PRIVATE
+    TINYMPC_API_HEADER_PATH="${tinympc_SOURCE_DIR}/src/tinympc/tiny_api.hpp")
+  target_link_libraries(tinympc_parity_gap_test PRIVATE mpc_tinympc)
+endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(builtin_interfaces REQUIRED)
@@ -42,8 +111,6 @@ set(msg_files
   "msg/VehicleState.msg"
   "msg/MpcTranslationalOutput.msg"
   "msg/ForceAttitudeSetpoint.msg"
-  "msg/MpcMissionWaypoint.msg"
-  "msg/MpcMissionPlan.msg"
 )
 
 set(srv_files
@@ -66,77 +133,81 @@ target_link_libraries(mpc_common INTERFACE Eigen3::Eigen)
 rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
 add_library(mpc_mission STATIC
-  src/mission/mission_json_parser.cpp
-  src/mission/mission_trajectory.cpp
-  src/mission/runtime_mission_loader.cpp)
+  src/domain/mission/trajectory.cpp
+  src/domain/mission/loader.cpp)
 target_compile_features(mpc_mission PUBLIC cxx_std_17)
 target_link_libraries(mpc_mission PUBLIC
   mpc_common nlohmann_json::nlohmann_json)
 
 add_library(mpc_solver STATIC
-  src/solver/osqp_solver.cpp)
+  src/adapters/solver/hpipm.cpp)
 target_compile_features(mpc_solver PUBLIC cxx_std_17)
-target_link_libraries(mpc_solver PUBLIC mpc_common PRIVATE osqpstatic)
+target_link_libraries(mpc_solver PUBLIC mpc_common PRIVATE hpipm)
+
+add_library(mpc_control_application STATIC
+  src/application/control_runtime.cpp)
+target_compile_features(mpc_control_application PUBLIC cxx_std_17)
+target_link_libraries(mpc_control_application PUBLIC mpc_common mpc_solver)
+
+add_library(mpc_mission_application STATIC
+  src/application/mission_runtime.cpp)
+target_compile_features(mpc_mission_application PUBLIC cxx_std_17)
+target_link_libraries(mpc_mission_application PUBLIC mpc_common mpc_mission)
 
 add_executable(mpc_controller_node
-  src/controller/mpc_controller_node.cpp)
+  src/nodes/mpc_node.cpp)
 target_compile_features(mpc_controller_node PRIVATE cxx_std_17)
 ament_target_dependencies(mpc_controller_node rclcpp std_msgs)
 target_link_libraries(mpc_controller_node
-  mpc_common mpc_solver "${cpp_typesupport_target}")
+  mpc_control_application "${cpp_typesupport_target}")
 
 add_executable(reference_generator_node
-  src/mission/reference_generator_node.cpp)
+  src/nodes/reference_node.cpp)
 target_compile_features(reference_generator_node PRIVATE cxx_std_17)
 ament_target_dependencies(reference_generator_node
   rclcpp std_msgs std_srvs visualization_msgs)
 target_link_libraries(reference_generator_node
-  mpc_mission "${cpp_typesupport_target}")
-
-add_executable(runtime_mission_client
-  src/mission/runtime_mission_client.cpp)
-target_compile_features(runtime_mission_client PRIVATE cxx_std_17)
-ament_target_dependencies(runtime_mission_client rclcpp)
-target_link_libraries(runtime_mission_client "${cpp_typesupport_target}")
-
-add_executable(vehicle_state_bridge_node
-  src/px4/vehicle_state_bridge_node.cpp)
-target_compile_features(vehicle_state_bridge_node PRIVATE cxx_std_17)
-ament_target_dependencies(vehicle_state_bridge_node rclcpp px4_msgs)
-target_link_libraries(vehicle_state_bridge_node
-  mpc_common "${cpp_typesupport_target}")
+  mpc_mission_application "${cpp_typesupport_target}")
 
 add_executable(px4_attitude_mode_node
-  src/px4/px4_attitude_mode_node.cpp)
+  src/nodes/attitude_node.cpp)
 target_compile_features(px4_attitude_mode_node PRIVATE cxx_std_17)
 ament_target_dependencies(px4_attitude_mode_node
   rclcpp px4_msgs px4_ros2_cpp std_msgs std_srvs)
 target_link_libraries(px4_attitude_mode_node
   mpc_common px4_ros2_cpp::px4_ros2_cpp "${cpp_typesupport_target}")
 
-add_executable(pid_mode_node src/PID_validation/pid_mode_node.cpp)
+add_executable(pid_mode_node src/nodes/pid_node.cpp)
 ament_target_dependencies(pid_mode_node rclcpp px4_msgs px4_ros2_cpp std_msgs)
 target_link_libraries(pid_mode_node
   mpc_common px4_ros2_cpp::px4_ros2_cpp "${cpp_typesupport_target}")
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
-  ament_add_gtest(pid_reference_test test/unit/pid_valid/pid_reference_test.cpp)
+  ament_add_gtest(pid_reference_test test/unit/compare/pid_test.cpp)
   target_link_libraries(pid_reference_test mpc_common)
 
-  ament_add_gtest(force_attitude_mapper_test
-    test/unit/px4/force_attitude_mapper_test.cpp)
-  target_link_libraries(force_attitude_mapper_test mpc_common)
+  ament_add_gtest(force_mapper_test
+    test/unit/adapters/geometry_mapper/force_test.cpp)
+  target_link_libraries(force_mapper_test mpc_common)
 
-  ament_add_gtest(mission_reference_generator_test
-    test/unit/mission/mission_trajectory_test.cpp)
-  target_link_libraries(mission_reference_generator_test mpc_mission)
+  ament_add_gtest(control_runtime_test
+    test/unit/application/control_runtime_test.cpp)
+  target_link_libraries(control_runtime_test mpc_control_application)
 
-  ament_add_gtest(runtime_mission_loader_test
-    test/unit/mission/runtime_mission_loader_test.cpp)
-  target_compile_definitions(runtime_mission_loader_test PRIVATE
+  ament_add_gtest(mission_trajectory_test
+    test/unit/domain/mission/trajectory_test.cpp)
+  target_link_libraries(mission_trajectory_test mpc_mission)
+
+  ament_add_gtest(trajectory_curve_test
+    test/unit/domain/model/trajectory_test.cpp)
+  target_link_libraries(trajectory_curve_test mpc_mission)
+
+  ament_add_gtest(mission_loader_test
+    test/unit/domain/mission/loader_test.cpp)
+  target_compile_definitions(mission_loader_test PRIVATE
     MPC_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")
-  target_link_libraries(runtime_mission_loader_test mpc_mission)
+  target_link_libraries(mission_loader_test mpc_mission)
 
   ament_add_gtest(mission_json_parser_test
     test/integration/mission/mission_json_parser_test.cpp)
@@ -144,17 +215,35 @@ if(BUILD_TESTING)
     MPC_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")
   target_link_libraries(mission_json_parser_test mpc_mission)
 
-  ament_add_gtest(vehicle_state_mapper_test
-    test/unit/px4/vehicle_state_mapper_test.cpp)
-  target_link_libraries(vehicle_state_mapper_test mpc_common)
+  ament_add_gtest(state_mapper_test
+    test/unit/adapters/geometry_mapper/state_test.cpp)
+  target_link_libraries(state_mapper_test mpc_common)
 
-  ament_add_gtest(waypoint_mission_test
-    test/unit/controller/waypoint_mission_test.cpp)
-  target_link_libraries(waypoint_mission_test mpc_common)
+  ament_add_gtest(mission_progress_tracker_test
+    test/unit/domain/mission/tracker_test.cpp)
+  target_link_libraries(mission_progress_tracker_test mpc_common)
 
-  ament_add_gtest(translational_mpc_goal_test
-    test/unit/controller/translational_mpc_goal_test.cpp)
-  target_link_libraries(translational_mpc_goal_test mpc_common mpc_solver)
+  ament_add_gtest(limits_test
+    test/unit/domain/control/limits_test.cpp)
+  target_link_libraries(limits_test mpc_common)
+
+  ament_add_gtest(reference_sampler_test
+    test/unit/domain/model/sampler_test.cpp)
+  target_link_libraries(reference_sampler_test mpc_common)
+
+  ament_add_gtest(constraint_layout_test
+    test/unit/ports/constraint_layout_test.cpp)
+  target_link_libraries(constraint_layout_test mpc_common mpc_solver)
+
+  ament_add_gtest(acceleration_envelope_test
+    test/unit/ports/acceleration_envelope_test.cpp)
+  target_link_libraries(acceleration_envelope_test mpc_common mpc_solver)
+endif()
+
+if(MPC_BUILD_SOLVER_BENCHMARK)
+  add_executable(mpc_solver_benchmark tools/mpc_solver_benchmark.cpp)
+  target_compile_features(mpc_solver_benchmark PRIVATE cxx_std_17)
+  target_link_libraries(mpc_solver_benchmark PRIVATE mpc_common mpc_solver)
 endif()
 
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
@@ -162,14 +251,14 @@ install(DIRECTORY include/ DESTINATION include)
 install(TARGETS
   mpc_mission
   mpc_solver
+  mpc_control_application
+  mpc_mission_application
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib)
 
 install(TARGETS
   reference_generator_node
-  runtime_mission_client
   mpc_controller_node
-  vehicle_state_bridge_node
   px4_attitude_mode_node
   pid_mode_node
   DESTINATION lib/${PROJECT_NAME})

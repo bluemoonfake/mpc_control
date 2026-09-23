@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "mission": {
+    "description": "Vertical helix: spiral climb from 5m to 25m then descend back, testing simultaneous XY+Z tracking",
+    "defaults": {
+      "horizontalVelocity": 6.0,
+      "verticalVelocity": 2.0,
+      "maxHeadingRate": 90,
+      "tpmc": {
+        "maximumAcceleration": 4.0,
+        "maximumJerk": 6.0
+      }
+    },
+    "items": [
+      {"id": "takeoff", "type": "takeoff", "z": 5.0},
+      {
+        "id": "helix_start",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 15.0, "y": 0.0, "z": 5.0
+      },
+      {
+        "id": "helix_q1_up",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0, "y": 15.0, "z": 10.0
+      },
+      {
+        "id": "helix_q2_up",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": -15.0, "y": 0.0, "z": 15.0
+      },
+      {
+        "id": "helix_q3_up",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0, "y": -15.0, "z": 20.0
+      },
+      {
+        "id": "helix_apex",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 15.0, "y": 0.0, "z": 25.0
+      },
+      {"id": "hold_apex_3s", "type": "hold", "duration": 3.0},
+      {
+        "id": "helix_q1_down",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0, "y": 15.0, "z": 20.0
+      },
+      {
+        "id": "helix_q2_down",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": -15.0, "y": 0.0, "z": 15.0
+      },
+      {
+        "id": "helix_q3_down",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0, "y": -15.0, "z": 10.0
+      },
+      {
+        "id": "helix_finish",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 15.0, "y": 0.0, "z": 5.0
+      },
+      {
+        "id": "return_home",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0, "y": 0.0, "z": 5.0
+      },
+      {"id": "hold_end", "type": "hold", "duration": 5.0}
+    ]
+  }
+}

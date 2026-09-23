@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "mission": {
+    "description": "Figure-8 continuous fly-through: tests corner-velocity planning at varying turn angles without stopping",
+    "defaults": {
+      "horizontalVelocity": 8.0,
+      "verticalVelocity": 1.5,
+      "maxHeadingRate": 90,
+      "tpmc": {
+        "maximumAcceleration": 5.0,
+        "maximumJerk": 8.0
+      }
+    },
+    "items": [
+      {"id": "takeoff", "type": "takeoff", "z": 10.0},
+      {
+        "id": "center_start",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0, "y": 0.0, "z": 10.0
+      },
+      {
+        "id": "loop1_top_right",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 20.0, "y": 15.0, "z": 11.0
+      },
+      {
+        "id": "loop1_far_right",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 40.0, "y": 0.0, "z": 12.0
+      },
+      {
+        "id": "loop1_bottom_right",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 20.0, "y": -15.0, "z": 11.0
+      },
+      {
+        "id": "center_cross",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0, "y": 0.0, "z": 10.0
+      },
+      {
+        "id": "loop2_top_left",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": -20.0, "y": 15.0, "z": 9.0
+      },
+      {
+        "id": "loop2_far_left",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": -40.0, "y": 0.0, "z": 8.0
+      },
+      {
+        "id": "loop2_bottom_left",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": -20.0, "y": -15.0, "z": 9.0
+      },
+      {
+        "id": "center_finish",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0, "y": 0.0, "z": 10.0
+      },
+      {"id": "hold_end", "type": "hold", "duration": 5.0}
+    ]
+  }
+}
