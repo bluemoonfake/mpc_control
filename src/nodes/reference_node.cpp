@@ -419,8 +419,7 @@ private:
   void publishVisualization() {
     const auto now = SteadyClock::now();
     if (last_visualization_published_at_ &&
-        std::chrono::duration<double>(now - *last_visualization_published_at_)
-                .count() <
+        std::chrono::duration<double>(now - *last_visualization_published_at_).count() <
             1.0 / std::max(visualization_publish_rate_hz_, 1.0)) {
       return;
     }
@@ -495,8 +494,7 @@ private:
     visualization_publisher_->publish(markers);
   }
 
-  std::unique_ptr<mpc_controller::application::MissionRuntime>
-      mission_runtime_;
+  std::unique_ptr<mpc_controller::application::MissionRuntime> mission_runtime_;
   std::array<double, 3> hold_position_{0.0, 0.0, 1.0};
   std::string frame_id_{"map"};
   double hold_yaw_rad_ = 0.0;
@@ -525,17 +523,12 @@ private:
   std::optional<SteadyClock::time_point> last_state_received_at_;
   std::optional<SteadyClock::time_point> last_visualization_published_at_;
   rclcpp::Publisher<Reference>::SharedPtr publisher_;
-  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr
-      mission_completed_publisher_;
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
-      visualization_publisher_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr mission_completed_publisher_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr visualization_publisher_;
   rclcpp::Subscription<State>::SharedPtr state_subscription_;
-  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr
-      mpc_mode_state_subscription_;
-  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr
-      px4_pid_mode_state_subscription_;
-  rclcpp::Service<mpc_controller::srv::LoadAndStartMission>::SharedPtr
-      load_and_start_mission_service_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr mpc_mode_state_subscription_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr px4_pid_mode_state_subscription_;
+  rclcpp::Service<mpc_controller::srv::LoadAndStartMission>::SharedPtr load_and_start_mission_service_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr start_mission_service_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_mission_service_;
   rclcpp::TimerBase::SharedPtr timer_;

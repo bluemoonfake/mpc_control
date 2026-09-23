@@ -424,22 +424,15 @@ TrajectoryCurve::Limits MissionTrajectory::curveLimits(
   return limits;
 }
 
-double MissionTrajectory::nominalDuration(
-    const KinematicState &from, const Waypoint &to) const noexcept {
-  const double horizontal_distance =
-      std::hypot(to.position[0] - from.position[0],
-                 to.position[1] - from.position[1]);
+double MissionTrajectory::nominalDuration( const KinematicState &from, const Waypoint &to) const noexcept {
+  const double horizontal_distance = std::hypot(to.position[0] - from.position[0], to.position[1] - from.position[1]);
   const double vertical_distance = std::abs(to.position[2] - from.position[2]);
-  const double horizontal_speed = std::min(
-      config_.planner_max_speed_xy_m_s,
+  const double horizontal_speed = std::min(config_.planner_max_speed_xy_m_s,
       clampPositive(to.horizontal_speed, config_.planner_max_speed_xy_m_s));
-  const double vertical_speed = std::min(
-      config_.planner_max_speed_z_m_s,
+  const double vertical_speed = std::min(config_.planner_max_speed_z_m_s,
       clampPositive(to.vertical_speed, config_.planner_max_speed_z_m_s));
-  const double horizontal_time = horizontal_distance > 1.0e-3
-      ? horizontal_distance / horizontal_speed : 0.0;
-  const double vertical_time = vertical_distance > 1.0e-3
-      ? vertical_distance / vertical_speed : 0.0;
+  const double horizontal_time = horizontal_distance > 1.0e-3 ? horizontal_distance / horizontal_speed : 0.0;
+  const double vertical_time = vertical_distance > 1.0e-3 ? vertical_distance / vertical_speed : 0.0;
   return std::max({horizontal_time, vertical_time, 0.5});
 }
 
@@ -479,10 +472,8 @@ void MissionTrajectory::buildWaypointStates() noexcept {
     const Vector3 incoming_unit = scale(incoming, 1.0 / incoming_length);
     const Vector3 outgoing_unit = scale(outgoing, 1.0 / outgoing_length);
     const Vector3 bisector = scale(
-        add(scale(incoming_unit, outgoing_length),
-            scale(outgoing_unit, incoming_length)),
-        1.0 / (incoming_length + outgoing_length));
-    const double turn_factor = std::clamp(1.0 * norm(bisector), 0.0, 2.0);
+        add(scale(incoming_unit, outgoing_length),scale(outgoing_unit, incoming_length)),1.0 / (incoming_length + outgoing_length));
+    const double turn_factor = std::clamp(0.5 * norm(bisector), 0.0, 1.0);
     const Vector3 tangent = normalized(bisector);
     const double horizontal_tangent = std::hypot(tangent[0], tangent[1]);
     const double vertical_tangent = std::abs(tangent[2]);
@@ -490,24 +481,18 @@ void MissionTrajectory::buildWaypointStates() noexcept {
     const auto &successor = waypoints_[index + 1U];
     const double horizontal_speed = std::min({
         config_.planner_max_speed_xy_m_s,
-        clampPositive(waypoint.horizontal_speed,
-                      config_.planner_max_speed_xy_m_s),
-        clampPositive(successor.horizontal_speed,
-                      config_.planner_max_speed_xy_m_s)});
+        clampPositive(waypoint.horizontal_speed,config_.planner_max_speed_xy_m_s),
+        clampPositive(successor.horizontal_speed,config_.planner_max_speed_xy_m_s)});
     const double vertical_speed = std::min({
         config_.planner_max_speed_z_m_s,
-        clampPositive(waypoint.vertical_speed,
-                      config_.planner_max_speed_z_m_s),
-        clampPositive(successor.vertical_speed,
-                      config_.planner_max_speed_z_m_s)});
+        clampPositive(waypoint.vertical_speed,config_.planner_max_speed_z_m_s),
+        clampPositive(successor.vertical_speed,config_.planner_max_speed_z_m_s)});
     double scalar_speed = std::numeric_limits<double>::infinity();
     if (horizontal_tangent > 1.0e-6) {
-      scalar_speed = std::min(scalar_speed,
-                              horizontal_speed / horizontal_tangent);
+      scalar_speed = std::min(scalar_speed,horizontal_speed / horizontal_tangent);
     }
     if (vertical_tangent > 1.0e-6) {
-      scalar_speed = std::min(scalar_speed,
-                              vertical_speed / vertical_tangent);
+      scalar_speed = std::min(scalar_speed,vertical_speed / vertical_tangent);
     }
     if (!std::isfinite(scalar_speed)) {
       continue;
@@ -773,8 +758,8 @@ TrajectorySample MissionTrajectory::sample(
   point.acceleration = curve_sample.acceleration;
   if (std::isfinite(target.heading_rad)) {
     point.yaw = target.heading_rad;
-  } else if (std::hypot(point.velocity[0], point.velocity[1]) > 1.0e-3) {
-    point.yaw = std::atan2(point.velocity[1], point.velocity[0]);
+  // } else if (std::hypot(point.velocity[0], point.velocity[1]) > 1.0e-3) {
+  //   point.yaw = std::atan2(point.velocity[1], point.velocity[0]);
   } else {
     point.yaw = leg_start_yaw_;
   }

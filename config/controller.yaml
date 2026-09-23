@@ -7,16 +7,14 @@ reference_generator_node:
     hold_yaw_rad: 0.0
     state_timeout_seconds: 0.25
     # Planner/reference preview horizon; independent of the 30-stage MPC prediction horizon below.
-    horizon_seconds: 10.0
-    sample_period_seconds: 0.1
+    horizon_seconds: 30.0
+    sample_period_seconds: 0.2
     # Planner envelope mirrors the current MPC envelope.
     planner_max_speed_xy_m_s: 18.0
-    planner_max_speed_z_m_s: 1.5
-    planner_max_acceleration_xy_m_s2: 10.0
-    # PX4 V6X snapshot allows 8.0 m/s^2 up and 3.0 m/s^2 down; use the
-    # conservative common bound for the symmetric planner interface.
-    planner_max_acceleration_z_m_s2: 10.0
-    planner_max_jerk_xy_m_s3: 12.0
+    planner_max_speed_z_m_s: 2.5
+    planner_max_acceleration_xy_m_s2: 8.0
+    planner_max_acceleration_z_m_s2: 8.0
+    planner_max_jerk_xy_m_s3: 6.0
     planner_max_jerk_z_m_s3: 6.0
     publish_rate_hz: 100.0
     # RViz visualization markers.
@@ -27,7 +25,7 @@ vehicle_state_bridge_node:
   ros__parameters:
     state_timeout_seconds: 0.25
     max_sample_skew_seconds: 0.10
-    publish_rate_hz: 100.0
+    publish_rate_hz: 50.0
 
 mpc_controller_node:
   ros__parameters:
@@ -37,16 +35,17 @@ mpc_controller_node:
     state_timeout_seconds: 0.25
     # MPC grid: 30 stages; first knot 0.01 s, later knots 0.10 s;
     # independent of the 100 Hz solve loop.
-    dt_first: 0.01
-    dt_later: 0.1
+    dt_first: 0.2
+    dt_later: 0.2
     # Target budget with margin inside the 10 ms control period; validate on
     # the target host before enabling flight experiments.
-    solver_deadline_seconds: 0.0094
+    solver_deadline_seconds: 0.009
     # HPIPM has no wall-clock cancellation; cap IPM iterations before SITL.
     max_iterations: 50
     # Identified acceleration-response lag (effective delay of PX4 Attitude cascade).
     model_time_constant_xyz: [0.25, 0.25, 0.08]
     # coupled: one 3D QP owns the command.
+    model_time_constant_xyz: [0.0, 0.0, 0.0]
     # Stage and terminal weights ordered [position, velocity, acceleration].
     # Near-aperiodic damping: Q_vel/Q_pos ~7 kills lateral velocity before line-crossing.
     q_xy: [80.0, 550.0, 2.0]
@@ -54,7 +53,7 @@ mpc_controller_node:
     q_z: [200.0, 350.0, 2.0]
     s_z: [300.0, 400.0, 4.0]
     # Penalize control rate (jerk) to damp attitude oscillations and ensure smooth tilting.
-    control_weight_xy: 8.0
+    control_weight_xy: 1.5
     control_rate_weight_xy: 40.0
     control_weight_z: 4.0
     control_rate_weight_z: 10.0
@@ -66,16 +65,16 @@ mpc_controller_node:
     # Reduced QP profile: six-sided XY polygons; predicted-acceleration rows
     # are removed. Hard command-rate rows remain active over all 30 stages;
     # command/velocity/tilt/thrust and recovery caps remain active throughout.
-    max_speed_xy: 30.0
-    max_acceleration_xy: 10.0  # mission limit tightens the QP command envelope
-    max_control_xy: 10.0
+    max_speed_xy: 18.0
+    max_acceleration_xy: 6.0  # mission limit tightens the QP command envelope
+    max_control_xy: 6.0
     # Provisional jerk limit for the external-attitude path; validate with
     # actuator saturation and attitude-response SITL data before raising it.
     max_control_rate_xy: 8.0
     # Symmetric Z limits use the conservative PX4 down direction bounds.
     max_speed_z: 3.0
-    max_acceleration_z: 3.0  # mission limit tightens the QP command envelope
-    max_measured_acceleration_z_m_s2: 10.0
+    max_acceleration_z: 5.0  # mission limit tightens the QP command envelope
+    max_measured_acceleration_z_m_s2: 5.0
     max_control_z: 3.0
     max_control_rate_z: 4.0
     min_collective_specific_force_m_s2: 1.0

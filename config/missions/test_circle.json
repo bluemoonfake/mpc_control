@@ -1,0 +1,162 @@
+{
+  "version": 1,
+  "mission": {
+    "description": "Circular Trajectory Benchmark: Constant curvature R=15m, altitude=10m, continuous lateral acceleration tracking",
+    "defaults": {
+      "horizontalVelocity": 6.0,
+      "verticalVelocity": 1.5,
+      "maxHeadingRate": 90.0,
+      "tpmc": {
+        "maximumAcceleration": 4.0,
+        "maximumJerk": 6.0
+      }
+    },
+    "items": [
+      {
+        "id": "takeoff",
+        "type": "takeoff",
+        "z": 10.0
+      },
+      {
+        "id": "wp_start",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0,
+        "y": 0.0,
+        "z": 10.0
+      },
+      {
+        "id": "circle_wp01_0deg",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 15.0,
+        "y": 0.0,
+        "z": 10.0
+      },
+      {
+        "id": "circle_wp02_30deg",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 12.99,
+        "y": 7.5,
+        "z": 10.0
+      },
+      {
+        "id": "circle_wp03_60deg",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 7.5,
+        "y": 12.99,
+        "z": 10.0
+      },
+      {
+        "id": "circle_wp04_90deg",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0,
+        "y": 15.0,
+        "z": 10.0
+      },
+      {
+        "id": "circle_wp05_120deg",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": -7.5,
+        "y": 12.99,
+        "z": 10.0
+      },
+      {
+        "id": "circle_wp06_150deg",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": -12.99,
+        "y": 7.5,
+        "z": 10.0
+      },
+      {
+        "id": "circle_wp07_180deg",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": -15.0,
+        "y": 0.0,
+        "z": 10.0
+      },
+      {
+        "id": "circle_wp08_210deg",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": -12.99,
+        "y": -7.5,
+        "z": 10.0
+      },
+      {
+        "id": "circle_wp09_240deg",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": -7.5,
+        "y": -12.99,
+        "z": 10.0
+      },
+      {
+        "id": "circle_wp10_270deg",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0,
+        "y": -15.0,
+        "z": 10.0
+      },
+      {
+        "id": "circle_wp11_300deg",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 7.5,
+        "y": -12.99,
+        "z": 10.0
+      },
+      {
+        "id": "circle_wp12_330deg",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 12.99,
+        "y": -7.5,
+        "z": 10.0
+      },
+      {
+        "id": "circle_wp13_close",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 15.0,
+        "y": 0.0,
+        "z": 10.0
+      },
+      {
+        "id": "wp_return_home",
+        "type": "navigation",
+        "navigationType": "waypoint",
+        "frame": "local",
+        "x": 0.0,
+        "y": 0.0,
+        "z": 10.0
+      },
+      {
+        "id": "hold_5s",
+        "type": "hold",
+        "duration": 5.0
+      }
+    ]
+  }
+}

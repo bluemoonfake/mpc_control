@@ -5,7 +5,7 @@
     "defaults": {
       "horizontalVelocity": 6.0,
       "verticalVelocity": 2.0,
-      "maxHeadingRate": 90,
+      "maxHeadingRate": 90.0,
       "tpmc": {
         "maximumAcceleration": 4.0,
         "maximumJerk": 6.0
